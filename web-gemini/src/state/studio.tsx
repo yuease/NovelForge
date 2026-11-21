@@ -93,6 +93,20 @@ const SSE_EVENTS = [
 
 const RELOAD_ON = new Set(['job:stage', 'job:progress', 'chapter:completed', 'chapter:repaired', 'job:completed', 'job:error', 'job:paused'])
 
+const STAGE_LABELS: Record<string, string> = {
+  topic_selection: '构建选题',
+  book_plan: '全书规划',
+  chapter_outlines: '分章细纲',
+  chapter_writing: '章节撰写',
+  chapter_verify: '章节审校',
+  chapter_repair: '章节返修',
+  fact_extraction: '事实提取',
+  arc_archive: '单元归档',
+  volume_archive: '卷摘要归档',
+  full_audit: '全书终审',
+  completed: '已完成',
+}
+
 function formatSseMessage(type: string, data: Record<string, unknown>): string {
   if (type === 'snapshot' && data.job && typeof data.job === 'object') {
     const j = data.job as JobRecord
@@ -110,7 +124,10 @@ function formatSseMessage(type: string, data: Record<string, unknown>): string {
   if (type === 'chapter:repair_started') return `第 ${data.chapterNumber} 章触发自动修复（第 ${data.attempt}/${data.maxRetries} 次）`
   if (type === 'chapter:repaired') return `第 ${data.chapterNumber} 章修复完成：${data.resolved ? '已通过重审' : '仍有待处理问题'}`
   if (type === 'facts:updated') return `第 ${data.chapterNumber} 章事实已写入事实库`
-  if (type === 'job:stage' || type === 'job:progress') return `阶段：${data.stage}（${data.progress ?? 0}%）`
+  if (type === 'job:stage' || type === 'job:progress') {
+    const stageKey = typeof data.stage === 'string' ? data.stage : ''
+    return `阶段：${STAGE_LABELS[stageKey] || stageKey}（${data.progress ?? 0}%）`
+  }
   if (type === 'job:completed') return '全书创作与终审全部完成'
   if (type === 'job:paused') return '任务已暂停并保存检查点'
   if (type === 'job:error') {

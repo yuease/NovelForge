@@ -526,30 +526,30 @@
   "test_all_templates_with_legacy_and_extended_options": [
     {
       "system": "7e6aaab689e0e928582c5d2593b4b305dbfd30b55cf5f6ae6088e8df6159508d",
-      "prompt": "f4f3a0ed2b6b9a19c31bdb6787057e172df464fed8e3d1abb8e9be6952cce99d"
+      "prompt": "c6fa0bacf1739a2e2e14ea2bda049949e1b59b67970ab32286b1da1f89c5d440"
     },
     {
       "system": "45861ef39dcef7f4b5ff3878b4dcae6b8ff4a609ab9d20f9506c8b4aa5c10cd0",
       "prompt": "ca3a618f9f3b3f025cda16dfcb3caa354fcfe56ef3d885d463d541f099b799cd"
     },
     {
-      "system": "44b5a8b1df985c9d9423f5178df9b09e713c300ca233a64eff5b94c8f8706918",
-      "prompt": "236506f33e4e89495b1d70717defcac73a9b2eb69978f3942f76ad3b412be8f5"
+      "system": "6f5f770ad7539c28f37d8fe6318a18a268a6997fef9b194e7267beff55390ddc",
+      "prompt": "eec842cb7b246697d8bde292a8ec05bcce59a16b88b6e99b4c340d5a3a805466"
     },
     {
-      "system": "b25592232a84506db5eb091ca3aea7cd7382a8df13c3447dc20d7b67a7b9307d",
-      "prompt": "4eefabe33ff275fba3aec5463203785a4523e106926b352edb330284f5183a58"
+      "system": "55e3f2b60cca7a1a4f0b484ded2f78d06529f187e88edfa4c8487a73dc95d591",
+      "prompt": "7ea282c7b30f9d926b9b893a5b5cd3fcd9b54e1adf2f601accf37dfc031e4db4"
     },
     {
-      "system": "ce33d10e80bf559366707494807aa29ba5e4cc6fe670c634e0f44d9700cbf22f",
-      "prompt": "1ded4365172c9a9edfe18ebed62c1f6967dae83de35c101786998a5677692ceb"
+      "system": "3e8adf2b8b6a05b5b9fee3c0dc7be731d1ec164793673f3a85fea20da8e5dad6",
+      "prompt": "3695e93754f5afd4deee8fa19ffb77c10f2bcc168990f2d585d0a7864cad61f2"
     },
     {
-      "system": "83c38539ac2ea740356160afa70c13d5db42ca769a82fd83d6b3fa18d062bbb7",
-      "prompt": "5e3c392be1100e55e97aa77c44da2d8de51162ab69c84ba443e30571eaa5cae6"
+      "system": "82c468287f1d4a8dc7899fd9063b6719f7f4d79a40c991528988672a4831a474",
+      "prompt": "282023526ab364169f42da86dde780b88498c96090afe2b5ff937c092013152d"
     },
     {
-      "system": "b25592232a84506db5eb091ca3aea7cd7382a8df13c3447dc20d7b67a7b9307d",
+      "system": "55e3f2b60cca7a1a4f0b484ded2f78d06529f187e88edfa4c8487a73dc95d591",
       "prompt": "92fdfbf75091ace67ec7cc266300ea1431715113a628f7cb04594ffe4c60f3c7"
     },
     {
@@ -557,20 +557,20 @@
       "prompt": "8a58f6d98d7df623ffbb59aa05e372fcde5dbb3a3303971efa5aca52067c6b8a"
     },
     {
-      "system": "046c0a133d1a4f2e22243385fa8f2c7bb658a29aa1cb8791d4f709f70e1139ad",
-      "prompt": "2b6cc82059898e6f6cffc3ba3abacf3b80c5c92059c88702737699e2e6a22bb1"
+      "system": "fded26c60a04eb3008743a1fd0d7a20101becad540302c1ac66ea1e3d35eda7f",
+      "prompt": "6b5b20e63d6e72500495bed2a5a90ab106a0fa81b3c6543641a735b246d6e5ed"
     },
     {
-      "system": "7670fdb597269c7618889b0f85391d9980a0da768058af6d650580ce8a32a2de",
-      "prompt": "6babe82b74ed781bd85940c14053c9b515738f6b44d8cf09e1cdf49d635dd40e"
+      "system": "1d1b413f41d0ed7a605e87b41a203bf82a9b9e763c9011d18acf1f13e06c1d25",
+      "prompt": "69e180b9875c553654b5a81ad818816a318374e7728738a3fab1260aecfd2df7"
     },
     {
-      "system": "65f6e000388b0008461ae8e5deebf17902b298affe25b8efa2f25b461772fc84",
-      "prompt": "654314a7cde280033e39959989c3280cf5e31be1b2f7e7c384b9cd4498d96d18"
+      "system": "d57e49a6495860ec8df92076eb286ef679ed8b2aeae36c7467edb12b9258d50e",
+      "prompt": "7586f6e4b776c8ec40c2dd659230524044ee43a6ba4183de7874a330dbfdda7d"
     },
     {
-      "system": "66be4e9dc1d1360e9673ad63842c94afb16283efcda6e9ee314db5c19b435634",
-      "prompt": "c4c149becb76870e83a8058c32d8e261dc5f3bab9f3d75674d786c5a43f08b2d"
+      "system": "06997b9b0a848e33931e8539f8e724fe32ed17db4efd32198f5ee73cedf1d7fe",
+      "prompt": "95206dd127398c9845dd868421c52ded887e02ae99a379ff52e3160936f116e2"
     },
     {
       "system": "8db7843821668e8b6ea3de2a34d1590f9e2bc4e494454311debad9cd7d1fe250",
@@ -583,6 +583,10 @@
     {
       "system": "0f617fdfe763c9b969193d74be95bd0e9141702fc1853197679cf7ecaf37dee0",
       "prompt": "e4134b1cfcf40701cc3ff8dda2b24a6c5c075d89ebfbd02973b645692c89d650"
+    },
+    {
+      "system": "6e5e51a0f7364f64a7e70aa82324c86c99ee11e8994390c9c1d486f0825eecae",
+      "prompt": "9af9ccae224852a1b3289782228e1f6f5d19bacd666137abc713b47cb87c3612"
     }
   ],
   "test_fact_selection_prioritizes_matches_before_recency": {

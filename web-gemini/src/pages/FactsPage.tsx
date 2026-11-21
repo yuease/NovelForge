@@ -1,14 +1,76 @@
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import type { ReactNode } from 'react'
 import { AnimatePresence, motion } from 'motion/react'
-import { BookOpen, Clock, EyeOff, HeartPulse, MapPin, Package, ShieldCheck, Sparkles, Users, Wrench } from 'lucide-react'
+import {
+  AlertTriangle, Archive, BookOpen, Brain, Clock, Coins, EyeOff, HeartPulse, Layers,
+  Lock, MapPin, Package, ShieldAlert, ShieldCheck, Sparkles, Tag as TagIcon, Users, Wrench,
+} from 'lucide-react'
 import { cn } from '../lib/cn'
+import type { Tone } from '../lib/format'
 import { navigate } from '../lib/router'
-import type { FactEntry, RepairLogEntry } from '../lib/types'
+import type {
+  ArcPlan,
+  ArcSummary,
+  CanonLocks,
+  CharacterRelationshipChange,
+  CharacterStateEntry,
+  FactEntry,
+  LedgerBalance,
+  RepairLogEntry,
+  StanceTier,
+  StoryClock,
+  VolumeSummary,
+} from '../lib/types'
 import { useStudio } from '../state/studio'
-import { AnimatedNumber, Badge, Button, Card, EmptyState, PageHeader, SectionLabel, Segmented, Stagger, StaggerItem, Tag } from '../components/ui'
+import {
+  AnimatedNumber, Badge, Button, Card, EmptyState, PageHeader, SectionLabel, Segmented,
+  Stagger, StaggerItem, Tag,
+} from '../components/ui'
 
-type FactTab = 'items' | 'secrets' | 'characters' | 'timeline' | 'foreshadowing' | 'repairs'
+type FactTab = 'ledger' | 'items' | 'secrets' | 'characters' | 'timeline' | 'foreshadowing' | 'repairs'
+
+const STANCE_META: Record<StanceTier, { label: string; tone: Tone }> = {
+  hostile: { label: '敌对', tone: 'danger' },
+  wary: { label: '戒备', tone: 'warning' },
+  transactional: { label: '交易', tone: 'neutral' },
+  ally: { label: '盟友', tone: 'primary' },
+  intimate: { label: '亲密', tone: 'success' },
+}
+
+const DRIFT_KIND_LABEL: Record<string, string> = {
+  value: '数值',
+  clock: '时钟',
+  canon: '口径',
+  character_ooc: '人设',
+}
+
+const EXIT_PLAN_LABEL: Record<string, string> = {
+  retain: '留场',
+  exit: '退场',
+  background: '转幕后',
+}
+
+const SEVERITY_LABEL: Record<string, string> = {
+  low: '轻伤',
+  mild: '轻伤',
+  medium: '中度',
+  moderate: '中度',
+  high: '重伤',
+  severe: '重伤',
+  critical: '危重',
+}
+
+function FastItem({ index, children }: { index: number; children: ReactNode }) {
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 8 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: 0.24, delay: Math.min(index * 0.022, 0.32), ease: [0.2, 0, 0, 1] }}
+    >
+      {children}
+    </motion.div>
+  )
+}
 
 function text(val: unknown): string {
   if (val === null || val === undefined) return ''
@@ -39,25 +101,52 @@ function Citation({ entry }: { entry: FactEntry }) {
   )
 }
 
-function FactCard({ title, entry, children, tone }: { title: ReactNode; entry: FactEntry; children?: ReactNode; tone?: 'danger' }) {
+function FactCard({ title, entry, badge, children, tone }: { title: ReactNode; entry: FactEntry; badge?: ReactNode; children?: ReactNode; tone?: 'danger' | 'success' }) {
   return (
-    <div className={cn('h-full rounded-md p-4 transition-colors', tone === 'danger' ? 'bg-danger-soft' : 'bg-surface-2 hover:bg-surface-3')}>
-      <div className="flex items-start justify-between gap-2">
-        <div className={cn('text-body font-medium', tone === 'danger' ? 'text-danger' : 'text-ink')}>{title}</div>
+    <div
+      className={cn(
+        'h-full rounded-md p-4 transition-colors',
+        tone === 'danger'
+          ? 'bg-danger-soft'
+          : tone === 'success'
+            ? 'bg-success-soft/65'
+            : 'bg-surface-2 hover:bg-surface-3',
+      )}
+    >
+      <div className="flex flex-wrap items-start justify-between gap-2">
+        <div className="flex min-w-0 flex-wrap items-center gap-2">
+          <div className={cn('text-body font-medium', tone === 'danger' ? 'text-danger' : 'text-ink')}>{title}</div>
+          {badge}
+        </div>
         <Citation entry={entry} />
       </div>
-      {children && <div className="mt-2 grid gap-1 text-body text-body">{children}</div>}
+      {children && <div className="mt-2 grid gap-1.5 text-body text-body">{children}</div>}
     </div>
   )
 }
 
 const Row = ({ label, children }: { label: string; children: ReactNode }) => (
-  <div className="flex gap-2 text-caption"><span className="shrink-0 text-muted">{label}</span><span className="text-ink">{children}</span></div>
+  <div className="flex gap-2 text-caption"><span className="shrink-0 text-muted">{label}</span><span className="min-w-0 text-ink">{children}</span></div>
 )
+
+function hasCanonLocks(locks?: CanonLocks | null): locks is CanonLocks {
+  if (!locks) return false
+  return Boolean(locks.powerScale || locks.currencyAndEra || locks.worldTaboos?.length || locks.keyAssets?.length)
+}
+
+function hasStoryClock(clock?: StoryClock | null): clock is StoryClock {
+  if (!clock) return false
+  return Boolean(clock.day || clock.season || clock.timeOfDay || clock.countdown)
+}
+
+function isHealedInjury(entry: FactEntry): boolean {
+  const s = text(entry.status).toLowerCase()
+  return s === 'healed' || s === 'recovered' || s.includes('痊愈') || s.includes('已愈') || s.includes('愈合')
+}
 
 export default function FactsPage() {
   const { facts, repairLogs, activeJob } = useStudio()
-  const [tab, setTab] = useState<FactTab>('items')
+  const [selectedTab, setSelectedTab] = useState<FactTab | null>(null)
 
   const characters = normalize(facts?.characters)
   const injuries = normalize(facts?.injuries)
@@ -68,10 +157,55 @@ export default function FactsPage() {
   const foreshadowing = normalize(facts?.foreshadowing)
   const title = activeJob?.title || activeJob?.bookPlan?.title
 
+  const canonLocks = activeJob?.bookPlan?.canonLocks ?? null
+  const storyClock = facts?.storyClock ?? null
+  const ledgerBalances = useMemo(() => (Array.isArray(facts?.ledgerBalances) ? facts.ledgerBalances : []), [facts?.ledgerBalances])
+  const arcPlans = useMemo(() => (Array.isArray(activeJob?.arcPlans) ? [...activeJob.arcPlans].sort((a, b) => a.startChapter - b.startChapter) : []), [activeJob?.arcPlans])
+  const arcSummaries = useMemo(() => (Array.isArray(facts?.arcSummaries) ? [...facts.arcSummaries].sort((a, b) => a.endChapter - b.endChapter) : []), [facts?.arcSummaries])
+  const volumeSummaries = useMemo(() => (Array.isArray(facts?.volumeSummaries) ? [...facts.volumeSummaries].sort((a, b) => a.endChapter - b.endChapter) : []), [facts?.volumeSummaries])
+  const characterStates = useMemo(() => (facts?.characterStates && typeof facts.characterStates === 'object' ? facts.characterStates : {}), [facts?.characterStates])
+
+  /* Merge base characters with characterStates so Phase 4 locked roles always appear */
+  const mergedCharacters = useMemo(() => {
+    const byName = new Map<string, { key: string; entry: FactEntry; state?: CharacterStateEntry }>()
+    for (const item of characters) {
+      const name = text(item.entry.name || item.key)
+      byName.set(name, { ...item, state: characterStates[name] ?? characterStates[item.key] })
+    }
+    for (const [name, state] of Object.entries(characterStates)) {
+      if (!byName.has(name)) {
+        const ch = state.updatedAtChapter ?? state.stanceTierChapter ?? state.lastSeenChapter ?? state.sourceChapter
+        byName.set(name, {
+          key: name,
+          entry: { name, updatedChapter: ch, sourceChapter: state.sourceChapter },
+          state,
+        })
+      }
+    }
+    return Array.from(byName.values())
+  }, [characters, characterStates])
+
+  const hasLedgerSection =
+    hasCanonLocks(canonLocks)
+    || hasStoryClock(storyClock)
+    || ledgerBalances.length > 0
+    || arcPlans.length > 0
+    || arcSummaries.length > 0
+    || volumeSummaries.length > 0
+
+  const ledgerCount =
+    (hasCanonLocks(canonLocks) ? 1 : 0)
+    + (hasStoryClock(storyClock) ? 1 : 0)
+    + ledgerBalances.length
+    + Math.max(arcPlans.length, arcSummaries.length)
+    + (arcPlans.length === 0 && arcSummaries.length === 0 ? volumeSummaries.length : 0)
+
+  const tab: FactTab = selectedTab ?? (hasLedgerSection ? 'ledger' : 'items')
+
   if (!activeJob) {
     return (
       <>
-        <PageHeader title="跨章事实" description="人物、物品、秘密与伏笔的一致性追踪。" />
+        <PageHeader title="跨章事实" description="口径锁、随章台账、人物状态、物品、秘密与伏笔的一致性追踪。" />
         <EmptyState icon={<ShieldCheck />} title="还没有选中作品" action={<Button variant="primary" onClick={() => navigate('monitor')}>选择作品</Button>} />
       </>
     )
@@ -81,12 +215,13 @@ export default function FactsPage() {
   const resolved = repairLogs.filter((l) => l.resolved).length
 
   const tabs = [
+    { value: 'ledger' as const, label: '台账', icon: <Layers />, count: ledgerCount },
+    { value: 'characters' as const, label: '人物', icon: <Users />, count: mergedCharacters.length + injuries.length },
     { value: 'items' as const, label: '物品', icon: <Package />, count: items.length },
     { value: 'secrets' as const, label: '秘密', icon: <EyeOff />, count: secrets.length },
-    { value: 'characters' as const, label: '人物', icon: <Users />, count: characters.length + injuries.length },
     { value: 'timeline' as const, label: '时间线', icon: <Clock />, count: timeline.length + locations.length },
     { value: 'foreshadowing' as const, label: '伏笔', icon: <Sparkles />, count: foreshadowing.length },
-    { value: 'repairs' as const, label: '修复日志', icon: <Wrench />, count: repairLogs.length },
+    { value: 'repairs' as const, label: '修复', icon: <Wrench />, count: repairLogs.length },
   ]
 
   return (
@@ -94,47 +229,68 @@ export default function FactsPage() {
       <PageHeader
         eyebrow={title ? `《${title}》` : undefined}
         title="跨章事实"
-        description="每条事实都引用来源章节；越权知情、物品瞬移或伤势冲突会触发自动修复。"
+        description="锁定核心口径、随章追踪时钟余额与人物认知；越权知情、数值冲突或伤势矛盾会触发自动修复。"
       />
 
-      <div className="mb-6 grid grid-cols-2 gap-3 md:grid-cols-4">
-        <Summary icon={<Users />} label="人物" value={characters.length} />
+      <div className={cn('mb-6 grid grid-cols-2 gap-3', hasLedgerSection ? 'md:grid-cols-3 lg:grid-cols-5' : 'md:grid-cols-4')}>
+        {hasLedgerSection && (
+          <Summary
+            icon={<Archive />}
+            label={arcPlans.length > 0 || arcSummaries.length > 0 ? '单元归档' : '核心台账'}
+            value={arcPlans.length > 0 || arcSummaries.length > 0 ? arcSummaries.length : ledgerBalances.length}
+            suffix={arcPlans.length > 0 ? `/ ${arcPlans.length} 段` : ledgerBalances.length > 0 ? '账户' : undefined}
+          />
+        )}
+        <Summary icon={<Users />} label="人物" value={mergedCharacters.length} />
         <Summary icon={<Package />} label="物品" value={items.length} />
         <Summary icon={<Sparkles />} label="伏笔回收" value={paidOff} suffix={`/ ${foreshadowing.length}`} />
         <Summary icon={<Wrench />} label="修复通过" value={resolved} suffix={`/ ${repairLogs.length}`} />
       </div>
 
-      <Segmented value={tab} onChange={setTab} options={tabs} className="mb-5" ariaLabel="事实分类" />
+      <Segmented size="sm" value={tab} onChange={setSelectedTab} options={tabs} className="mb-5" ariaLabel="事实分类" />
 
       <AnimatePresence mode="wait">
         <motion.div key={tab} initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -8 }} transition={{ duration: 0.2 }}>
           <Card padding="lg">
+            {tab === 'ledger' && (
+              hasLedgerSection ? (
+                <LedgerAndArcsView
+                  canonLocks={canonLocks}
+                  storyClock={storyClock}
+                  ledgerBalances={ledgerBalances}
+                  arcPlans={arcPlans}
+                  arcSummaries={arcSummaries}
+                  volumeSummaries={volumeSummaries}
+                />
+              ) : <Empty>暂无核心口径锁、随章台账或单元归档记录</Empty>
+            )}
+
             {tab === 'items' && (
               items.length ? (
-                <Stagger className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
-                  {items.map(({ key, entry }) => (
-                    <StaggerItem key={key}>
+                <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+                  {items.map(({ key, entry }, idx) => (
+                    <FastItem key={key} index={idx}>
                       <FactCard title={entry.name || key} entry={entry}>
                         {entry.location && <Row label="位置"><span className="inline-flex items-center gap-1"><MapPin className="size-3 text-success" />{String(entry.location)}</span></Row>}
                         {Boolean(entry.holder || entry.owner) && <Row label="持有者">{text(entry.holder || entry.owner)}</Row>}
                         {entry.status && <Row label="状态">{String(entry.status)}</Row>}
                         {entry.description && <p className="mt-1 text-caption text-muted">{String(entry.description)}</p>}
                       </FactCard>
-                    </StaggerItem>
+                    </FastItem>
                   ))}
-                </Stagger>
+                </div>
               ) : <Empty>暂无物品位置记录</Empty>
             )}
 
             {tab === 'secrets' && (
               secrets.length ? (
-                <Stagger className="grid gap-3 md:grid-cols-2">
-                  {secrets.map(({ key, entry }) => {
+                <div className="grid gap-3 md:grid-cols-2">
+                  {secrets.map(({ key, entry }, idx) => {
                     const known = (Array.isArray(entry.holders) ? entry.holders : Array.isArray(entry.knownBy) ? entry.knownBy : []) as unknown[]
                     const excluded = (Array.isArray(entry.excludedCharacters) ? entry.excludedCharacters : []) as unknown[]
                     const body = text(entry.secret || entry.description)
                     return (
-                      <StaggerItem key={key}>
+                      <FastItem key={key} index={idx}>
                         <FactCard title={text(entry.name || key)} entry={entry}>
                           {body && <p>{body}</p>}
                           {known.length > 0 && (
@@ -150,42 +306,124 @@ export default function FactsPage() {
                             </div>
                           )}
                         </FactCard>
-                      </StaggerItem>
+                      </FastItem>
                     )
                   })}
-                </Stagger>
+                </div>
               ) : <Empty>暂无秘密知情范围记录</Empty>
             )}
 
             {tab === 'characters' && (
-              characters.length || injuries.length ? (
+              mergedCharacters.length || injuries.length ? (
                 <div className="grid gap-8">
-                  {characters.length > 0 && (
+                  {mergedCharacters.length > 0 && (
                     <div>
-                      <SectionLabel>人物状态</SectionLabel>
-                      <Stagger className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
-                        {characters.map(({ key, entry }) => (
-                          <StaggerItem key={key}>
-                            <FactCard title={entry.name || key} entry={entry}>
-                              <p>{entry.description || entry.status || JSON.stringify(entry)}</p>
-                            </FactCard>
-                          </StaggerItem>
-                        ))}
-                      </Stagger>
+                      <SectionLabel>人物状态与认知锁</SectionLabel>
+                      <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+                        {mergedCharacters.map(({ key, entry, state }, idx) => {
+                          const tier = state?.stanceTier ? STANCE_META[state.stanceTier] : null
+                          const knownFacts = state?.knownFacts ?? []
+                          const knownChapters = state?.knownFactChapters ?? {}
+                          const combinedLinks: Array<[string, CharacterRelationshipChange]> = Object.entries({
+                            ...(state?.relationships ?? {}),
+                            ...(state?.storyRelationships ?? {}),
+                          })
+                            .sort((a, b) => (b[1]?.updatedAtChapter ?? 0) - (a[1]?.updatedAtChapter ?? 0))
+                            .slice(0, 3)
+                          const desc = text(entry.description || entry.status)
+
+                          return (
+                            <FastItem key={key} index={idx}>
+                              <FactCard
+                                title={entry.name || key}
+                                entry={entry}
+                                badge={
+                                  tier ? (
+                                    <Badge
+                                      tone={tier.tone}
+                                      className="h-5 px-2 text-[11px]"
+                                    >
+                                      {tier.label}{state?.stanceTierChapter ? ` · 第${state.stanceTierChapter}章` : ''}
+                                    </Badge>
+                                  ) : undefined
+                                }
+                              >
+                                {desc && <p className="text-body text-body">{desc}</p>}
+                                {state?.currentGoal && <Row label="目标">{state.currentGoal}</Row>}
+                                {state?.emotion && <Row label="情绪">{state.emotion}</Row>}
+                                {!tier && state?.stance && <Row label="立场">{state.stance}</Row>}
+                                {knownFacts.length > 0 && (
+                                  <div className="mt-1 rounded-sm bg-surface/80 p-2.5">
+                                    <div className="mb-1 flex items-center gap-1 text-[11px] font-medium text-muted">
+                                      <Brain className="size-3 text-primary" />已确认认知
+                                    </div>
+                                    <ul className="grid gap-1 text-caption text-ink">
+                                      {knownFacts.map((fact, factIdx) => (
+                                        <li key={factIdx} className="flex items-start justify-between gap-2">
+                                          <span className="min-w-0">· {fact}</span>
+                                          {knownChapters[fact] && (
+                                            <span className="shrink-0 text-[11px] tabular-nums text-muted">第{knownChapters[fact]}章</span>
+                                          )}
+                                        </li>
+                                      ))}
+                                    </ul>
+                                  </div>
+                                )}
+                                {combinedLinks.length > 0 && (
+                                  <div className="mt-1 flex flex-wrap gap-1.5">
+                                    {combinedLinks.map(([other, rel]) => (
+                                      <Tag key={other} className="h-auto bg-surface py-1 text-[11px]">
+                                        <span className="font-medium text-ink">{other}</span>
+                                        <span className="mx-1 text-muted">·</span>
+                                        <span>{rel.change || '关系变化'}</span>
+                                        {rel.updatedAtChapter ? <span className="ml-1 tabular-nums text-muted">（第{rel.updatedAtChapter}章）</span> : null}
+                                      </Tag>
+                                    ))}
+                                  </div>
+                                )}
+                                {!desc && !state?.currentGoal && !state?.emotion && !knownFacts.length && !combinedLinks.length && (
+                                  <p className="text-caption text-muted">已纳入人物状态追踪</p>
+                                )}
+                              </FactCard>
+                            </FastItem>
+                          )
+                        })}
+                      </div>
                     </div>
                   )}
                   {injuries.length > 0 && (
                     <div>
                       <SectionLabel><span className="inline-flex items-center gap-1.5 text-danger"><HeartPulse className="size-3.5" />伤势追踪</span></SectionLabel>
-                      <Stagger className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
-                        {injuries.map(({ key, entry }) => (
-                          <StaggerItem key={key}>
-                            <FactCard tone="danger" title={entry.name || key} entry={entry}>
-                              <p>{entry.description || entry.status || entry.severity || JSON.stringify(entry)}</p>
-                            </FactCard>
-                          </StaggerItem>
-                        ))}
-                      </Stagger>
+                      <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+                        {injuries.map(({ key, entry }, idx) => {
+                          const healed = isHealedInjury(entry)
+                          const bodyPart = text(entry.bodyPart)
+                          const rawSeverity = text(entry.severity)
+                          const severity = SEVERITY_LABEL[rawSeverity.toLowerCase()] ?? rawSeverity
+                          const owner = text(entry.character || entry.name || key)
+                          return (
+                            <FastItem key={`${key}-${idx}`} index={idx}>
+                              <FactCard
+                                tone={healed ? 'success' : 'danger'}
+                                title={owner}
+                                entry={entry}
+                                badge={
+                                  <>
+                                    {bodyPart && <Tag className="h-5 bg-surface/85 px-2 text-[11px]">{bodyPart}</Tag>}
+                                    {healed
+                                      ? <Tag className="h-5 bg-surface/85 px-2 text-[11px] font-medium text-success">已愈</Tag>
+                                      : severity
+                                        ? <Tag className="h-5 bg-surface/85 px-2 text-[11px] font-medium text-danger">{severity}</Tag>
+                                        : null}
+                                  </>
+                                }
+                              >
+                                <p>{text(entry.description || entry.injury || entry.status || rawSeverity || entry)}</p>
+                              </FactCard>
+                            </FastItem>
+                          )
+                        })}
+                      </div>
                     </div>
                   )}
                 </div>
@@ -254,6 +492,375 @@ export default function FactsPage() {
         </motion.div>
       </AnimatePresence>
     </>
+  )
+}
+
+/* ---------------- Phase 3–4 Ledger & Arcs View ---------------- */
+
+function LedgerAndArcsView({
+  canonLocks,
+  storyClock,
+  ledgerBalances,
+  arcPlans,
+  arcSummaries,
+  volumeSummaries,
+}: {
+  canonLocks: CanonLocks | null
+  storyClock: StoryClock | null
+  ledgerBalances: LedgerBalance[]
+  arcPlans: ArcPlan[]
+  arcSummaries: ArcSummary[]
+  volumeSummaries: VolumeSummary[]
+}) {
+  const showLocks = hasCanonLocks(canonLocks)
+  const showClock = hasStoryClock(storyClock)
+
+  /* Merge arcPlans and arcSummaries chronologically */
+  const arcRecords = useMemo(() => {
+    const map = new Map<number, { index: number; plan?: ArcPlan; summary?: ArcSummary }>()
+    for (const plan of arcPlans) {
+      map.set(plan.arcIndex, { index: plan.arcIndex, plan })
+    }
+    for (const summary of arcSummaries) {
+      const idx = typeof summary.arc === 'number' ? summary.arc : map.size + 1
+      const existing = map.get(idx)
+      map.set(idx, { index: idx, plan: existing?.plan, summary })
+    }
+    return Array.from(map.values()).sort((a, b) => {
+      const startA = a.plan?.startChapter ?? a.summary?.startChapter ?? a.index
+      const startB = b.plan?.startChapter ?? b.summary?.startChapter ?? b.index
+      return startA - startB
+    })
+  }, [arcPlans, arcSummaries])
+
+  return (
+    <div className="grid gap-8">
+      {/* 1. Core Canon Locks */}
+      {showLocks && canonLocks && (
+        <motion.section
+          initial={{ opacity: 0, y: 6 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.25 }}
+        >
+          <SectionLabel
+            actions={<Badge tone="primary" icon={<Lock />}>不可变硬基准</Badge>}
+          >
+            核心口径锁
+          </SectionLabel>
+          <div className="rounded-md border border-primary/15 bg-[image:var(--nf-gradient-soft)] p-5">
+            <div className="grid gap-4 md:grid-cols-2">
+              {canonLocks.powerScale && (
+                <div className="rounded-md bg-surface/85 p-3.5 shadow-card">
+                  <div className="text-caption font-medium text-muted">战力与体系标尺</div>
+                  <p className="mt-1 text-body text-ink">{canonLocks.powerScale}</p>
+                </div>
+              )}
+              {canonLocks.currencyAndEra && (
+                <div className="rounded-md bg-surface/85 p-3.5 shadow-card">
+                  <div className="text-caption font-medium text-muted">货币与时代口径</div>
+                  <p className="mt-1 text-body text-ink">{canonLocks.currencyAndEra}</p>
+                </div>
+              )}
+            </div>
+            {(canonLocks.worldTaboos?.length || canonLocks.keyAssets?.length) ? (
+              <div className="mt-4 grid gap-3 md:grid-cols-2">
+                {canonLocks.worldTaboos && canonLocks.worldTaboos.length > 0 && (
+                  <div>
+                    <div className="mb-1.5 flex items-center gap-1.5 text-caption font-medium text-danger">
+                      <ShieldAlert className="size-3.5" />世界硬禁忌
+                    </div>
+                    <div className="flex flex-wrap gap-1.5">
+                      {canonLocks.worldTaboos.map((item, i) => (
+                        <span key={i} className="rounded-sm bg-danger-soft px-2.5 py-1 text-caption text-danger">
+                          {item}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                )}
+                {canonLocks.keyAssets && canonLocks.keyAssets.length > 0 && (
+                  <div>
+                    <div className="mb-1.5 flex items-center gap-1.5 text-caption font-medium text-primary">
+                      <Sparkles className="size-3.5" />核心资产与金手指
+                    </div>
+                    <div className="flex flex-wrap gap-1.5">
+                      {canonLocks.keyAssets.map((item, i) => (
+                        <span key={i} className="rounded-sm bg-surface/90 px-2.5 py-1 text-caption text-ink shadow-card">
+                          {item}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            ) : null}
+          </div>
+        </motion.section>
+      )}
+
+      {/* 2. Story Clock & Ledger Balances */}
+      {(showClock || ledgerBalances.length > 0) && (
+        <div className={cn('grid gap-6', showClock && ledgerBalances.length > 0 && 'lg:grid-cols-[minmax(0,1fr)_minmax(0,1.45fr)]')}>
+          {showClock && storyClock && (
+            <section>
+              <SectionLabel>剧情时钟</SectionLabel>
+              <Stagger className="grid grid-cols-2 gap-3">
+                {([
+                  ['day', '当前天数', storyClock.day],
+                  ['season', '季节气候', storyClock.season],
+                  ['timeOfDay', '叙事时段', storyClock.timeOfDay],
+                  ['countdown', '关键倒计时', storyClock.countdown],
+                ] as const).filter(([, , val]) => Boolean(val)).map(([field, label, val]) => {
+                  const ch = storyClock.fieldChapters?.[field]
+                  return (
+                    <StaggerItem key={field}>
+                      <div className="h-full rounded-md bg-surface-2 p-3.5 transition-colors hover:bg-surface-3">
+                        <div className="flex items-center justify-between gap-2 text-caption text-muted">
+                          <span className="inline-flex items-center gap-1"><Clock className="size-3 text-primary" />{label}</span>
+                          {ch ? <span className="tabular-nums text-[11px] text-primary">第{ch}章</span> : null}
+                        </div>
+                        <div className="mt-1.5 font-display text-title font-medium text-ink">{val}</div>
+                      </div>
+                    </StaggerItem>
+                  )
+                })}
+              </Stagger>
+            </section>
+          )}
+
+          {ledgerBalances.length > 0 && (
+            <section>
+              <SectionLabel actions={<span className="text-caption tabular-nums text-muted">核心账户 · {ledgerBalances.length} / 6</span>}>
+                核心余额账本
+              </SectionLabel>
+              <Stagger className="grid gap-3 sm:grid-cols-2">
+                {ledgerBalances.map((account) => (
+                  <StaggerItem key={account.label}>
+                    <div className="h-full rounded-md bg-surface-2 p-4 transition-colors hover:bg-surface-3">
+                      <div className="flex items-start justify-between gap-2">
+                        <span className="inline-flex items-center gap-1.5 text-caption font-medium text-muted">
+                          <Coins className="size-3.5 text-warning" />
+                          {account.label}
+                        </span>
+                        {account.updatedAtChapter ? (
+                          <Badge tone="primary" className="h-5 px-2 text-[11px]">第 {account.updatedAtChapter} 章</Badge>
+                        ) : null}
+                      </div>
+                      <div className="mt-1.5 font-display text-headline font-normal tabular-nums text-ink">{account.value}</div>
+                      {account.recentChanges && account.recentChanges.length > 0 && (
+                        <div className="mt-2.5 flex flex-wrap gap-1.5">
+                          {account.recentChanges.map((mv, idx) => (
+                            <span
+                              key={`${mv.chapter}-${idx}`}
+                              className="inline-flex items-center gap-1 rounded-sm bg-surface px-2 py-0.5 text-[11px] tabular-nums text-body"
+                            >
+                              <span className="text-muted">第{mv.chapter}章</span>
+                              {mv.change && <span className="font-medium text-primary">{mv.change}</span>}
+                              <span>→ {mv.value}</span>
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  </StaggerItem>
+                ))}
+              </Stagger>
+            </section>
+          )}
+        </div>
+      )}
+
+      {/* 3. Rolling Arc Plans + Archives & Drift Checks */}
+      {arcRecords.length > 0 && (
+        <section>
+          <SectionLabel actions={<span className="text-caption tabular-nums text-muted">共 {arcRecords.length} 个剧情单元</span>}>
+            滚动单元与归档快检
+          </SectionLabel>
+          <Stagger className="grid gap-4">
+            {arcRecords.map(({ index, plan, summary }) => {
+              const start = plan?.startChapter ?? summary?.startChapter ?? 1
+              const end = plan?.endChapter ?? summary?.endChapter ?? start
+              const driftChecks = summary?.driftChecks ?? []
+              const usedBeats = summary?.usedBeats ?? []
+              const usedHooks = summary?.usedHooks ?? []
+              const turningPoints = summary?.turningPoints ?? []
+              const needsReview = summary?.needsReviewChapters ?? []
+
+              return (
+                <StaggerItem key={index}>
+                  <div className="rounded-md bg-surface-2 p-5 transition-colors hover:bg-surface-3/70">
+                    <div className="flex flex-wrap items-start justify-between gap-2">
+                      <div className="min-w-0">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="font-display text-title font-medium text-ink">
+                            第 {index} 单元{plan?.arcTitle ? ` · ${plan.arcTitle}` : ''}
+                          </span>
+                          <Badge tone="neutral" className="tabular-nums">第 {start}–{end} 章</Badge>
+                          {summary
+                            ? <Badge tone="success" dot>已归档</Badge>
+                            : <Badge tone="primary" dot>规划中 / 推进中</Badge>}
+                          {driftChecks.length > 0 && (
+                            <Badge tone="warning" icon={<AlertTriangle />}>快检提醒 {driftChecks.length}</Badge>
+                          )}
+                          {needsReview.length > 0 && (
+                            <Badge tone="warning">待复核：第 {needsReview.join('、')} 章</Badge>
+                          )}
+                        </div>
+                        {plan?.arcGoal && (
+                          <p className="mt-1.5 text-caption text-muted">单元目标：{plan.arcGoal}</p>
+                        )}
+                      </div>
+                    </div>
+
+                    {summary?.mainline && (
+                      <p className="mt-3 rounded-sm bg-surface/85 px-3.5 py-2.5 text-body text-ink">{summary.mainline}</p>
+                    )}
+
+                    {/* Turning points */}
+                    {turningPoints.length > 0 && (
+                      <div className="mt-3 flex flex-wrap gap-2">
+                        {turningPoints.map((pt, i) => (
+                          <span key={i} className="inline-flex items-center gap-1.5 rounded-sm bg-surface px-2.5 py-1 text-caption text-body">
+                            {pt.chapter ? <span className="font-medium tabular-nums text-primary">第{pt.chapter}章</span> : null}
+                            <span>{pt.text}</span>
+                          </span>
+                        ))}
+                      </div>
+                    )}
+
+                    {/* Villain status / planned chips */}
+                    {(summary?.villainStatus || (plan?.villainChips && plan.villainChips.length > 0)) && (
+                      <div className="mt-3 grid gap-1.5 text-caption">
+                        {summary?.villainStatus && (
+                          <Row label="反派动向">{summary.villainStatus}</Row>
+                        )}
+                        {plan?.villainChips && plan.villainChips.length > 0 && (
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            <span className="text-muted">本单元筹码</span>
+                            {plan.villainChips.map((v, i) => (
+                              <Tag key={i} className="h-auto bg-surface py-0.5 text-[11px]">
+                                <span className="font-medium text-ink">{v.villain}</span>
+                                {v.exitPlan && (
+                                  <span className="ml-1 text-muted">({EXIT_PLAN_LABEL[v.exitPlan] ?? v.exitPlan})</span>
+                                )}
+                                {v.newChips?.length ? <span className="ml-1 text-body">：{v.newChips.join('、')}</span> : null}
+                              </Tag>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    {/* Used Beats & Used Hooks */}
+                    {(usedBeats.length > 0 || usedHooks.length > 0) && (
+                      <div className="mt-3.5 grid gap-2.5 md:grid-cols-2">
+                        {usedBeats.length > 0 && (
+                          <div>
+                            <div className="mb-1.5 flex items-center gap-1 text-[11px] font-medium text-muted">
+                              <TagIcon className="size-3 text-primary" />已演桥段（后续规避重复）
+                            </div>
+                            <div className="flex flex-wrap gap-1.5">
+                              {usedBeats.map((beat, i) => (
+                                <span
+                                  key={i}
+                                  title={beat.quote ? `原文引证：「${beat.quote}」` : undefined}
+                                  className="inline-flex items-center gap-1 rounded-sm bg-primary-soft/80 px-2 py-0.5 text-caption text-primary"
+                                >
+                                  {beat.chapter ? <span className="tabular-nums opacity-75">第{beat.chapter}章</span> : null}
+                                  <span>{beat.text}</span>
+                                </span>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                        {usedHooks.length > 0 && (
+                          <div>
+                            <div className="mb-1.5 flex items-center gap-1 text-[11px] font-medium text-muted">
+                              <Sparkles className="size-3 text-muted" />已用章末钩子
+                            </div>
+                            <div className="flex flex-wrap gap-1.5">
+                              {usedHooks.map((hook, i) => (
+                                <span
+                                  key={i}
+                                  title={hook.quote ? `原文引证：「${hook.quote}」` : undefined}
+                                  className="inline-flex items-center gap-1 rounded-sm bg-surface px-2 py-0.5 text-caption text-body"
+                                >
+                                  {hook.chapter ? <span className="tabular-nums text-muted">第{hook.chapter}章</span> : null}
+                                  <span>{hook.text}</span>
+                                </span>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    {/* Drift Checks */}
+                    {driftChecks.length > 0 && (
+                      <div className="mt-4 rounded-md border border-warning/30 bg-warning-soft/75 p-3.5">
+                        <div className="mb-2 flex items-center gap-1.5 text-caption font-medium text-warning">
+                          <AlertTriangle className="size-3.5" />
+                          单元一致性快检（已注入下一单元滚纲）
+                        </div>
+                        <ul className="grid gap-2">
+                          {driftChecks.map((dc, i) => (
+                            <li key={i} className="rounded-sm bg-surface/90 px-3 py-2 text-caption">
+                              <div className="flex flex-wrap items-center gap-2">
+                                <Badge tone="warning" className="h-5 px-2 text-[11px]">
+                                  {DRIFT_KIND_LABEL[dc.kind] ?? dc.kind} · 第 {dc.chapter} 章
+                                </Badge>
+                                <span className="font-medium text-ink">{dc.issue}</span>
+                              </div>
+                              {dc.fixHint && <p className="mt-1 text-body">衔接建议：{dc.fixHint}</p>}
+                              {dc.quote && <p className="mt-1 truncate text-[11px] text-muted" title={dc.quote}>原文：「{dc.quote}」</p>}
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                  </div>
+                </StaggerItem>
+              )
+            })}
+          </Stagger>
+        </section>
+      )}
+
+      {/* 4. Legacy Volume Summaries Fallback */}
+      {arcRecords.length === 0 && volumeSummaries.length > 0 && (
+        <section>
+          <SectionLabel actions={<span className="text-caption tabular-nums text-muted">共 {volumeSummaries.length} 卷</span>}>
+            卷摘要归档
+          </SectionLabel>
+          <Stagger className="grid gap-3">
+            {volumeSummaries.map((vol, idx) => (
+              <StaggerItem key={vol.volume ?? idx}>
+                <div className="rounded-md bg-surface-2 p-4">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="text-body font-medium text-ink">第 {vol.volume ?? idx + 1} 卷</span>
+                    <Badge tone="neutral" className="tabular-nums">第 {vol.startChapter}–{vol.endChapter} 章</Badge>
+                    {vol.needsReviewChapters?.length ? (
+                      <Badge tone="warning">待复核：第 {vol.needsReviewChapters.join('、')} 章</Badge>
+                    ) : null}
+                  </div>
+                  <p className="mt-2 text-body text-ink">{vol.mainline}</p>
+                  {vol.turningPoints && vol.turningPoints.length > 0 && (
+                    <div className="mt-2.5 flex flex-wrap gap-1.5">
+                      {vol.turningPoints.map((pt, i) => (
+                        <Tag key={i} className="h-auto bg-surface py-0.5 text-[11px]">
+                          {pt.chapter ? <span className="mr-1 font-medium tabular-nums text-primary">第{pt.chapter}章</span> : null}
+                          {pt.text}
+                        </Tag>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </StaggerItem>
+            ))}
+          </Stagger>
+        </section>
+      )}
+    </div>
   )
 }
 

@@ -14,7 +14,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
-from .long_memory import empty_long_memory, normalize_memory_delta, normalize_volume_summary, replay_long_memory
+from .arc_planning import legacy_outline_placeholder, prior_arc_summaries, saved_arc_plans
+from .long_memory import empty_long_memory, normalize_arc_summary, normalize_memory_delta, normalize_volume_summary, replay_long_memory
 from .providers import (
     PROVIDERS, ProviderCatalogError, get_provider_definition, is_masked_api_key, mask_api_key,
     normalize_model_ids, provider_requires_key, same_endpoint_origin,
@@ -166,6 +167,16 @@ def volume_source_hash(chapters):
     ])
 
 
+def arc_context_version(facts, preceding, before):
+    return (
+        tuple((row.get("arc"), row["startChapter"], row["endChapter"], row.get("sourceHash"))
+              for row in prior_arc_summaries(facts, before)),
+        tuple((row.get("endChapter"), row.get("sourceHash")) for row in _list(facts.get("volumeSummaries"))
+              if isinstance(row, dict) and _number(row.get("endChapter"), math.inf) < before),
+        volume_source_hash(preceding[-5:]),
+    )
+
+
 def revision_manuscript_state(job, chapters, active=False):
     if active or job.get("evaluationStatus") == "running" or job.get("status") not in ("completed", "failed"):
         return "busy"
@@ -179,13 +190,17 @@ def revision_manuscript_state(job, chapters, active=False):
     return "ready"
 
 
-def _invalidate_volumes(facts, chapters):
-    volumes = _list(facts.get("volumeSummaries"))
-    if not volumes:
-        return facts
-    return {**facts, "volumeSummaries": [volume for volume in volumes if not any(
-        volume["startChapter"] <= chapter <= volume["endChapter"] for chapter in chapters
-    )]}
+def _archive_touches(archive, chapters):
+    row = _dict(archive)
+    start, end = _number(row.get("startChapter")), _number(row.get("endChapter"))
+    return any(start <= chapter <= end for chapter in chapters)
+
+
+def _invalidate_archives(facts, chapters):
+    return {
+        **facts, **{kind: [row for row in _list(facts.get(kind)) if not _archive_touches(row, chapters)]
+                   for kind in ("volumeSummaries", "arcSummaries") if kind in facts},
+    }
 
 
 def _job_record(data, config, now):
@@ -453,9 +468,16 @@ class Store:
         rows = db.execute("SELECT payload FROM chapters WHERE job_id = ? ORDER BY number", (job_id,))
         return [json.loads(row[0]) for row in rows]
 
-    def get_chapters(self, job_id):
+    def get_chapters(self, job_id, *, start_chapter=None, end_chapter=None):
         with self._connection() as db:
-            return self._get_chapters(db, job_id)
+            if start_chapter is None and end_chapter is None:
+                return self._get_chapters(db, job_id)
+            rows = db.execute(
+                "SELECT payload FROM chapters WHERE job_id=? AND number BETWEEN ? AND ? ORDER BY number",
+                (job_id, start_chapter if start_chapter is not None else 1,
+                 end_chapter if end_chapter is not None else 2**63 - 1),
+            )
+            return [json.loads(row[0]) for row in rows]
 
     @staticmethod
     def _get_chapter(db, job_id, number):
@@ -472,7 +494,7 @@ class Store:
                       ON CONFLICT(job_id, number) DO UPDATE SET payload=excluded.payload""",
                    (job_id, chapter["chapterNumber"], _json(chapter)))
 
-    def _save_chapter(self, job_id, number, data, facts_delta, long_memory):
+    def _save_chapter(self, job_id, number, data, facts_delta, long_memory, *, meme_title=None, story_ledger=False):
         number = _number(number, None)
         if type(number) is not int or number < 1:
             raise ValueError("Chapter number must be a positive integer")
@@ -495,48 +517,55 @@ class Store:
             updated = {**job, "chapterIndex": index, "updatedAt": now,
                        "completedChapters": sum(_is_committed(item) for item in index.values()),
                        "totalWords": sum(_number(item.get("wordCount")) for item in index.values())}
+            if meme_title and _is_committed(chapter):
+                updated["usedMemeTitles"] = _unique_strings([*_list(job.get("usedMemeTitles")), meme_title])
             if facts_delta is not None and chapter["status"] != "needs_review":
                 updated["canonicalFacts"] = _merge_chapter_facts(job.get("canonicalFacts"), number, facts_delta,
-                                                               long_memory, content, now)
+                                                               long_memory, content, now, story_ledger=story_ledger,
+                                                               book_plan=job.get("bookPlan"))
             current = _dict(job.get("canonicalFacts"))
-            volumes = _list(current.get("volumeSummaries"))
-            if any(volume["startChapter"] <= number <= volume["endChapter"] for volume in volumes):
+            archives = [*_list(current.get("volumeSummaries")), *_list(current.get("arcSummaries"))]
+            if any(_archive_touches(archive, [number]) for archive in archives):
                 previous = self._get_chapter(db, job_id, number) or {}
                 if (any(previous.get(key) != chapter[key] for key in ("title", "content", "summary"))
                         or (previous.get("status") == "needs_review") != (chapter["status"] == "needs_review")
                         or (_is_committed(previous) and not _is_committed(chapter))):
-                    updated["canonicalFacts"] = _invalidate_volumes(_dict(updated.get("canonicalFacts")), [number])
+                    updated["canonicalFacts"] = _invalidate_archives(_dict(updated.get("canonicalFacts")), [number])
             self._write_chapter(db, job_id, chapter)
             self._write_job(db, updated)
         return chapter, _canonical_facts(updated.get("canonicalFacts"))
 
-    def save_chapter(self, job_id, number, data, *, facts_delta=None, long_memory=False):
-        chapter, _ = self._save_chapter(job_id, number, data, facts_delta, long_memory)
+    def save_chapter(self, job_id, number, data, *, facts_delta=None, long_memory=False, story_ledger=False):
+        chapter, _ = self._save_chapter(job_id, number, data, facts_delta, long_memory, story_ledger=story_ledger)
         return chapter
 
-    def save_verified_chapter(self, job_id, number, data, facts_delta=None, *, long_memory=False):
-        chapter, facts = self._save_chapter(job_id, number, data, facts_delta, long_memory)
+    def save_verified_chapter(self, job_id, number, data, facts_delta=None, *, long_memory=False, meme_title=None,
+                              story_ledger=False):
+        chapter, facts = self._save_chapter(job_id, number, data, facts_delta, long_memory, meme_title=meme_title,
+                                           story_ledger=story_ledger)
         return {"chapter": chapter, "canonicalFacts": facts}
 
     def get_canonical_facts(self, job_id):
         with self._connection() as db:
             return _canonical_facts(self._get_job(db, job_id, required=True).get("canonicalFacts"))
 
-    def commit_chapter_facts(self, job_id, number, facts_delta=None, *, long_memory=False, chapter_text=None):
+    def commit_chapter_facts(self, job_id, number, facts_delta=None, *, long_memory=False, chapter_text=None,
+                             story_ledger=False):
         number = _number(number, None)
         if type(number) is not int or number < 1:
             raise ValueError("Chapter number must be a positive integer")
         with self._write() as db:
             job = self._get_job(db, job_id, required=True)
             now = _now()
-            facts = _merge_chapter_facts(job.get("canonicalFacts"), number, facts_delta or {}, long_memory, chapter_text, now)
+            facts = _merge_chapter_facts(job.get("canonicalFacts"), number, facts_delta or {}, long_memory, chapter_text, now,
+                                         story_ledger=story_ledger, book_plan=job.get("bookPlan"))
             self._write_job(db, {**job, "canonicalFacts": facts, "updatedAt": now})
         return facts
 
     def delete_uncommitted_facts(self, job_id, from_chapter):
         with self._write() as db:
             job = self._get_job(db, job_id, required=True)
-            facts = _rollback_facts(job.get("canonicalFacts"), _number(from_chapter))
+            facts = _rollback_facts(job.get("canonicalFacts"), _number(from_chapter), book_plan=job.get("bookPlan"))
             self._write_job(db, {**job, "canonicalFacts": facts, "updatedAt": _now()})
         return facts
 
@@ -570,12 +599,79 @@ class Store:
             self._write_job(db, {**job, "canonicalFacts": facts, "updatedAt": _now()})
             return True
 
-    def save_checkpoint(self, job_id, checkpoint):
+    def save_checkpoint(self, job_id, checkpoint, *, outlines=None):
         with self._write() as db:
             job = self._get_job(db, job_id, required=True)
             saved = {**checkpoint, "savedAt": _now()}
+            if outlines is not None:
+                job["outlines"] = outlines
             self._write_job(db, {**job, "checkpoint": saved, "updatedAt": saved["savedAt"]})
         return saved
+
+    def save_arc_plan(self, job_id, arc, outlines, *, total, expected_context, checkpoint):
+        """Save one full arc and its cursor as a single job update."""
+        start, end = arc["startChapter"], arc["endChapter"]
+        if not 1 <= start <= end <= total or [row["chapterNumber"] for row in outlines] != list(range(start, end + 1)):
+            return False
+        with self._write() as db:
+            job = self._get_job(db, job_id, required=True)
+            if job.get("totalChapters") != total:
+                return False
+            preceding = [row for row in self._get_chapters(db, job_id)
+                         if row["chapterNumber"] < start and _is_committed(row)]
+            facts = _dict(job.get("canonicalFacts"))
+            if arc_context_version(facts, preceding, start) != expected_context:
+                return False
+            plans = saved_arc_plans(job)
+            if any(record["arcIndex"] == arc["arcIndex"] or
+                   record["startChapter"] <= end and start <= record["endChapter"] for record in plans):
+                return False
+            previous = {}
+            for value in _list(job.get("outlines")):
+                row = _dict(value)
+                number = _number(row.get("chapterNumber"))
+                if type(number) is int and 1 <= number <= total:
+                    previous.setdefault(number, row)
+            for number in range(start, end + 1):
+                if number in previous and not legacy_outline_placeholder(previous[number], number):
+                    return False
+                chapter = self._get_chapter(db, job_id, number)
+                if chapter and _is_committed(chapter):
+                    return False
+            previous.update((row["chapterNumber"], row) for row in outlines)
+            now = _now()
+            self._write_job(db, {**job, "arcPlans": [*plans, arc], "outlines": [previous[n] for n in sorted(previous)],
+                                 "checkpoint": {**checkpoint, "savedAt": now}, "updatedAt": now})
+            return True
+
+    def save_arc_summary(self, job_id, arc, source_hash, summary, *, story_ledger=False):
+        start, end = arc["startChapter"], arc["endChapter"]
+        index = arc["arcIndex"]
+        with self._write() as db:
+            job = self._get_job(db, job_id, required=True)
+            if not any((row["arcIndex"], row["startChapter"], row["endChapter"]) == (index, start, end)
+                       for row in saved_arc_plans(job)):
+                return False
+            rows = db.execute("SELECT payload FROM chapters WHERE job_id=? AND number BETWEEN ? AND ? ORDER BY number",
+                              (job_id, start, end))
+            chapters = [json.loads(row[0]) for row in rows]
+            if ([row["chapterNumber"] for row in chapters] != list(range(start, end + 1))
+                    or not all(_is_committed(row) for row in chapters) or volume_source_hash(chapters) != source_hash):
+                return False
+            facts = _canonical_facts(job.get("canonicalFacts"))
+            archives = _list(facts["arcSummaries"])
+            if any(_dict(row).get("arc") == index and row.get("sourceHash") == source_hash for row in archives):
+                return True
+            normalized = normalize_arc_summary(summary, chapters, story_ledger=story_ledger)
+            if normalized is None:
+                return False
+            review = [row["chapterNumber"] for row in chapters if row.get("status") == "needs_review"]
+            record = {"arc": index, "startChapter": start, "endChapter": end, "sourceHash": source_hash, **normalized,
+                      **({"needsReviewChapters": review} if review else {})}
+            facts["arcSummaries"] = sorted([row for row in archives if isinstance(row, dict) and row.get("arc") != index] + [record],
+                                           key=lambda row: _number(row.get("endChapter")))
+            self._write_job(db, {**job, "canonicalFacts": facts, "updatedAt": _now()})
+            return True
 
     def append_job_log(self, job_id, entry):
         with self._write() as db:
@@ -654,7 +750,7 @@ class Store:
                 "evaluationProgress": "已应用修订稿，可以重新评估。",
             }
             if job.get("canonicalFacts") is not None and changed:
-                updated["canonicalFacts"] = _invalidate_volumes(job["canonicalFacts"], changed)
+                updated["canonicalFacts"] = _invalidate_archives(job["canonicalFacts"], changed)
             self._write_job(db, updated)
 
 
@@ -688,7 +784,7 @@ def _empty_facts():
     return {
         "characters": {}, "injuries": [], "timeline": [], "items": {}, "secrets": [],
         "locations": {}, "foreshadowing": [], "relations": [], "factHistory": [],
-        **empty_long_memory(), "volumeSummaries": [],
+        **empty_long_memory(), "volumeSummaries": [], "arcSummaries": [],
     }
 
 
@@ -711,7 +807,78 @@ def _matching_index(entries, match):
     return next((i for i, entry in enumerate(entries) if match(entry)), None)
 
 
-def _merge_chapter_facts(saved, number, delta, long_memory, chapter_text, timestamp):
+_INJURY_PART = re.compile(r"左前臂|右前臂|左上臂|右上臂|左臂|右臂|左肩|右肩|左手|右手|左腿|右腿|双腿|胸口")
+
+
+def _injury_part(entry):
+    for field in ("bodyPart", "description"):
+        matches = {re.sub(r"[前上]臂$", "臂", part) for part in _INJURY_PART.findall(str(entry.get(field) or ""))}
+        if matches:
+            return next(iter(matches)) if len(matches) == 1 else None
+    return None
+
+
+def _apply_injuries(injuries, changes, number):
+    for ordinal, change in enumerate(_list(changes), 1):
+        change = _dict(change)
+        character = change.get("character")
+        if not isinstance(character, str) or not character.strip():
+            continue
+        identifier = change.get("id") if isinstance(change.get("id"), str) else None
+        description = change.get("description")
+        part = _injury_part(change)
+        active = change.get("active") is not False
+        candidates = [(i, row) for i, row in enumerate(injuries)
+                      if row.get("character") == character and _number(row.get("sourceChapter")) <= number]
+        index = next((i for i, row in candidates if identifier and row.get("id") == identifier), None)
+        candidates = [(i, row) for i, row in candidates if row.get("active") is not False]
+        if index is None and isinstance(description, str) and description.strip():
+            index = next((i for i, row in candidates if row.get("description") == description), None)
+        if index is None and part:
+            matches = [i for i, row in candidates if _injury_part(row) == part]
+            if len(matches) == 1:
+                index = matches[0]
+            elif matches and not identifier:
+                continue
+        if index is None and (not active or not isinstance(description, str) or not description.strip()):
+            continue
+
+        previous = injuries[index] if index is not None else {}
+        if "active" not in change and previous:
+            active = previous.get("active") is not False
+        if previous.get("id"):
+            identifier = previous["id"]
+        elif not identifier or any(row.get("id") == identifier for row in injuries):
+            identifier = f"inj_{number}_{ordinal}"
+            while any(row.get("id") == identifier for row in injuries):
+                identifier += "_new"
+        record = {
+            **previous, "id": identifier,
+            "character": character, "severity": change.get("severity") or previous.get("severity") or "medium",
+            "active": active, "sourceChapter": _first_non_null(previous.get("sourceChapter"), number),
+            "updatedAtChapter": number, "healedChapter": None if active else (
+                _first_non_null(previous.get("healedChapter"), number) if "active" not in change else number
+            ),
+        }
+        if active and isinstance(description, str) and description.strip():
+            record["description"] = description
+        if part:
+            record["bodyPart"] = part
+        if index is None:
+            injuries.append(record)
+        else:
+            injuries[index] = record
+
+
+def _replay_injuries(base, history):
+    injuries = [dict(entry) for entry in _list(base) if isinstance(entry, dict)]
+    for row in sorted(_list(history), key=lambda entry: _number(_dict(entry).get("chapter"))):
+        if _dict(row).get("injuryMergeVersion") == 1:
+            _apply_injuries(injuries, _dict(row.get("delta")).get("injuries"), _number(row.get("chapter")))
+    return injuries
+
+
+def _merge_chapter_facts(saved, number, delta, long_memory, chapter_text, timestamp, *, story_ledger=False, book_plan=None):
     facts = _canonical_facts(saved)
     for name, info in _named_entries(delta.get("characters"), "name"):
         if not name:
@@ -725,25 +892,10 @@ def _merge_chapter_facts(saved, number, delta, long_memory, chapter_text, timest
             "sourceChapter": _first_non_null(previous.get("sourceChapter"), number), "updatedAtChapter": number,
         }
 
-    for injury in _list(delta.get("injuries")):
-        if not _dict(injury).get("character"):
-            continue
-        index = _matching_index(facts["injuries"], lambda item:
-                                item.get("character") == injury["character"] and item.get("description") == injury.get("description"))
-        record = {
-            "id": injury.get("id") or f'inj_{number}_{len(facts["injuries"]) + 1}',
-            "character": injury["character"], "severity": injury.get("severity") or "medium",
-            "active": injury.get("active", True), "sourceChapter": _first_non_null(injury.get("sourceChapter"), number),
-            "healedChapter": _first_non_null(injury.get("healedChapter"), number if injury.get("active") is False else None),
-        }
-        if "description" in injury:
-            record["description"] = injury["description"]
-        if index is not None:
-            facts["injuries"][index] = {**facts["injuries"][index], **record}
-            if "description" not in injury:
-                facts["injuries"][index].pop("description", None)
-        else:
-            facts["injuries"].append(record)
+    has_injury_changes = bool(_list(delta.get("injuries")))
+    if has_injury_changes and "injuryReplayBase" not in facts:
+        # Old books may have verified injuries without matching history entries.
+        facts["injuryReplayBase"] = [dict(entry) for entry in _list(facts["injuries"]) if isinstance(entry, dict)]
 
     if isinstance(delta.get("timeline"), list):
         facts["timeline"] = [item for item in facts["timeline"] if _number(item.get("sourceChapter")) != number]
@@ -825,18 +977,26 @@ def _merge_chapter_facts(saved, number, delta, long_memory, chapter_text, timest
         else:
             facts["relations"].append(record)
 
-    memory = normalize_memory_delta(delta.get("memory"), number, chapter_text) if long_memory else None
+    history = [item for item in _list(facts["factHistory"]) if _number(_dict(item).get("chapter")) != number]
+    memory = normalize_memory_delta(
+        delta.get("memory"), number, chapter_text, story_ledger=story_ledger, long_memory=long_memory,
+        book_plan=book_plan, history=history,
+    ) if long_memory or story_ledger else None
     recorded = {key: value for key, value in delta.items() if key != "memory"}
     if memory:
         recorded["memory"] = memory
-    history = [item for item in _list(facts["factHistory"]) if _number(_dict(item).get("chapter")) != number]
-    history.append({"chapter": number, "timestamp": timestamp, "delta": recorded})
+    history.append({"chapter": number, "timestamp": timestamp, "delta": recorded,
+                    **({"injuryMergeVersion": 1} if has_injury_changes else {})})
     facts["factHistory"] = history
-    facts.update(replay_long_memory(history))
+    if "injuryReplayBase" in facts:
+        facts["injuries"] = _replay_injuries(facts["injuryReplayBase"], history)
+    for key in ("storyClock", "ledgerBalances"):
+        facts.pop(key, None)
+    facts.update(replay_long_memory(history, book_plan=book_plan))
     return facts
 
 
-def _rollback_facts(saved, from_chapter):
+def _rollback_facts(saved, from_chapter, *, book_plan=None):
     previous, result = _canonical_facts(saved), _empty_facts()
     for kind in ("characters", "items", "locations"):
         result[kind] = {key: value for key, value in _dict(previous[kind]).items()
@@ -853,7 +1013,14 @@ def _rollback_facts(saved, from_chapter):
         result["foreshadowing"].append(record)
     history = [item for item in _list(previous["factHistory"]) if _number(item.get("chapter")) < from_chapter]
     result["factHistory"] = history
-    result.update(replay_long_memory(history))
+    if "injuryReplayBase" in previous:
+        base = [entry for entry in _list(previous["injuryReplayBase"])
+                if _number(_dict(entry).get("sourceChapter")) < from_chapter]
+        result["injuryReplayBase"] = base
+        result["injuries"] = _replay_injuries(base, history)
+    result.update(replay_long_memory(history, book_plan=book_plan))
     result["volumeSummaries"] = [volume for volume in _list(previous["volumeSummaries"])
                                  if _number(volume.get("endChapter"), math.inf) < from_chapter]
+    result["arcSummaries"] = [arc for arc in _list(previous["arcSummaries"])
+                              if _number(_dict(arc).get("endChapter"), math.inf) < from_chapter]
     return result

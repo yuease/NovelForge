@@ -2,15 +2,47 @@
 
 import re
 import unicodedata
+from itertools import combinations
 
 from .storage import count_chinese_words
+from .text_evidence import locate_quote as _locate_quote, normalize_quote as _normalize_quote
 
 
 _SPACE = re.compile(r"[\u0009-\u000d\u0020\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]+")
 _PSYCHOLOGICAL_LEAD = re.compile(r"(?:不禁(?:想到|想起|觉得)|心(?:里|中)(?:明白|知道|觉得|暗想|暗道)|(?:他|她|我)意识到|脑海中闪过)")
 _QUOTED_DIALOGUE = re.compile(r'“[^”]*”|「[^」]*」|『[^』]*』|"[^"]*"')
-_COMMON_PUNCTUATION = str.maketrans({"。": ".", "、": ",", "“": '"', "”": '"', "‘": "'", "’": "'"})
-_ELLIPSIS = re.compile(r"…+|\.{3,}|．{3,}")
+_STYLE_DIALOGUE = re.compile(_QUOTED_DIALOGUE.pattern + r"|‘[^’]*’|＂[^＂]*＂")
+_FILLER = re.compile(r"瞬间|骤然|死寂|仿佛|一丝(?!不苟|不挂|一毫)|一抹(?!黑|布)")
+_MOUTH_ARC = re.compile(r"(?:嘴角|唇角)[^。！？.!?；;\r\n]{0,10}?(?:勾起|泛起|扯出|咧开|扬起|浮现)")
+_EXPLAINING = re.compile(
+    r"(?:这番话|这句话)看似[^。！？!?；;\r\n]{2,40}?(?:实则|实际上)"
+    r"|(?:^|(?<=[。！？!?；;\n]))[ \t]*说白了[，,]?就是"
+)
+_RHETORICAL_RECAP = re.compile(
+    r"(?:这甚至不是|这不仅是)[^。！？!?；;\r\n]{2,36}?(?:更是|而是)"
+    r"|打的正是[^。！？!?；;\r\n]{2,30}?算盘"
+)
+_PAREN_NOTE = re.compile(r"（[^（）\r\n]+）|\([^()\r\n]+\)")
+_ACCOUNT_TERMS = re.compile(r"余额|进账|到账|入账|转账|扣除|支出|累计|合计|结算|款项|欠款|本金|明细")
+_AMOUNT = re.compile(
+    r"(?:[0-9]+(?:,[0-9]{3})*(?:\.[0-9]+)?|[零〇一二两三四五六七八九十百千万亿点]+)\s*"
+    r"(?:(?P<currency>(?:(?:万亿|万|亿)\s*)?(?:元|块钱|人民币))|(?:万亿|万|亿)(?![个名人米公里秒次天点分岁本件步]))"
+)
+_LATE_TURN = re.compile(
+    r"(?:(?:然而|可|但)[，,]?[ \t]*)?(?:就在|还没等|话音刚落)"
+    r"[^。！？!?\r\n]{0,24}?(?:瞬间|刹那|之际|平息|收敛|话音未落)"
+)
+_RESOLUTION = re.compile(r"尘埃终于落定|一切归于平静|事情就此了结")
+_SYSTEM_CLOSE = re.compile(r"(【[^【】\r\n]{1,120}】)[。！？!?…\s]*\Z")
+_SYSTEM_MARKER = re.compile(
+    r"^【[ \t]*(?:(?:系统(?:提示|警报|警告|公告|通知|弹窗)?|警报|警告|任务更新|倒计时)"
+    r"(?=[:：\s】！!]|提示|触发|响起)|倒计时(?=\d))"
+)
+_MOTIF_NOISE = r"然而|就在|还没等|话音刚落|他们|我们|这个|那个|忽然|突然|只见|于是|仿佛|终于|[的了着在向从与被把和又也]"
+_CJK_PHRASE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]{4,}")
+_SOUND = re.compile(r"咚[、，,\s]?咚|砰[、，,\s]?砰|哐当|咔嚓|嘎吱|叮咚|滴[、，,\s]?滴")
+_ENDING_WINDOW = 380
+_MOTIF_WINDOW = 150
 _PLACEHOLDERS = (
     re.compile(r"【待补充(?:[^】\n]*】)?"),
     re.compile(r"【此处[^】]*略[^】]*】"),
@@ -20,7 +52,10 @@ _PLACEHOLDERS = (
     re.compile(r"（待完善[^）]*）"),
     re.compile(r"（此处省略[^）]*）"),
 )
-_NON_FATAL_STYLE_RULES = {"dash_density", "psychological_lead_density", "repeated_subject", "single_paragraph"}
+_NON_FATAL_STYLE_RULES = {
+    "dash_density", "psychological_lead_density", "repeated_subject", "single_paragraph",
+    "cliche_filler_density", "mouth_arc_cliche", "explanatory_narration", "repetitive_ending_hook",
+}
 _NON_FATAL_AI_CATEGORIES = {"over_explaining", "formulaic_reaction", "shared_voice", "static_situation", "repetitive_hooks"}
 
 
@@ -30,43 +65,6 @@ def _trim(text):
 
 def _utf16_length(text):
     return len(text.encode("utf-16-le", "surrogatepass")) // 2
-
-
-def _meaningful_count(text):
-    return sum(unicodedata.category(char)[0] in "LN" for char in text)
-
-
-def _normalize_quote(value):
-    return _SPACE.sub("", unicodedata.normalize("NFKC", value)).translate(_COMMON_PUNCTUATION)
-
-
-def _locate_quote(quote, source):
-    quote = _trim(quote)
-    wrappers = {"“": "”", "「": "」", "『": "』", '"': '"'}
-    if len(quote) >= 2 and quote[0] in wrappers and quote[-1] == wrappers[quote[0]]:
-        quote = quote[1:-1]
-    exact = _normalize_quote(quote)
-    if _meaningful_count(exact) < 4:
-        return None
-    if exact in source:
-        return exact
-
-    parts = [_normalize_quote(part).strip(",.;:!?") for part in _ELLIPSIS.split(quote)]
-    parts = [part for part in parts if part]
-    if not _ELLIPSIS.search(quote) or not parts or any(_meaningful_count(part) < 2 for part in parts):
-        return None
-    start = source.find(parts[0])
-    while start >= 0:
-        cursor = start + len(parts[0])
-        for part in parts[1:]:
-            next_at = source.find(part, cursor)
-            if next_at < 0 or next_at - cursor > 320 or _utf16_length(source[cursor:next_at]) > 320:
-                break
-            cursor = next_at + len(part)
-        else:
-            return source[start:cursor]
-        start = source.find(parts[0], start + 1)
-    return None
 
 
 def verified_ai_blockers(ai_issues, chapter_text):
@@ -94,7 +92,152 @@ def _issue_quote(text):
     return text.encode("utf-16-le", "surrogatepass")[:320].decode("utf-16-le", errors="ignore")
 
 
-def find_chapter_style_issues(chapter_text, canonical_facts, word_count):
+def _narration(text, start=0):
+    """Yield unquoted prose and its offset in the unmodified chapter."""
+    cursor = start
+    for quote in _STYLE_DIALOGUE.finditer(text):
+        if quote.end() <= start:
+            continue
+        if quote.start() > cursor:
+            yield cursor, text[cursor:quote.start()]
+        cursor = quote.end()
+    if cursor < len(text):
+        yield cursor, text[cursor:]
+
+
+def _around_match(prose, match):
+    left = re.split(r"[。！？!?\n]", prose[max(0, match.start() - 24):match.start()])[-1]
+    right = re.split(r"[。！？!?\n]", prose[match.end():match.end() + 34], maxsplit=1)[0]
+    return left + match[0] + right
+
+
+def _account_recap(prose):
+    for note in _PAREN_NOTE.finditer(prose):
+        if count_chinese_words(note[0][1:-1]) < 45:
+            continue
+        body = unicodedata.normalize("NFKC", note[0])
+        markers = set(_ACCOUNT_TERMS.findall(body))
+        amounts = list(_AMOUNT.finditer(body))
+        currency = sum(match["currency"] is not None for match in amounts)
+        if currency >= 3 or len(markers) >= 2 and len(amounts) >= 2:
+            return note[0]
+    return None
+
+
+def _late_turn(text, tail):
+    for offset, prose in reversed(tail):
+        for match in reversed(list(_LATE_TURN.finditer(prose))):
+            rest = text[offset + match.end():].strip()
+            if len(rest) <= 100 and len(re.findall(r"[。！？!?]+", rest)) <= 2 and not _RESOLUTION.search(rest):
+                return _around_match(prose, match)
+    return None
+
+
+def _system_close(text, tail):
+    if tail:
+        offset, prose = tail[-1]
+        if offset + len(prose) == len(text) and (match := _SYSTEM_CLOSE.search(prose)):
+            if _SYSTEM_MARKER.match(match[1]):
+                return match[1]
+    return None
+
+
+def _motif_parts(tail, start, noise):
+    anchors, sounds = [], []
+    for offset, prose in tail:
+        skip = max(0, start - offset)
+        prose = prose[skip:]
+        offset += skip
+        for match in _SOUND.finditer(prose):
+            sounds.append((re.sub(r"[、，,\s]", "", match[0]), offset + match.start(), offset + match.end()))
+        masked = noise.sub(lambda match: " " * len(match[0]), prose)
+        masked = _SOUND.sub(lambda match: " " * len(match[0]), masked)
+        for run in _CJK_PHRASE.finditer(masked):
+            for index in range(run.start(), run.end() - 3):
+                key = masked[index:index + 4]
+                if len(set(key)) > 1:
+                    anchors.append((key, offset + index, offset + index + 4))
+    return anchors, sounds
+
+
+def _motif_quote(chapter, tail, history, names):
+    names = [re.escape(name) for name in names if len(name) >= 2]
+    noise = re.compile("|".join([*names, _MOTIF_NOISE]))
+    anchors, sounds = _motif_parts(tail, max(0, len(chapter) - _MOTIF_WINDOW), noise)
+    prior = []
+    for text, prose in history:
+        words, noises = _motif_parts(prose, max(0, len(text) - _MOTIF_WINDOW), noise)
+        prior.append(({key for key, _, _ in words}, {key for key, _, _ in noises}))
+    for (first, first_sounds), (second, second_sounds) in combinations(prior, 2):
+        common = first & second
+        spans = []
+        for key, start, end in anchors:
+            if key not in common:
+                continue
+            if spans and start <= spans[-1][1]:
+                spans[-1] = spans[-1][0], end
+            else:
+                spans.append((start, end))
+        if not spans:
+            continue
+        start, end = spans[0]
+        if other := next((part for part in spans[1:] if chapter[part[0]:part[1]] != chapter[start:end]), None):
+            return chapter[start:other[1]]
+        if sound := next((part for part in sounds if part[0] in first_sounds and part[0] in second_sounds), None):
+            return chapter[min(start, sound[1]):max(end, sound[2])]
+    return None
+
+
+def _check_new_style(text, word_count, recent_chapters, names, add):
+    prose_segments = [prose for _, prose in _narration(text)]
+    fillers = [(prose, match) for prose in prose_segments for match in _FILLER.finditer(prose)]
+    instant = sum(match[0] == "瞬间" for _, match in fillers)
+    if instant >= 6 or len(fillers) >= 12 and word_count > 0 and len(fillers) * 1000 >= word_count * 4.5:
+        prose, match = next((hit for hit in fillers if hit[1][0] == "瞬间"), fillers[0])
+        add("cliche_filler_density", _around_match(prose, match),
+            f"叙述中填充词出现 {len(fillers)} 次，其中「瞬间」{instant} 次。",
+            "保留需要强调的时点，其余用具体动作或直接转场表达。")
+
+    history = [entry if isinstance(entry, str) else "" for entry in (recent_chapters or ())[-3:]]
+    history = [entry.strip() for entry in history]
+    mouths = [(prose, match) for prose in prose_segments for match in _MOUTH_ARC.finditer(prose)]
+    if mouths:
+        count = len(mouths)
+        combined = count + sum(len(_MOUTH_ARC.findall(prose)) for old in history for _, prose in _narration(old))
+        if count >= 2 or sum(bool(entry) for entry in history) >= 2 and combined >= 3:
+            add("mouth_arc_cliche", _around_match(*mouths[0]),
+                f"本章出现 {count} 处嘴角套式，连同近章共 {combined} 处。",
+                "保留必要表情，其余改为与人物立场相符的动作、对话或沉默。")
+
+    strong = next(((prose, match) for prose in prose_segments if (match := _EXPLAINING.search(prose))), None)
+    recaps = [(prose, match) for prose in prose_segments for match in _RHETORICAL_RECAP.finditer(prose)]
+    if strong or len(recaps) >= 2:
+        add("explanatory_narration", _around_match(*(strong or recaps[0])),
+            "旁白出现解释性复述或抽象总结。", "删去重复翻译，保留读者尚未获知的信息并继续推进情节。")
+    elif note := next((note for prose in prose_segments if (note := _account_recap(prose))), None):
+        add("explanatory_narration", note, "长括号内集中复述多笔账务。",
+            "保留关键数值、余额或因果，把必要细目交给自然动作或证据。")
+
+    if not any(history):
+        return
+    text = text.rstrip()
+    tail = list(_narration(text, max(0, len(text) - _ENDING_WINDOW)))
+    prior = [(old, list(_narration(old, max(0, len(old) - _ENDING_WINDOW)))) for old in history]
+    previous_turns = [_late_turn(old, ending) for old, ending in prior]
+    if (quote := _late_turn(text, tail)) and (previous_turns[-1] or sum(bool(item) for item in previous_turns) >= 2):
+        reason = "相邻或近期章尾复用了同构突转句式。"
+    elif (quote := _system_close(text, tail)) and len(prior) >= 2 and all(
+        _system_close(old, ending) for old, ending in prior[-2:]
+    ):
+        reason = "连续三章以系统弹窗或警报收尾。"
+    elif quote := _motif_quote(text, tail, prior, names):
+        reason = "本章与近期至少两章复用同一组章尾意象。"
+    else:
+        return
+    add("repetitive_ending_hook", quote, reason, "改用本章独有的行动后果、人物决定或新信息收尾。")
+
+
+def find_chapter_style_issues(chapter_text, canonical_facts, word_count, *, recent_chapters=None):
     paragraphs = [part for part in re.split(r"\n+", _trim(chapter_text)) if _trim(part)]
     sequence = []
     for prose in _QUOTED_DIALOGUE.split(chapter_text):
@@ -131,6 +274,7 @@ def find_chapter_style_issues(chapter_text, canonical_facts, word_count):
         unicodedata.category(char).startswith("L") for sentence in sentences for char in sentence
     ):
         add("single_paragraph", paragraphs[0], "长篇正文挤在同一个自然段。", "按说话人、动作转换或场景节奏分段。")
+    _check_new_style(chapter_text, word_count, recent_chapters, names, add)
     return issues
 
 

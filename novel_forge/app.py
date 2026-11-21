@@ -403,7 +403,10 @@ def create_app(data_dir: Path | None = None, *, client=None):
         outlines = job.get("outlines") or []
         settings = {"pov": job.get("pov") or "第三人称限知", "target_words": job.get("wordsPerChapter") or 2000,
                     "llm_config": job.get("llmConfig"), "test_scenario": job.get("testScenario"),
-                    "store": store, "client": client}
+                    "store": store, "client": client, "book_plan": job.get("bookPlan"),
+                    "long_memory": os.getenv("NOVEL_FORGE_LONG_MEMORY") != "0",
+                    "rolling_arc_outlines": os.getenv("NOVEL_FORGE_ROLLING_ARC_OUTLINES") != "0",
+                    "story_ledger": os.getenv("NOVEL_FORGE_STORY_LEDGER") != "0"}
         if payload.get("reverify"):
             facts = await asyncio.to_thread(store.get_canonical_facts, job_id)
             pending = existing.get("status") == "needs_review"

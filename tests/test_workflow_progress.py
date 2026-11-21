@@ -184,3 +184,38 @@ class TestWorkflowProgress(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(latest["errorNode"], "topic")
         self.assertEqual(latest["lastNode"], "prepare")
         self.assertEqual(latest["jobStatus"], "interrupted")
+
+    async def test_rolling_arc_archive_and_next_outlines_edges_emit_live_frames(self):
+        worker = ControlledWorker([
+            ("prepare", {"phase": "topic"}),
+            ("topic", {"phase": "plan"}),
+            ("plan", {"phase": "outlines"}),
+            ("outlines", {"phase": "chapter", "chapter": 1}),
+            ("chapter", {"phase": "verify", "chapter": 1}),
+            ("verify", {"phase": "review", "chapter": 1, "passed": True, "canRepair": False}),
+            ("commit", {"phase": "archive", "chapter": 1}),
+            ("archive", {"phase": "outlines", "chapter": 2}),
+            ("outlines", {"phase": "chapter", "chapter": 2}),
+            ("chapter", {"phase": "verify", "chapter": 2}),
+            ("verify", {"phase": "review", "chapter": 2, "passed": True, "canRepair": False}),
+            ("commit", {"phase": "calibrate"}),
+            ("calibrate", {"phase": "audit"}),
+            ("audit", {"phase": "finish"}),
+            ("finish", {"phase": "done"}),
+        ])
+        worker.graph = build_graph(worker, InMemorySaver())
+        worker.release.set()
+        with worker.progress.subscribe("book") as queue:
+            await asyncio.wait_for(worker.run("book", "run"), timeout=3)
+            frames = []
+            while not queue.empty():
+                frames.append(queue.get_nowait())
+        active_steps = [(f["activeNode"], f["activeChapter"]) for f in frames if f["activeNode"]]
+        self.assertIn(("archive", 1), active_steps)
+        self.assertIn(("outlines", 2), active_steps)
+        progress = await worker.read_progress("book")
+        self.assertEqual(progress["nodeVisits"]["archive"], 1)
+        self.assertEqual(progress["nodeVisits"]["outlines"], 2)
+        self.assertEqual(progress["edgeVisits"]["commit:archive"], 1)
+        self.assertEqual(progress["edgeVisits"]["archive:outlines"], 1)
+        self.assertEqual(progress["edgeVisits"]["outlines:chapter"], 2)

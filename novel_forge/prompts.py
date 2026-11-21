@@ -6,8 +6,16 @@ import os
 import re
 from string import Template
 
+from .arc_planning import (
+    CANON_LOCKS_MARKER, arc_chapter_span, character_name_registry, compact_arc_summaries, compact_used_beats,
+    normalize_canon_locks, normalize_character_name, prior_arc_summaries,
+)
 from .draft_quality import STYLE_BIBLE_MARKER, compact_style_bible
-from .long_memory import active_memory_items, protagonist_name, relevant_memory_characters
+from .llm import STORY_LEDGER_MARKER
+from .long_memory import (
+    STORY_CHARACTER_FIELDS, active_memory_items, protagonist_name, relevant_memory_characters,
+    story_ledger_events, story_ledger_view,
+)
 from .prompt_budget import read_chapter_input_budget, fit_chapter_prompt
 
 POV_RULES = {
@@ -63,6 +71,19 @@ _BOOK_PLAN_STYLE_BIBLE_SPEC = """
 _BOOK_PLAN_STYLE_BIBLE_REQUEST = Template("""
 风格指南每条写成短句或短语，总计不超过 300 字。${marker}""")
 
+_BOOK_PLAN_CANON_SPEC = """
+  "canonLocks": {
+    "powerScale": "力量或等级天花板和主角起点",
+    "currencyAndEra": "时代、货币或积分单位与合理量级",
+    "worldTaboos": ["舞台与题材的绝对禁区"],
+    "keyAssets": ["道具颜色、佩戴侧、编号等不会变化的属性"]
+  },"""
+
+_BOOK_PLAN_CANON_REQUEST = (
+    "\n核心口径只写已有依据的固定规则。powerScale 与 currencyAndEra 各不超过100字，"
+    "worldTaboos 最多3条且每条45字内，keyAssets 最多4条且每条50字内，合计不超过420字。"
+    "没有等级或硬设定时省略对应字段，避免发明数值和世界机制。" + CANON_LOCKS_MARKER
+)
 _BOOK_PLAN_SYSTEM = Template("""[TASK:BOOK_PLAN]
 你是资深商业网文总编兼长篇架构师。请根据用户提供的核心创意与选题立项包，输出一部结构严谨、爽点密集、伏笔可回收的完整全书总纲（BookPlan）。
 必须严格输出合法 JSON，不要包含 Markdown 代码块之外的多余寒暄。${style_request}""")
@@ -188,9 +209,15 @@ _WORD_COUNT_ADJUST_PROMPT = Template("""请对第${chapter_number}章进行${mod
 【待调整正文】
 ${chapter_text}""")
 
+_FACT_RECORDING_RULES = (
+    "伤势只记录会持续影响后续行动的实质伤残、中毒或重伤；情绪反应、心率变化和轻微擦伤不入库。"
+    "已有伤势沿用 id、注明部位与左右侧；正文确认已愈或已过明确恢复期时提交 active=false。"
+    "物品只记录跨章复用的核心道具、契约、载具或通讯工具，保留有依据的颜色、佩戴侧、状态等关键属性；一次性消耗品不入库。"
+)
+
 _FACT_EXTRACTION_SYSTEM = """[TASK:FACT_EXTRACTION]
 你是严谨的小说连续性档案员。请从刚生成的章节正文中提取所有关键事实增量（人物状态变化、伤势、时间线、物品位置/归属、秘密知情边界、伏笔埋设/强化/回收）。
-必须严格输出合法 JSON。"""
+必须严格输出合法 JSON。\n""" + _FACT_RECORDING_RULES
 
 _FACT_EXTRACTION_PROMPT = Template("""请提取第${chapter_number}章的规范事实增量：
 【已有事实库摘要】
@@ -205,13 +232,13 @@ ${chapter_text}
     "角色名": { "name": "角色名", "status": "active", "location": "当前地点", "traits": [] }
   },
   "injuries": [
-    { "character": "角色名", "description": "伤势描述", "severity": "high|medium|low", "active": true }
+    { "id": "更新时填写", "character": "角色名", "bodyPart": "含左右侧", "description": "伤势描述", "severity": "high|medium|low", "active": true }
   ],
   "timeline": [
     { "dayOrTime": "时间点", "event": "发生了什么", "characters": ["相关角色"] }
   ],
   "items": {
-    "物品名": { "name": "物品名", "owner": "持有者", "location": "存放位置", "status": "intact" }
+    "物品名": { "name": "物品名", "owner": "持有者", "location": "存放位置", "status": "intact", "attributes": ["已知关键物理属性"] }
   },
   "secrets": [
     { "secret": "秘密内容", "holders": ["知情人"], "excludedCharacters": ["明确不知情的人"] }
@@ -232,7 +259,14 @@ _VERIFY_AI_FLAVOR_INSTRUCTION = Template("""
    - shared_voice（不同角色说话腔调与说教方式高度雷同）
    - static_situation（连环查线索换下条线索，处境与筹码毫无推进）
    - repetitive_hooks（章尾反复用对讲机响、系统弹窗、还有一件事硬断章）
+   - core_scene_repetition（同一大招或信息揭示跨章无新后果地复演，属于硬冲突；有本章引文时必须阻塞）${style_focus}
    ${instruction}""")
+
+_VERIFY_STYLE_FOCUS = """
+   - over_explaining：战后再替读者定性、给已演清的动作翻译意图，或用大段括号复述已知账目。
+   - shared_voice：临死、崩溃或反噬时条理清晰地背供词，危急中像说明书一样讲公式，或在生死与情感高潮用出戏的梗破坏人物口吻。
+   - repetitive_hooks：连续用「然而就在……瞬间」转折或系统弹窗收尾；须有前文可比证据。
+   以上病灶证据明确且破坏节奏、情绪或人物时标 P1，给出本章原句和具体改法；自然台词、必要数值和合理回扣照常保留。"""
 
 _VERIFY_SYSTEM = Template("""[TASK:VERIFY]
 你是严谨但懂网文叙事规律的小说连续性与质量审校官兼档案员。请在本次调用中**一次性**完成两件事：
@@ -240,17 +274,19 @@ A. 逐项核查本章正文是否存在**真正的硬性逻辑/设定冲突与�
 1. 伤势一致性（前文未愈合的伤势不能无故正常使用受伤部位）。
 2. 物品位置与归属一致性（注意：本章主角合理取用/转移物品导致的变化，将在本章通过后才入库，不得以“事实库尚未同步本章新动作”判 error）。
 3. 秘密知情边界：只有当不知情角色（excludedCharacters）在**无任何告知/目击/推理来源**下凭空使用秘密，才判 secret_leak error；角色在本章**主动摊牌揭露**或**目击当前可疑行为（如在配电间徘徊）**属于合理剧情推进，不是 error。
-4. 时间线、门牌/编号、金额/扩容规则、空间移动等跨章设定硬冲突（必须顺承上一章末尾衔接；**若规范事实库与旧章纲数值/时间冲突，以规范事实库和上章末尾为准，顺承事实而偏离旧章纲不是错误**）。
+4. 时间线、门牌/编号、等级/金额/身份、空间移动等跨章设定（必须顺承上章末尾；旧章纲与规范事实冲突时，以实际发生的正文和已核实事实为准）。
+   三类必须阻塞的硬冲突：跨章等级、金额或身份无依据地互相矛盾 (hard_value_conflict)；直接违反总纲世界观硬规则 (world_rule_conflict)；核心大招或信息揭示无新后果地跨章复演 (core_scene_repetition)。填 issues、severity="error"、本章原文 quote 及已知来源章，令 passed=false；若放入 aiIssues，使用对应分类及有证据的 P0/P1。若沿用 inconsistent_details，另填 hardConflictType 指明上述具体类型。正文已经解释的合理变化、有新后果的回扣和轻微表述差异按一般问题处理。
 5. 叙事视角（${pov}）是否严重越界（如直接透视他人的秘密内心；通过对话转述他人见闻仅作轻微 warning，不判 error）。
 6. 是否包含未完成占位符。${ai_instruction}
 注：精确字数由系统程序校验，请勿因“后续章节建议”将 word_count 标为 error。${severity_rule}${memory_rule}
 
 B. 同步从本章正文中抽取**候选规范事实增量 (factsDelta)**（仅作候选提取；若未通过审校系统不会入库）：包含 characters、injuries、timeline、items、secrets、foreshadowing。
+${fact_recording_rules}
 
 必须严格输出合法 JSON。""")
 
 _VERIFY_PROMPT = Template("""请一次性完成第${chapter_number}章的审校、AI味问题定位与事实增量抽取：
-【章纲】${outline}${ending_block}
+【章纲】${outline}${ending_block}${review_notes}
 【相关规范事实库（含 sourceChapter 溯源）】
 ${facts}${memory_instructions}
 
@@ -262,20 +298,20 @@ ${chapter_text}
   "passed": true,
   "chapterNumber": ${chapter_number},
   "issues": [
-    { "type": "injury_contradiction|item_mismatch|secret_leak|pov_violation|placeholder|timeline|inconsistent_details|ai_flavor", "severity": "error|warning", "message": "具体问题说明", "quote": "原文原句证据", "sourceChapter": 1 }
+    { "type": "injury_contradiction|item_mismatch|secret_leak|pov_violation|placeholder|timeline|inconsistent_details|hard_value_conflict|world_rule_conflict|core_scene_repetition|ai_flavor", "severity": "error|warning", "message": "具体问题说明", "quote": "原文原句证据", "sourceChapter": 1 }
   ],
   "aiIssues": [
-    { "category": "over_explaining|formulaic_reaction|shared_voice|static_situation|repetitive_hooks|inconsistent_details", "quote": "原文原句", "impact": "为什么影响阅读", "priority": "P0|P1|P2", "suggestion": "删改建议" }
+    { "category": "over_explaining|formulaic_reaction|shared_voice|static_situation|repetitive_hooks|inconsistent_details|hard_value_conflict|world_rule_conflict|core_scene_repetition", "quote": "原文原句", "impact": "为什么影响阅读", "priority": "P0|P1|P2", "suggestion": "删改建议" }
   ],
   "factsDelta": {
     "characters": { "角色名": { "name": "角色名", "status": "active", "location": "当前地点", "traits": [] } },
-    "injuries": [{ "character": "角色名", "description": "伤势描述", "severity": "high|medium|low", "active": true }],
+    "injuries": [{ "id": "更新时填写", "character": "角色名", "bodyPart": "含左右侧", "description": "伤势描述", "severity": "high|medium|low", "active": true }],
     "timeline": [{ "dayOrTime": "时间点", "event": "关键事件", "characters": ["角色"] }],
-    "items": { "物品名": { "name": "物品名", "owner": "持有者", "location": "位置", "status": "intact" } },
+    "items": { "物品名": { "name": "物品名", "owner": "持有者", "location": "位置", "status": "intact", "attributes": ["已知关键物理属性"] } },
     "secrets": [{ "secret": "秘密内容", "holders": ["知情人"], "excludedCharacters": ["不知情人"] }],
     "foreshadowing": [{ "id": "fs_id", "clue": "伏笔线索", "status": "planted|reinforced|paid_off", "details": "进展" }]${memory_spec}
   },
-  "summary": "审校总结"
+  "summary": "审校总结"${identity_spec}
 }""")
 
 _REPAIR_ENDING_BLOCK = Template("""
@@ -291,14 +327,14 @@ _REPAIR_SYSTEM = Template("""[TASK:REPAIR]
 要求：
 1. 彻底解决所有 severity="error" 的一致性、门牌/金额/时间线、占位符或视角问题。${hard_style_rule}
 2. ${style_instruction}
-3. 遵循优先级：**相关规范事实库（Relevant Facts）与上一章末尾衔接 > 早先章纲**；若章纲数值低于事实库已记录数值，保持与事实库一致。
+3. 遵守总纲世界观硬规则与活跃期限。规范事实与上一章实际发生的情节优先于旧章纲，按已核实数值、身份及状态修复。
 4. 保留原有的核心剧情推进与爽点节奏，严格遵守${pov}视角，保持目标字数在 ${target_words} 字左右。
 5. 直接输出修复后的完整正文，不要输出解释。""")
 
 _REPAIR_PROMPT = Template("""请修复第${chapter_number}章正文中的以下问题：
 目标字数：${target_words}
 【本章章纲】
-${outline}${ending_block}
+${outline}${ending_block}${review_notes}
 
 【审校问题列表】
 ${issues}${ai_fix_block}
@@ -353,16 +389,50 @@ _FULL_BOOK_AUDIT_PROMPT = Template("""请对全书进行定稿终审：
 }
 注：只有当 blockingIssues 为空时，passed 才可为 true；若存在需修改章节，请将 passed 设为 false 并同时在 blockingIssues 和 issueChapters 中指明章号。""")
 
-_MEMORY_DELTA_JSON = """,
+_MEMORY_DELTA_JSON = Template(""",
     "memory": {
-      "characterStates": { "角色名": { "seen": true, "currentGoal": "当前目标", "emotion": "情绪", "stance": "立场", "relationships": { "另一角色": "本章关系变化" }, "quote": "原文" } },
+      "characterStates": { "角色名": { "seen": true${general_character}${locked_character}, "quote": "原文" } }${general_memory}${story_memory}
+    }""")
+
+_GENERAL_MEMORY_FIELDS = """,
       "constraints": [{ "id": "已有条目更新时填写", "text": "硬规则", "characters": ["角色"], "status": "active|fulfilled|expired", "quote": "原文" }],
-      "commitments": [{ "text": "承诺或倒计时", "deadline": "剧情时间", "status": "active|fulfilled|expired", "quote": "原文" }],
-      "subplots": [{ "text": "支线进展", "status": "active|resolved", "quote": "原文" }]
-    }"""
+      "commitments": [{ "id": "已有条目更新时填写", "text": "承诺或倒计时的稳定名称", "deadline": "剧情时间", "status": "active|fulfilled|expired", "quote": "原文" }],
+      "subplots": [{ "text": "支线进展", "status": "active|resolved", "quote": "原文" }]"""
+
+_STORY_MEMORY_FIELDS = """,
+      "storyClock": { "day": "剧情日或日期", "season": "季节与天气基调", "timeOfDay": "当前时段", "countdown": "主线倒计时", "quote": "本章原文" },
+      "ledgerBalances": [{ "label": "沿用已有账户名", "value": "明确的当前值和单位", "change": "+明确同单位净变化（可省略）", "quote": "本章原文" }]"""
+
+_STORY_LEDGER_EXTRACTION = (
+    "\n随章台账可选。只记本章明确发生的变化，每条 quote 必须逐字来自正文（4–120 字）。"
+    "storyClock 每字段最多40字，只提交现在时间线中变化的字段；提及未来、回忆、预报和假设不改变现在。"
+    "ledgerBalances 最多6个核心账户，沿用 label、量级和单位，区分可用余额、冻结与累计。"
+    "仅在原文明示同一账户同一单位的净变化及结果值时填 change（有正负号），不要从部分交易推算。"
+    "核心角色最多12人。stanceTier 是对主角的关系档位，跨两档及以上必须有重大触发。"
+    "knownFacts 只记录角色亲眼确认的新增认知，最多3条、每条60字内；传闻、梦境与猜测不入锁。"
+    "普通角色只可用 seen=true 配原文确认出场，不为一次性龙套设锁。无可靠增量可省略。"
+)
+_STORY_LEDGER_WRITE = (
+    "\n随章台账优先于旧章纲。时间与核心余额只能随真实剧情变化。"
+    "关系跨两档及以上必须有重大触发，已亲证的关键认知必须延续。"
+)
+_STORY_LEDGER_VERIFY = (
+    "\n核对随章台账与人物锁。同一剧情时点、同一口径的时间或精确余额硬冲突写 issues，"
+    "type=hard_value_conflict、severity=error，ledgerRef={\"kind\":\"clock|balance\",\"key\":\"字段名或账户名\"}。"
+    "正常跨日、倒叙、换地点、冬日有阳光、口径改变或明确交易不是冲突。"
+    "对主角的关系按 hostile → wary → transactional → ally → intimate 排列。"
+    "跨两档及以上但没有明确重大触发，或无故遗忘、否认已确认的 knownFacts，写 type=character_ooc、severity=error，"
+    "ledgerRef={\"kind\":\"character\",\"key\":\"全名\"}。剧情明确的假装、失忆或证据被推翻应保留。"
+    "这些 issues 必须引用本章原句 quote，并指出对应前文来源。"
+    "重名仅提交 newCharacterCandidates 候选：全名与已有人物完全相同，且原文明确证明是不同的人，"
+    "quote 要包含完整姓名与同名、另一个、并非同一人等区分语句。"
+    "同姓、职务变化、同一人的化名及作者明示的既有同名设定均不提报。候选无证据时可省略。"
+)
+_IDENTITY_SPEC = """,
+  "newCharacterCandidates": [{ "name": "全名", "identity": "明确的新人物身份", "quote": "能证明是不同人物的本章原文" }]"""
 
 _MEMORY_EXTRACTION_INSTRUCTIONS = Template("""
-可选 memory 只记录本章明确确立或改变的角色目标、立场关系、硬规则、期限和支线；仅出现可写 seen。每条必须带本章逐字 quote（4–100 字），只填有变化的字段，无变化可省略 memory。更新、兑现或完结沿用已有 id，新项省略 id。已有活跃条目：${active}
+可选 memory 只记录本章明确确立或改变的角色目标、立场关系、硬规则、期限和支线；仅出现可写 seen。每条必须带本章逐字 quote（4–100 字），只填有变化的字段，无变化可省略 memory。更新、兑现或完结沿用已有 id，新项省略 id。同一承诺或倒计时沿用稳定的 text，剩余时长与到期时间变化只写入 deadline。已有活跃条目：${active}
 """)
 
 _VOLUME_SUMMARY_PROMPT = Template("""给第${start_chapter}–${end_chapter}章归档。mainline 不超过 360 字。turningPoints 最多 4 条，每条包含 chapter（整数）和 text（不超过 90 字）。
@@ -375,6 +445,11 @@ _SPACE = r"\u0009-\u000d\u0020\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\
 _TERMS = re.compile(rf"[{_SPACE},，、：:；;()（）]+")
 _EDGE_SPACE = re.compile(rf"^[{_SPACE}]+|[{_SPACE}]+\Z")
 _DRAFT_RULE = "\n8. 动作已表情绪就收笔。少用套话、心理引导词和破折号，变换句首、按节奏分段，让角色的用词贴合各自立场。"
+_WRITE_STYLE_RED_LINES = (
+    "\n【写中风格红线】临死、崩溃、反噬或危急汇报时只说贴合人物的口语短句；"
+    "公式、叠乘算法与完整案情用系统提示、证据或主角观察交代，禁止说明书式对白和背供词。"
+    "冲突、反转或笑点演完就推进，禁止旁白抽象定性或替读者翻译意图。"
+)
 _VOLUME_SUMMARY_SYSTEM = (
     "[TASK:VOLUME_SUMMARY]\n"
     "你是小说档案员。概括已保存的这十章，只记录有依据的主线进展与关键转折，节选正文优先于摘要，保持因果与章号。"
@@ -391,6 +466,8 @@ def read_writing_options(job=None):
         "draft_quality": os.environ.get("NOVEL_FORGE_DRAFT_QUALITY") != "0",
         "long_memory": os.environ.get("NOVEL_FORGE_LONG_MEMORY") != "0",
         "chapter_ai_gate": os.environ.get("NOVEL_FORGE_WRITE_AI_GATE") != "0",
+        "rolling_arc_outlines": os.environ.get("NOVEL_FORGE_ROLLING_ARC_OUTLINES") != "0",
+        "story_ledger": os.environ.get("NOVEL_FORGE_STORY_LEDGER") != "0",
         "degrade_on_verify_exhausted": degrade_setting != "0" and (
             degrade_setting == "1" if job_degrade is None else job_degrade is True
         ),
@@ -441,7 +518,7 @@ def _pov_rule(pov):
     return POV_RULES.get(pov, POV_RULES[_DEFAULT_POV])
 
 
-def _meme_guidance(level, samples):
+def _meme_guidance(level, samples, *, chapter_ai_gate=False):
     preset = MEME_LEVEL_PRESETS.get(level)
     if not preset or level == "none":
         return ""
@@ -453,7 +530,9 @@ def _meme_guidance(level, samples):
             "\n可自然化用/二创以下幽默结构或近期热点元素（切忌生硬直接照抄老词条名词，重点学习其中的“反差逻辑、沟通错位或反转笑点”）："
             f"\n{lines}"
         )
-    return f"\n【网感与玩梗风格要求（{preset['label']}）】\n{preset['instruction']}{examples}"
+    recurrence = "同一热梗或比喻全书最多点题使用一至两次，严禁跨章反复复述同一类比。"
+    scene_rule = "\n生死关头与核心情感高潮禁止出戏玩梗、破第四面墙或自夸。" if chapter_ai_gate else ""
+    return f"\n【网感与玩梗风格要求（{preset['label']}）】\n{preset['instruction']}\n{recurrence}{scene_rule}{examples}"
 
 
 def _pick_relevant(items, context, maximum, search_text):
@@ -469,10 +548,29 @@ def _pick_relevant(items, context, maximum, search_text):
     return [*matched[-maximum:], *(others[-count:] if count else [])]
 
 
-def extract_relevant_facts(canonical_facts=None, *, context_text="", max_items=28, max_secrets=22, max_foreshadowing=22):
+def _visible_injuries(entries, context, current_chapter=None, *, story_ledger=False):
+    terms = ("bodyPart", "description") if story_ledger else ("character", "bodyPart", "description")
+
+    def visible(entry):
+        if entry.get("active") is False:
+            return False
+        updated = _number(entry.get("updatedAtChapter")) or _number(entry.get("sourceChapter"))
+        if current_chapter is None or not updated or _number(current_chapter) - updated <= 10:
+            return True
+        if entry.get("severity") not in (None, "", "low", "medium"):
+            return True
+        return any(_matches_term(entry.get(key), context) for key in terms)
+
+    return [entry for entry in _records(entries) if visible(entry)]
+
+
+def extract_relevant_facts(canonical_facts=None, *, context_text="", max_items=28, max_secrets=22, max_foreshadowing=22,
+                           current_chapter=None, story_ledger=False):
     facts = canonical_facts or {}
-    injuries = [entry for entry in _records(facts.get("injuries")) if entry.get("active") is not False]
-    open_clues = [entry for entry in _records(facts.get("foreshadowing")) if entry.get("status") != "paid_off"]
+    injuries = _visible_injuries(facts.get("injuries", facts.get("activeInjuries")), context_text, current_chapter,
+                                  story_ledger=story_ledger)
+    open_clues = [entry for entry in _records(facts.get("foreshadowing", facts.get("openForeshadowing")))
+                  if entry.get("status") != "paid_off"]
     foreshadowing = _pick_relevant(
         open_clues, context_text, max_foreshadowing,
         lambda entry: " ".join(str(entry.get(key) or "") for key in ("id", "clue", "details")),
@@ -502,12 +600,17 @@ def extract_relevant_facts(canonical_facts=None, *, context_text="", max_items=2
     )
     return {
         "characters": characters, "activeInjuries": injuries, "items": items, "secrets": secrets,
-        "openForeshadowing": foreshadowing, "recentTimeline": _list(facts.get("timeline"))[-5:],
+        "openForeshadowing": foreshadowing, "recentTimeline": _list(facts.get("timeline", facts.get("recentTimeline")))[-5:],
     }
 
 
-def _plan_for_outlines_and_audit(plan):
-    return {key: value for key, value in plan.items() if key != "styleBible"} if isinstance(plan, dict) else plan
+def _plan_for_outlines_and_audit(plan, *, rolling_arc_outlines=False):
+    if not isinstance(plan, dict):
+        return plan
+    visible = {key: value for key, value in plan.items() if key not in ("styleBible", "canonLocks")}
+    if rolling_arc_outlines and (locks := normalize_canon_locks(plan.get("canonLocks"))):
+        return {"canonLocks": locks, **visible}
+    return visible
 
 
 def _topic_anchors(topic):
@@ -517,7 +620,7 @@ def _topic_anchors(topic):
 
 def build_book_plan_prompt(*, title="", premise="", genre="都市重生爽文", pov=_DEFAULT_POV, target_words=30000,
                            total_chapters=15, hotspot_context=None, topic_package=None, meme_level="none",
-                           meme_samples=None, draft_quality=False):
+                           meme_samples=None, draft_quality=False, rolling_arc_outlines=False):
     topic = topic_package or {}
     hotspot = hotspot_context or {}
     topic_block = _BOOK_PLAN_TOPIC_BLOCK.substitute(
@@ -528,13 +631,15 @@ def build_book_plan_prompt(*, title="", premise="", genre="都市重生爽文", 
         hook_formula=hotspot.get("hookFormula") or "",
     ) if hotspot_context is not None else ""
     request = _BOOK_PLAN_STYLE_BIBLE_REQUEST.substitute(marker=STYLE_BIBLE_MARKER) if draft_quality else ""
+    if rolling_arc_outlines:
+        request = _BOOK_PLAN_CANON_REQUEST + request
     system = _BOOK_PLAN_SYSTEM.substitute(style_request=request)
     prompt = _BOOK_PLAN_PROMPT.substitute(
         title=title or topic.get("title") or "请根据核心梗拟定一个不超过14字的商业爆款书名",
         premise=premise or topic.get("premise") or "主角重生归来，凭借前世记忆破局逆袭，揭开惊天阴谋。",
         genre=genre, pov=pov, pov_rule=_pov_rule(pov), target_words=target_words, total_chapters=total_chapters,
         topic_block=topic_block, hotspot_block=hotspot_block, meme_block=_meme_guidance(meme_level, meme_samples),
-        style_spec=_BOOK_PLAN_STYLE_BIBLE_SPEC if draft_quality else "",
+        style_spec=(_BOOK_PLAN_CANON_SPEC if rolling_arc_outlines else "") + (_BOOK_PLAN_STYLE_BIBLE_SPEC if draft_quality else ""),
     )
     return {"system": system, "prompt": prompt}
 
@@ -565,7 +670,116 @@ def build_chapter_outlines_prompt(*, book_plan=None, start_chapter=1, end_chapte
     return {"system": _CHAPTER_OUTLINES_SYSTEM, "prompt": prompt}
 
 
-def _chapter_write_facts(canonical, relevant, context):
+_ARC_OUTLINES_SYSTEM = """[TASK:ARC_OUTLINES]
+你是剧情单元编剧。根据已经发生的正文事实与总纲路标，只规划当前单元。核心口径锁为不可变硬设定，动态数值与人物去向以有证据的前文为准。
+禁止重演已演桥段清单中的破局机制、大招和信息揭示；强化旧伏笔必须带来新的信息或后果。勿提前消耗终局破局。
+同一反派连续两个单元没有新增实质筹码，必须退场或转幕后。章名和断章方式要与近期章节有清晰差异。
+只输出完整 JSON 对象。"""
+
+
+def _facts_before(facts, chapter):
+    def earlier(entry):
+        record = _dict(entry)
+        return max(_number(record.get(key)) for key in
+                   ("sourceChapter", "updatedAtChapter", "chapterNumber", "plantedChapter")) < chapter
+
+    selected = {key: ({name: row for name, row in value.items() if earlier(row)} if isinstance(value, dict)
+                      else [row for row in _list(value) if earlier(row)])
+                for key, value in facts.items() if key in (
+                    "characters", "characterStates", "injuries", "items", "secrets", "timeline",
+                    "constraints", "commitments", "subplots",
+                )}
+    selected["foreshadowing"] = []
+    for clue in _records(facts.get("foreshadowing")):
+        if not earlier(clue):
+            continue
+        chapters = _list(clue.get("relatedChapters"))
+        if any(_number(number) >= chapter for number in chapters) or (
+            clue.get("status") == "paid_off" and _number(clue.get("payoffChapter")) >= chapter
+        ):
+            clue = {**clue, "status": "planted", "payoffChapter": None, "details": "",
+                    "relatedChapters": [number for number in chapters if _number(number) < chapter]}
+        selected["foreshadowing"].append(clue)
+    return selected
+
+
+def build_arc_outlines_prompt(*, book_plan, canonical_facts, start_chapter, total_chapters, arc_index,
+                              preceding_chapters=(), recent_titles=(), continuation_direction="", finalize_book=False,
+                              story_ledger=False):
+    minimum, maximum = arc_chapter_span(start_chapter, total_chapters)
+    terminal = total_chapters - start_chapter + 1 <= 6
+    plan = _dict(book_plan)
+    facts = _dict(canonical_facts)
+    archives = prior_arc_summaries(facts, start_chapter)
+    past = _facts_before(facts, start_chapter)
+    context = " ".join([str(plan.get("logline") or ""), continuation_direction,
+                        *(str(row.get("summary") or "") for row in preceding_chapters[-5:])])
+    selected = extract_relevant_facts(past, context_text=context, current_chapter=start_chapter, story_ledger=story_ledger,
+                                      max_foreshadowing=len(_list(past.get("foreshadowing"))) if terminal else 22)
+    for kind in ("constraints", "commitments", "subplots"):
+        if active := active_memory_items(past, kind, context):
+            selected[kind] = active
+    if past.get("characterStates"):
+        lead = protagonist_name(plan.get("mainCharacters"))
+        selected["characterStates"] = [
+            {"name": entry["key"], **_legacy_character_state(entry["value"]["state"])}
+            for entry in relevant_memory_characters(past, _dict(past.get("characters")), lead, context)
+            if isinstance(entry["value"].get("state"), dict)
+        ]
+    system = _ARC_OUTLINES_SYSTEM
+    if story_ledger:
+        ledger = story_ledger_view(facts, chapter_number=start_chapter, book_plan=plan)
+        if ledger:
+            selected["storyLedger"] = ledger
+        core_names = _core_character_names(plan, past, ledger)
+        if core_names:
+            selected["coreCharacterNames"] = core_names
+        if archives and archives[0]["endChapter"] == start_chapter - 1:
+            corrections = [{key: row[key] for key in ("chapter", "kind", "issue", "fixHint") if key in row}
+                           for row in _records(archives[0].get("driftChecks"))[:4]]
+            if corrections:
+                selected["previousArcDriftChecks"] = corrections
+        system += (_STORY_LEDGER_WRITE +
+                   "新配角须避开 coreCharacterNames 中的已有全名，也不要与主角、核心反派高度撞名。"
+                   "previousArcDriftChecks 是上一单元纠偏建议，以当前台账和正文为准，不改写已提交章节。")
+    legacy_volumes = [
+        {"endChapter": row["endChapter"], "mainline": _text_excerpt(row["mainline"], 180)}
+        for row in sorted((row for row in _records(facts.get("volumeSummaries")) if
+                           0 < _number(row.get("endChapter")) < start_chapter and row.get("mainline")),
+                          key=lambda row: _number(row["endChapter"]), reverse=True)[:2]
+    ]
+    material = {
+        "bookPlan": _plan_for_outlines_and_audit(plan, rolling_arc_outlines=True),
+        "canonicalFacts": selected,
+        "arcSummaries": compact_arc_summaries(archives), "usedBeats": compact_used_beats(archives),
+        "legacyVolumes": legacy_volumes,
+        "recentChapters": [
+            {"chapter": row["chapterNumber"], "summary": _text_excerpt(row.get("summary") or "", 240),
+             **({"ending": _text_excerpt(row.get("content") or "", 350, from_end=True)} if row is preceding_chapters[-1] else {})}
+            for row in preceding_chapters[-5:]
+        ],
+        "recentTitles": list(recent_titles),
+        "continuationDirection": continuation_direction,
+    }
+    finale = ""
+    if terminal:
+        finale = "\n本单元为终局收网单元，必须一次规划至终章，收束本轮核心危机并兑现所有未回收伏笔。"
+        if finalize_book:
+            finale += "作者要求彻底完结，终章给出明确结局，禁止开放性续作悬念。"
+    example = {
+        "arcTitle": "单元标题", "arcGoal": "本单元的新推进目标与结局",
+        "villainChips": [{"villain": "反派名", "newChips": ["确有新增的筹码"], "exitPlan": "retain|exit|background"}],
+        "chapters": [{"chapterNumber": start_chapter, "title": "具体章名", "goal": "本章目标",
+                      "summary": "具体因果推进", "keyEvents": ["实际事件"], "hook": "章末独有结果或终章收束"}],
+    }
+    prompt = (f"当前单元：{arc_index}\n起始章节：{start_chapter}\n全书总章数：{total_chapters}\n"
+              f"最少章数：{minimum}\n最多章数：{maximum}\n剩余章节：{total_chapters - start_chapter + 1}{finale}\n"
+              f"从起始章起严格连续，按允许区间决定单元长度。无反派时 villainChips 返回空数组。\n"
+              f"【已发生事实与全书路标】\n{_json(material)}\n【输出结构】\n{_json(example)}")
+    return {"system": system, "prompt": prompt}
+
+
+def _chapter_write_facts(canonical, relevant, context, *, current_chapter=None, story_ledger=False):
     def source(key, fallback):
         value = canonical.get(key)
         return relevant.get(fallback) if value is None else value
@@ -582,8 +796,9 @@ def _chapter_write_facts(canonical, relevant, context):
     def rank(entries):
         return sorted(entries, key=lambda item: (item["relevance"], item["sourceChapter"]), reverse=True)
 
-    injuries = [tag("activeInjuries", item, [item.get("character")])
-                for item in _records(source("injuries", "activeInjuries")) if item.get("active") is not False]
+    injuries = [tag("activeInjuries", item, [item.get(key) for key in ("character", "bodyPart", "description")])
+                for item in _visible_injuries(source("injuries", "activeInjuries"), context, current_chapter,
+                                              story_ledger=story_ledger)]
     secrets = [
         tag("secrets", entry, [entry.get("secret"), *_list(entry.get("holders")), *_list(entry.get("excludedCharacters"))])
         for entry in _records(source("secrets", "secrets"))
@@ -603,8 +818,12 @@ def _chapter_write_facts(canonical, relevant, context):
     return rank([*injuries, *secrets, *items, *timeline]), characters, [entry["value"] for entry in clues]
 
 
-def _chapter_anchors(book_plan, lead, include_core_rules):
+def _chapter_anchors(book_plan, lead, include_core_rules, *, rolling_arc_outlines=False, story_notes=""):
     anchors = []
+    if rolling_arc_outlines and (locks := normalize_canon_locks(book_plan.get("canonLocks"))):
+        anchors.append(f"不可变核心口径锁（初始值仅为历史基线）：{_json(locks)}")
+    if story_notes:
+        anchors.append(story_notes)
     worldview = _dict(book_plan.get("worldview"))
     if book_plan.get("logline"):
         anchors.append(f"主线卖点：{book_plan['logline']}")
@@ -622,7 +841,34 @@ def _chapter_anchors(book_plan, lead, include_core_rules):
     return _CHAPTER_WRITE_BOOK_ANCHOR_BLOCK.substitute(anchors="\n".join(anchors)) if anchors else ""
 
 
-def _memory_slots(canonical, relevant, context, outline, lead, chapter_number, recent_summaries):
+def _legacy_character_state(state):
+    return {key: value for key, value in state.items() if key not in STORY_CHARACTER_FIELDS}
+
+
+def _core_character_names(plan, facts, ledger):
+    cast = _records(plan.get("mainCharacters"))
+    lead = protagonist_name(cast)
+    registry = character_name_registry(plan, facts)
+    names = {}
+    for name in (lead, *(row.get("name") for row in cast), *_dict(ledger.get("characterStates"))):
+        if key := normalize_character_name(name):
+            names.setdefault(key, name)
+    return [{"name": _text_excerpt(name, 40),
+             "role": _text_excerpt(registry.get(key, [{}])[0].get("role") or "", 40)}
+            for key, name in list(names.items())[:12]]
+
+
+def _story_ledger_entries(ledger):
+    entries = []
+    if clock := ledger.get("storyClock"):
+        entries.append({"kind": "storyClock", "value": clock})
+    entries.extend({"kind": "ledgerBalances", "value": row} for row in ledger.get("ledgerBalances", []))
+    entries.extend({"kind": "characterStates", "name": name, "value": state}
+                   for name, state in ledger.get("characterStates", {}).items())
+    return entries
+
+
+def _memory_slots(canonical, relevant, context, outline, lead, chapter_number, recent_summaries, *, arc_views=()):
     hard_items = [
         {"kind": kind, "value": value}
         for kind in ("constraints", "commitments")
@@ -633,6 +879,9 @@ def _memory_slots(canonical, relevant, context, outline, lead, chapter_number, r
                        if item.get("endChapter") is not None and _number(item["endChapter"]) < current),
                       key=lambda item: _number(item["endChapter"]), reverse=True)[:2]
     last_archive = _number(archives[0]["endChapter"]) if archives else 0
+    if arc_views:
+        last_archive = max(last_archive, arc_views[0]["endChapter"])
+        archives = []
     summaries = [entry for entry in _records(recent_summaries)
                  if last_archive < _number(entry.get("chapterNumber")) < current and entry.get("summary")]
     rolling = "\n".join(
@@ -643,6 +892,10 @@ def _memory_slots(canonical, relevant, context, outline, lead, chapter_number, r
     characters = relevant_memory_characters(
         canonical, relevant.get("characters") if base is None else base, lead, f"{context} {_json(outline)}",
     )
+    for entry in characters:
+        value = entry["value"]
+        if isinstance(value.get("state"), dict):
+            value["state"] = _legacy_character_state(value["state"])
     goal = _dict(characters[0]["value"].get("state")).get("currentGoal") if characters else None
     compact_lead = {"key": lead, "value": {"name": lead, **({"state": {"currentGoal": goal}} if goal else {})}}
     payoffs = [
@@ -671,10 +924,22 @@ def _render_allocated_facts(parts, use_long_memory):
         "openForeshadowing": [entry["value"] for entry in clues if not entry["paid"]] if use_long_memory else clues,
         "recentTimeline": [entry["value"] for entry in timeline],
     }
+    hard_items = parts.get("hardMemory", [])
+    story = {}
+    for entry in hard_items:
+        kind, value = entry["kind"], entry["value"]
+        if kind == "storyClock":
+            story[kind] = value
+        elif kind == "ledgerBalances":
+            story.setdefault(kind, []).append(value)
+        elif kind == "characterStates":
+            story.setdefault(kind, {})[entry["name"]] = value
+    if story:
+        facts["storyLedger"] = story
     if use_long_memory:
         blocks = {
-            "constraints": [item["value"] for item in parts["hardMemory"] if item["kind"] == "constraints"],
-            "commitments": [item["value"] for item in parts["hardMemory"] if item["kind"] == "commitments"],
+            "constraints": [item["value"] for item in hard_items if item["kind"] == "constraints"],
+            "commitments": [item["value"] for item in hard_items if item["kind"] == "commitments"],
             "volumeSummaries": parts["archives"],
             "subplots": parts["subplots"],
             "recentPayoffs": [entry["value"] for entry in clues if entry["paid"]],
@@ -689,23 +954,36 @@ def build_chapter_write_prompt(*, book_plan=None, outline=None, prev_chapter_end
                                prev_chapter_summary="", relevant_facts=None, canonical_facts=None,
                                pov=_DEFAULT_POV, target_words=2000, total_chapters=None, style_guide=_DEFAULT_STYLE,
                                meme_level="none", meme_samples=None, input_budget=None, draft_quality=False,
-                               long_memory=False):
+                               long_memory=False, chapter_ai_gate=False, rolling_arc_outlines=False, story_ledger=False):
     book_plan, outline, canonical = _dict(book_plan), _dict(outline), _dict(canonical_facts)
     chapter_number = outline.get("chapterNumber") or 1
     use_long_memory = long_memory and input_budget is not None
     lead = protagonist_name(book_plan.get("mainCharacters")) if use_long_memory else None
-    relevant = extract_relevant_facts(canonical) if relevant_facts is None else relevant_facts
+    ending = _EDGE_SPACE.sub("", str(prev_chapter_ending or prev_chapter_summary or ""))
+    context = _chapter_context(_text_excerpt(ending, 300, from_end=True), outline)
+    relevant = (
+        extract_relevant_facts(canonical, context_text=context, current_chapter=chapter_number, story_ledger=story_ledger)
+        if relevant_facts is None else relevant_facts
+    )
     summaries = _list(recent_summaries)
     summary_text = "\n".join(
         entry if isinstance(entry, str) else f"第{_dict(entry).get('chapterNumber', 'undefined')}章：{_dict(entry).get('summary', 'undefined')}"
         for entry in summaries[-2:]
     )
-    anchors = _chapter_anchors(book_plan, lead, input_budget is not None)
+    anchors = _chapter_anchors(book_plan, lead, input_budget is not None, rolling_arc_outlines=rolling_arc_outlines)
+    arc_views = compact_arc_summaries(prior_arc_summaries(canonical, _number(chapter_number))) if rolling_arc_outlines else []
     finale = _CHAPTER_WRITE_FINALE_BLOCK.substitute(
         chapter_number=chapter_number, total_chapters=total_chapters,
     ) if total_chapters and _number(chapter_number) >= _number(total_chapters) else ""
     style_lines = compact_style_bible(book_plan.get("styleBible")) if draft_quality else []
-    draft_rule = _DRAFT_RULE if draft_quality else ""
+    draft_rule = (_DRAFT_RULE if draft_quality else "") + (_WRITE_STYLE_RED_LINES if chapter_ai_gate else "")
+    ledger = {}
+    if story_ledger:
+        ledger = story_ledger_view(canonical, chapter_number=_number(chapter_number), book_plan=book_plan,
+                                   context_text=_chapter_context("", outline))
+        draft_rule += _STORY_LEDGER_WRITE + "\n" + STORY_LEDGER_MARKER
+    if arc_views:
+        draft_rule += "\n既有单元的已演破局、信息揭示与大招只可承接后果或推进新层级，禁止按原样复演。"
     pretty_outline = _json(outline, pretty=True)
 
     def render(ending, summary, facts, samples, bible):
@@ -719,7 +997,7 @@ def build_chapter_write_prompt(*, book_plan=None, outline=None, prev_chapter_end
         system = _CHAPTER_WRITE_SYSTEM.substitute(
             pov=pov, pov_rule=_pov_rule(pov), target_words=target_words,
             min_words=_round(target_words * 0.9), max_words=_round(target_words * 1.1), style_guide=style_guide,
-            meme_block=_meme_guidance(meme_level, samples), draft_rule=draft_rule,
+            meme_block=_meme_guidance(meme_level, samples, chapter_ai_gate=chapter_ai_gate), draft_rule=draft_rule,
         )
         prompt = _CHAPTER_WRITE_PROMPT.substitute(
             chapter_number=chapter_number, total_suffix=f"/{total_chapters}" if total_chapters else "",
@@ -735,24 +1013,27 @@ def build_chapter_write_prompt(*, book_plan=None, outline=None, prev_chapter_end
             _text_excerpt(prev_chapter_ending, 800, from_end=True) if prev_chapter_ending
             else prev_chapter_summary or "（本章为开篇或紧接总纲）"
         )
-        return render(snippet, summary_text, relevant, meme_samples, style_lines)
+        visible = _visible_injuries(relevant.get("activeInjuries"), context, chapter_number, story_ledger=story_ledger)
+        return render(snippet, summary_text, {**relevant, "activeInjuries": visible,
+                                              **({"arcSummaries": arc_views} if arc_views else {}),
+                                              **({"storyLedger": ledger} if ledger else {})}, meme_samples, style_lines)
 
-    ending = _EDGE_SPACE.sub("", str(prev_chapter_ending or prev_chapter_summary or ""))
-    context = " ".join(str(value) if value is not None else "" for value in (
-        outline.get("title"), outline.get("summary"), *_list(outline.get("keyEvents")), _text_excerpt(ending, 300, from_end=True),
-    ))
-    continuity, characters, clues = _chapter_write_facts(canonical, relevant, context)
+    continuity, characters, clues = _chapter_write_facts(canonical, relevant, context, current_chapter=chapter_number,
+                                                        story_ledger=story_ledger)
     has_style = bool(style_lines)
     style_slot = [{"key": "styleBible", "entries": style_lines, "share": 8}] if has_style else []
+    arc_slot = [{"key": "arcSummaries", "entries": arc_views, "share": 10}] if arc_views else []
+    story_items = _story_ledger_entries(ledger)
     samples = _list(meme_samples) if meme_level != "none" else []
     if use_long_memory:
         hard_items, archives, rolling, characters, fallback, payoffs = _memory_slots(
-            canonical, relevant, context, outline, lead, chapter_number, summaries,
+            canonical, relevant, context, outline, lead, chapter_number, summaries, arc_views=arc_views,
         )
         slots = [
-            {"key": "hardMemory", "entries": hard_items, "share": 20},
+            {"key": "hardMemory", "entries": story_items + hard_items, "share": 20},
             {"key": "continuity", "entries": continuity, "share": 30 if has_style else 32},
-            {"key": "archives", "entries": archives, "share": 10},
+            {"key": "archives", "entries": archives, "share": 0 if arc_views else 10},
+            *arc_slot,
             *style_slot,
             {"key": "ending", "text": ending, "from_end": True, "share": 12 if has_style else 15},
             {"key": "summary", "text": rolling, "share": 6},
@@ -764,8 +1045,11 @@ def build_chapter_write_prompt(*, book_plan=None, outline=None, prev_chapter_end
             {"key": "samples", "entries": samples, "share": 1},
         ]
     else:
+        story_slot = [{"key": "hardMemory", "entries": story_items, "share": 20}] if story_items else []
         slots = [
-            {"key": "continuity", "entries": continuity, "share": 50},
+            *story_slot,
+            {"key": "continuity", "entries": continuity, "share": 50 - 10 * bool(arc_views) - 20 * bool(story_items)},
+            *arc_slot,
             *style_slot,
             {"key": "ending", "text": ending, "from_end": True, "share": 20},
             {"key": "summary", "text": summary_text, "share": 9 if has_style else 12},
@@ -775,8 +1059,10 @@ def build_chapter_write_prompt(*, book_plan=None, outline=None, prev_chapter_end
         ]
 
     def render_budgeted(parts):
-        return render(parts["ending"], parts["summary"], _render_allocated_facts(parts, use_long_memory),
-                      parts["samples"], parts.get("styleBible", []))
+        rendered_facts = _render_allocated_facts(parts, use_long_memory)
+        if parts.get("arcSummaries"):
+            rendered_facts["arcSummaries"] = parts["arcSummaries"]
+        return render(parts["ending"], parts["summary"], rendered_facts, parts["samples"], parts.get("styleBible", []))
 
     return fit_chapter_prompt(render=render_budgeted, slots=slots, input_budget=input_budget)
 
@@ -796,13 +1082,97 @@ def build_word_count_adjust_prompt(*, chapter_number, chapter_text, current_word
     return {"system": system, "prompt": prompt}
 
 
-def _memory_extraction(facts, chapter_text):
+def _chapter_context(chapter_text, outline):
+    outline = _dict(outline)
+    return " ".join(str(value or "") for value in (
+        chapter_text, outline.get("title"), outline.get("goal"), outline.get("summary"), outline.get("hook"),
+        *_list(outline.get("keyEvents")),
+    ))
+
+
+def _memory_extraction(facts, context):
     active = {
         kind: [{key: entry[key] for key in ("id", "text", "deadline") if key in entry}
-               for entry in active_memory_items(facts, kind, chapter_text, 6)]
+               for entry in active_memory_items(facts, kind, context, 6)]
         for kind in ("constraints", "commitments", "subplots")
     }
     return _MEMORY_EXTRACTION_INSTRUCTIONS.substitute(active=_json(active))
+
+
+def _memory_delta_spec(long_memory, story_ledger):
+    if not (long_memory or story_ledger):
+        return ""
+    general_character = (
+        ', "currentGoal": "当前目标", "emotion": "情绪", "stance": "立场", "relationships": { "另一角色": "本章关系变化" }'
+        if long_memory else ""
+    )
+    if story_ledger and not long_memory:
+        general_character = ', "relationships": { "另一核心角色": "本章关系变化" }'
+    locked_character = (
+        ', "stanceTier": "hostile|wary|transactional|ally|intimate", "knownFacts": ["实际亲证的关键认知"]'
+        if story_ledger else ""
+    )
+    return _MEMORY_DELTA_JSON.substitute(
+        general_character=general_character, locked_character=locked_character,
+        general_memory=_GENERAL_MEMORY_FIELDS if long_memory else "",
+        story_memory=_STORY_MEMORY_FIELDS if story_ledger else "",
+    )
+
+
+def _story_notes(ledger):
+    return f"【本章前随章台账与核心人物锁】\n{_json(ledger)}" if ledger else ""
+
+
+def _review_notes(book_plan, facts, context, chapter_number, long_memory, *, rolling_arc_outlines=False, story_ledger=False):
+    plan = _dict(book_plan)
+    facts = _dict(facts)
+    current = _number(chapter_number)
+    ledger = story_ledger_view(facts, chapter_number=current, book_plan=plan, context_text=context) if story_ledger else {}
+    world = _dict(plan.get("worldview"))
+    rules = [rule.strip() for rule in _list(world.get("coreRules")) if isinstance(rule, str) and rule.strip()]
+    rules.sort(key=lambda rule: not any(_matches_term(term, context) for term in _TERMS.split(rule)))
+    cast = _records(plan.get("mainCharacters"))
+    lead = protagonist_name(cast)
+    cast = sorted(cast, key=lambda entry: entry.get("name") != lead)[:6]
+    anchors = _chapter_anchors({
+        "logline": _text_excerpt(plan.get("logline") or "", 150),
+        "worldview": {"setting": _text_excerpt(world.get("setting") or "", 220),
+                      "coreRules": [_text_excerpt(rule, 120) for rule in rules[:10]]},
+        "mainCharacters": [{key: _text_excerpt(entry.get(key) or "", 40) for key in ("name", "role")} for entry in cast],
+        "canonLocks": plan.get("canonLocks"),
+    }, None, True, rolling_arc_outlines=rolling_arc_outlines, story_notes=_story_notes(ledger))
+    arc_views = prior_arc_summaries(facts, current) if rolling_arc_outlines else []
+    if arc_views:
+        anchors += "\n【前两个单元与累计已演桥段（正文复演需拦截）】\n" + _json({
+            "arcSummaries": compact_arc_summaries(arc_views), "usedBeats": compact_used_beats(arc_views, limit=12),
+        })
+    if not long_memory:
+        return anchors
+
+    memory = {}
+    for kind in ("constraints", "commitments"):
+        prior = [entry for entry in _records(facts.get(kind)) if
+                 max(_number(entry.get("sourceChapter")), _number(entry.get("updatedAtChapter"))) < current]
+        entries = [
+            {**{key: entry[key] for key in ("sourceChapter", "updatedAtChapter") if key in entry},
+             **{key: _text_excerpt(entry[key], limit) for key, limit in
+                (("id", 80), ("text", 120), ("deadline", 60)) if isinstance(entry.get(key), str)}}
+             for entry in active_memory_items({kind: prior}, kind, context, 6)
+        ]
+        if entries:
+            memory[kind] = entries
+    archives = sorted((entry for entry in _records(facts.get("volumeSummaries")) if
+                       0 < _number(entry.get("endChapter")) < current and entry.get("mainline")),
+                      key=lambda entry: _number(entry["endChapter"]), reverse=True)[:2]
+    if archives and not arc_views:
+        memory["volumeSummaries"] = [
+            {**{key: entry[key] for key in ("startChapter", "endChapter") if key in entry},
+             "mainline": _text_excerpt(entry["mainline"], 220),
+             "turningPoints": [{"chapter": _number(point.get("chapter")), "text": _text_excerpt(point.get("text") or "", 65)}
+                               for point in _records(entry.get("turningPoints"))[:2]]}
+            for entry in archives
+        ]
+    return f"{anchors}\n【当前约束与前卷摘要】\n{_json(memory)}" if memory else anchors
 
 
 def build_volume_summary_prompt(chapters):
@@ -822,55 +1192,132 @@ def build_volume_summary_prompt(chapters):
     return {"system": _VOLUME_SUMMARY_SYSTEM, "prompt": prompt}
 
 
+_ARC_SUMMARY_SYSTEM = """[TASK:ARC_SUMMARY]
+从已提交章的正文提取真正发生的剧情，章纲式摘要只用于指路。needs_review 章里已写出的场景可以用于去重，待复核的数值与设定不得当成硬事实。
+只返回 JSON。mainline 最多280字，turningPoints 至多3条，usedBeats 至多4条，usedHooks 至多3条。
+usedBeats 只记录实际消耗的核心破局机制、大招与揭示；usedHooks 只记录实际出现的断章方式。每项提供章号、60字内可辨认的机制描述、4–120字的本章连续原文 quote。
+villainStatus 最多120字，写清实际新增/失去的筹码和退场状态，说明无新增筹码；没有反派可留空。"""
+
+
+def _arc_story_review(arc, chapters, canonical_facts, book_plan):
+    start = arc["startChapter"]
+    baseline = story_ledger_view(canonical_facts, chapter_number=start, book_plan=book_plan)
+    pending = {row["chapterNumber"] for row in chapters if row.get("status") == "needs_review"}
+    facts = _dict(canonical_facts)
+    history = [event for event in _records(facts.get("factHistory")) if _number(event.get("chapter")) not in pending]
+    changes = story_ledger_events({"factHistory": history}, start, arc["endChapter"], book_plan=book_plan)
+    return {
+        "canonLocks": normalize_canon_locks(_dict(book_plan).get("canonLocks")) or {},
+        "baselineBeforeChapter": start,
+        "openingLedger": baseline,
+        "changesByChapter": changes,
+    }
+
+
+def build_arc_summary_prompt(arc, chapters, *, story_ledger=False, canonical_facts=None, book_plan=None):
+    evidence = []
+    for chapter in chapters:
+        content = chapter.get("content") or ""
+        record = {key: chapter[key] for key in ("chapterNumber", "title", "status") if key in chapter}
+        record["summary"] = _text_excerpt(chapter.get("summary") or "", 240)
+        if len(content) <= 4400:
+            record["content"] = content
+        else:
+            middle = len(content) // 2
+            record.update(beginning=content[:1400], middle=content[middle - 750:middle + 750], ending=content[-1500:])
+        evidence.append(record)
+    example = {"mainline": "实际主线进展", "turningPoints": [{"chapter": arc["startChapter"], "text": "转折"}],
+               "usedBeats": [{"chapter": arc["startChapter"], "text": "实际破局机制", "quote": "逐字原文"}],
+               "usedHooks": [], "villainStatus": "反派名：新增筹码、失去筹码、退场状态"}
+    system = _ARC_SUMMARY_SYSTEM
+    review = ""
+    if story_ledger:
+        material = _arc_story_review(arc, chapters, canonical_facts, book_plan)
+        review = f"【单元开始前的台账基线与按章变化】\n{_json(material)}\n"
+        example["driftChecks"] = [{"chapter": arc["startChapter"], "kind": "value|clock|canon|character_ooc",
+                                    "issue": "60字内的具体冲突", "fixHint": "80字内的纠偏建议", "quote": "4–120字本章原文"}]
+        system += (
+            "\n按单元开始前基线和按章变化顺序快检，不能用单元末数值或人物立场倒推早前章节。"
+            "最多返回4条 driftChecks，只报有本章原文并能对应明确事实的硬冲突。"
+            "quote 为4–120字正文，issue 不超过60字，fixHint 不超过80字。无可靠问题可省略或给空数组。"
+            "快检只供下一单元纠偏，保持实际正文事实和归档的其他字段。"
+            f"\n{STORY_LEDGER_MARKER}"
+        )
+    prompt = (f"归档第 {arc['arcIndex']} 单元，第 {arc['startChapter']}–{arc['endChapter']} 章。\n"
+              f"{review}【正文依据】\n{_json(evidence)}\n【输出结构】\n{_json(example)}")
+    return {"system": system, "prompt": prompt}
+
+
 def build_fact_extraction_prompt(*, chapter_number, chapter_text, existing_facts=None, canonical_facts=None,
-                                 long_memory=False):
+                                 long_memory=False, outline=None, story_ledger=False, book_plan=None):
     effective_facts = existing_facts if canonical_facts is None else canonical_facts
+    context = _chapter_context(chapter_text, outline)
+    memory_instructions = _memory_extraction(effective_facts, context) if long_memory else ""
+    system = _FACT_EXTRACTION_SYSTEM
+    if story_ledger:
+        ledger = story_ledger_view(effective_facts, chapter_number=_number(chapter_number), book_plan=book_plan,
+                                   context_text=context)
+        if ledger:
+            memory_instructions += "\n" + _story_notes(ledger)
+        system += _STORY_LEDGER_EXTRACTION + "\n" + STORY_LEDGER_MARKER
     prompt = _FACT_EXTRACTION_PROMPT.substitute(
         chapter_number=chapter_number, chapter_text=chapter_text,
-        facts=_json(extract_relevant_facts(existing_facts), pretty=True),
-        memory_instructions=_memory_extraction(effective_facts, chapter_text) if long_memory else "",
-        memory_spec=_MEMORY_DELTA_JSON if long_memory else "",
+        facts=_json(extract_relevant_facts(effective_facts, context_text=context, current_chapter=chapter_number,
+                                          story_ledger=story_ledger), pretty=True),
+        memory_instructions=memory_instructions,
+        memory_spec=_memory_delta_spec(long_memory, story_ledger),
     )
-    return {"system": _FACT_EXTRACTION_SYSTEM, "prompt": prompt}
+    return {"system": system, "prompt": prompt}
 
 
 def build_verify_prompt(*, chapter_number, chapter_text, outline=None, canonical_facts=None, prev_chapter_ending="",
                         pov=_DEFAULT_POV, min_words=500, max_words=5000, check_ai_flavor=True,
-                        chapter_ai_gate=False, long_memory=False):
+                        chapter_ai_gate=False, long_memory=False, book_plan=None, rolling_arc_outlines=False,
+                        story_ledger=False):
     # As in Node, exact word counts are checked locally and are not sent to the reviewer.
     ai_instruction = ""
     if check_ai_flavor:
         instruction = (
-            "只用 aiIssues 报告 AI 味，避免在 issues 重复记录。P0 是严重损害全章可读性的问题，P1 是必须当章解决的明显重复、"
+            "一般 AI 味只用 aiIssues 报告，避免重复记录。P0 是严重损害全章可读性的问题，P1 是必须当章解决的明显重复、"
             "叙事停滞或角色声音混同，P2 是局部措辞建议。P0/P1 必须给出可在本章定位的原文 quote 和具体修法，并令 passed=false。P2 不阻断。"
             if chapter_ai_gate else
-            "说明：轻微 AI 味放 aiIssues（priority=P2/P1，issues 设为 warning）；仅当本章大段严重注水解释或原地打转影响可读性时，才计入阻塞修复。"
+            "轻微 AI 味放 aiIssues 或 warning；严重注水可阻塞。上述核心桥段复演始终按硬冲突判定。"
         )
-        ai_instruction = _VERIFY_AI_FLAVOR_INSTRUCTION.substitute(instruction=instruction)
+        ai_instruction = _VERIFY_AI_FLAVOR_INSTRUCTION.substitute(
+            instruction=instruction, style_focus=_VERIFY_STYLE_FOCUS if chapter_ai_gate else "",
+        )
     severity = (
         "硬性逻辑或设定冲突在 issues 中标 error；有原文的 P0/P1 放 aiIssues。任一存在则 passed=false，轻微瑕疵或后续建议只记告警。"
         if chapter_ai_gate else
         '只有存在真实不可调和的硬冲突时才设 severity="error" 且 passed=false；轻微瑕疵或后续建议一律设为 severity="warning" 且 passed=true。'
     )
     system = _VERIFY_SYSTEM.substitute(
-        pov=pov, ai_instruction=ai_instruction, severity_rule=severity,
+        pov=pov, ai_instruction=ai_instruction, severity_rule=severity, fact_recording_rules=_FACT_RECORDING_RULES,
         memory_rule="\n若有活跃硬规则与期限，也核对本章是否延续；有原文支撑的正常状态变化应更新记忆。" if long_memory else "",
     )
+    if story_ledger:
+        system += _STORY_LEDGER_VERIFY + _STORY_LEDGER_EXTRACTION + "\n" + STORY_LEDGER_MARKER
     ending = _VERIFY_ENDING_BLOCK.substitute(
         ending=_text_excerpt(prev_chapter_ending, 600, from_end=True)
     ) if prev_chapter_ending else ""
+    context = _chapter_context(chapter_text, outline)
     prompt = _VERIFY_PROMPT.substitute(
         chapter_number=chapter_number, chapter_text=chapter_text, outline=_json(outline or {}), ending_block=ending,
-        facts=_json(extract_relevant_facts(canonical_facts), pretty=True),
-        memory_instructions=_memory_extraction(canonical_facts, chapter_text) if long_memory else "",
-        memory_spec=_MEMORY_DELTA_JSON if long_memory else "",
+        facts=_json(extract_relevant_facts(canonical_facts, context_text=context, current_chapter=chapter_number,
+                                          story_ledger=story_ledger), pretty=True),
+        review_notes=_review_notes(book_plan, canonical_facts, context, chapter_number, long_memory,
+                                   rolling_arc_outlines=rolling_arc_outlines, story_ledger=story_ledger),
+        memory_instructions=_memory_extraction(canonical_facts, context) if long_memory else "",
+        memory_spec=_memory_delta_spec(long_memory, story_ledger),
+        identity_spec=_IDENTITY_SPEC if story_ledger else "",
     )
     return {"system": system, "prompt": prompt}
 
 
 def build_repair_prompt(*, chapter_number, chapter_text, issues=None, ai_issues=None, outline=None,
                         canonical_facts=None, prev_chapter_ending="", pov=_DEFAULT_POV, target_words=2000,
-                        chapter_ai_gate=False):
+                        chapter_ai_gate=False, book_plan=None, long_memory=False, rolling_arc_outlines=False,
+                        story_ledger=False):
     ending = _REPAIR_ENDING_BLOCK.substitute(
         ending=_text_excerpt(prev_chapter_ending, 700, from_end=True)
     ) if prev_chapter_ending else ""
@@ -884,10 +1331,18 @@ def build_repair_prompt(*, chapter_number, chapter_text, issues=None, ai_issues=
         chapter_number=chapter_number, pov=pov, target_words=target_words, style_instruction=style_instruction,
         hard_style_rule=' type="ai_flavor" 且 severity="error" 的项目同样必须修复。' if chapter_ai_gate else "",
     )
+    if story_ledger:
+        system += (_STORY_LEDGER_WRITE +
+                   "若确认是不同人物撞名，给新增人物独立全名并同步本章相关称呼。"
+                   "保留正常跨日、交易及有证据的人物转折。\n" + STORY_LEDGER_MARKER)
+    context = _chapter_context(chapter_text, outline)
     prompt = _REPAIR_PROMPT.substitute(
         chapter_number=chapter_number, target_words=target_words, chapter_text=chapter_text,
         outline=_json(outline or {}, pretty=True), ending_block=ending, issues=_json(issues or [], pretty=True),
-        ai_fix_block=ai_fix, facts=_json(extract_relevant_facts(canonical_facts), pretty=True),
+        ai_fix_block=ai_fix, facts=_json(extract_relevant_facts(canonical_facts, context_text=context,
+                                                               current_chapter=chapter_number, story_ledger=story_ledger), pretty=True),
+        review_notes=_review_notes(book_plan, canonical_facts, context, chapter_number, long_memory,
+                                   rolling_arc_outlines=rolling_arc_outlines, story_ledger=story_ledger),
     )
     return {"system": system, "prompt": prompt}
 
@@ -904,7 +1359,7 @@ def build_de_ai_prompt(*, chapter_text, pov=_DEFAULT_POV, style_guide=_DEFAULT_S
 
 
 def build_full_book_audit_prompt(*, book_plan=None, chapters_summary=None, chapter_evidence=None,
-                                 word_stats=None, canonical_facts=None):
+                                 word_stats=None, canonical_facts=None, rolling_arc_outlines=False):
     facts = canonical_facts or {}
     timeline = _list(facts.get("timeline"))
     compact_facts = {
@@ -913,7 +1368,7 @@ def build_full_book_audit_prompt(*, book_plan=None, chapters_summary=None, chapt
         "secrets": _list(facts.get("secrets"))[-25:], "timelineMilestones": [*timeline[:5], *timeline[-10:]],
     }
     prompt = _FULL_BOOK_AUDIT_PROMPT.substitute(
-        book_plan=_json(_plan_for_outlines_and_audit(book_plan) or {}, pretty=True),
+        book_plan=_json(_plan_for_outlines_and_audit(book_plan, rolling_arc_outlines=rolling_arc_outlines) or {}, pretty=True),
         word_stats=_json(word_stats or {}, pretty=True), chapters_summary=_json(chapters_summary or [], pretty=True),
         chapter_evidence=_json(chapter_evidence or [], pretty=True), facts=_json(compact_facts, pretty=True),
     )

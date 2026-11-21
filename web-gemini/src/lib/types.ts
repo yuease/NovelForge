@@ -353,9 +353,11 @@ export interface JobRecord {
     } | null
   } | null
   evaluationReport?: BookEvaluationReport | null
+  arcPlans?: ArcPlan[]
   bookPlan?: {
     title?: string
     synopsis?: string
+    canonLocks?: CanonLocks | null
     volumes?: Array<{
       volumeNumber?: number
       title?: string
@@ -492,6 +494,110 @@ export interface FactEntry {
   [key: string]: unknown
 }
 
+export interface CanonLocks {
+  powerScale?: string
+  currencyAndEra?: string
+  worldTaboos?: string[]
+  keyAssets?: string[]
+}
+
+export interface ArcVillainChip {
+  villain: string
+  newChips?: string[]
+  exitPlan?: 'retain' | 'exit' | 'background' | string
+}
+
+export interface ArcPlan {
+  arcIndex: number
+  startChapter: number
+  endChapter: number
+  arcTitle: string
+  arcGoal: string
+  villainChips?: ArcVillainChip[]
+}
+
+export interface StoryClock {
+  day?: string
+  season?: string
+  timeOfDay?: string
+  countdown?: string
+  fieldChapters?: Partial<Record<'day' | 'season' | 'timeOfDay' | 'countdown', number>>
+}
+
+export interface LedgerBalanceChange {
+  chapter: number
+  value: string
+  change?: string
+}
+
+export interface LedgerBalance {
+  label: string
+  value: string
+  updatedAtChapter?: number
+  recentChanges?: LedgerBalanceChange[]
+}
+
+export type StanceTier = 'hostile' | 'wary' | 'transactional' | 'ally' | 'intimate'
+
+export interface CharacterRelationshipChange {
+  change?: string
+  sourceChapter?: number
+  updatedAtChapter?: number
+}
+
+export interface CharacterStateEntry {
+  sourceChapter?: number
+  lastSeenChapter?: number
+  updatedAtChapter?: number
+  currentGoal?: string | null
+  emotion?: string | null
+  stance?: string | null
+  relationships?: Record<string, CharacterRelationshipChange>
+  stanceTier?: StanceTier
+  stanceTierChapter?: number
+  knownFacts?: string[]
+  knownFactChapters?: Record<string, number>
+  storyRelationships?: Record<string, CharacterRelationshipChange>
+}
+
+export interface ArcEvidenceItem {
+  chapter?: number
+  text?: string
+  quote?: string
+}
+
+export interface ArcDriftCheck {
+  chapter: number
+  kind: 'value' | 'clock' | 'canon' | 'character_ooc' | string
+  issue: string
+  fixHint: string
+  quote: string
+}
+
+export interface ArcSummary {
+  arc?: number
+  startChapter: number
+  endChapter: number
+  sourceHash?: string
+  mainline: string
+  turningPoints?: Array<{ chapter?: number; text?: string }>
+  usedBeats?: ArcEvidenceItem[]
+  usedHooks?: ArcEvidenceItem[]
+  villainStatus?: string
+  driftChecks?: ArcDriftCheck[]
+  needsReviewChapters?: number[]
+}
+
+export interface VolumeSummary {
+  volume?: number
+  startChapter: number
+  endChapter: number
+  sourceHash?: string
+  mainline: string
+  turningPoints?: Array<{ chapter?: number; text?: string }>
+  needsReviewChapters?: number[]
+}
+
 export interface CanonicalFacts {
   characters?: Record<string, FactEntry> | FactEntry[]
   injuries?: Record<string, FactEntry> | FactEntry[]
@@ -501,6 +607,11 @@ export interface CanonicalFacts {
   locations?: Record<string, FactEntry> | FactEntry[]
   foreshadowing?: Record<string, FactEntry> | FactEntry[]
   relations?: Record<string, FactEntry> | FactEntry[]
+  storyClock?: StoryClock | null
+  ledgerBalances?: LedgerBalance[]
+  characterStates?: Record<string, CharacterStateEntry>
+  arcSummaries?: ArcSummary[]
+  volumeSummaries?: VolumeSummary[]
   factHistory?: Array<{
     chapter?: number
     type?: string

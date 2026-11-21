@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from novel_forge.storage import (
-    StorageError, Store, count_chinese_words, manuscript_fingerprint,
+    StorageError, Store, arc_context_version, count_chinese_words, manuscript_fingerprint,
     revision_manuscript_state, volume_source_hash,
 )
 
@@ -28,6 +28,83 @@ class PythonStorageTests(unittest.TestCase):
     def setUp(self):
         directory = self.enterContext(tempfile.TemporaryDirectory())
         self.store = Store(Path(directory))
+
+    def test_arc_archive_validates_evidence_with_fail_soft_and_rejects_stale_sources(self):
+        job_id = self.store.create_job({"totalChapters": 9})["id"]
+        arcs = [{"arcIndex": index, "startChapter": start, "endChapter": end, "arcTitle": "行动", "arcGoal": "取证"}
+                for index, start, end in ((1, 1, 3), (2, 4, 6))]
+        self.assertEqual(self.store.get_canonical_facts(job_id)["arcSummaries"], [])
+        self.store.update_job(job_id, {"arcPlans": arcs})
+        story = "港口ＡＢ、换岗完毕。船工掀开暗门，交出了古铜刻印。"
+        for chapter in range(1, 10):
+            self.store.save_chapter(job_id, chapter, {"content": story, "status": "needs_review" if chapter == 2 else "verified"})
+        first = self.store.get_chapters(job_id, start_chapter=1, end_chapter=3)
+        second = self.store.get_chapters(job_id, start_chapter=4, end_chapter=6)
+        source1, source2 = volume_source_hash(first), volume_source_hash(second)
+        raw = {
+            "mainline": "门" * 290,
+            "turningPoints": [{"chapter": n, "text": "变化"} for n in (1, 2, 3, 2, 7)],
+            "usedBeats": [
+                {"chapter": 2, "text": "实证换岗", "quote": "港口 AB,换岗完毕."},
+                {"chapter": 2, "text": "编造机制", "quote": "根本没有这句"},
+                {"chapter": 5, "text": "超出本单元", "quote": "船工掀开暗门"},
+            ],
+            "usedHooks": [{"chapter": 3, "text": "从实物带出新进展", "quote": "船工掀开暗门……古铜刻印"}],
+            "villainStatus": "退" * 130,
+        }
+        self.assertTrue(self.store.save_arc_summary(job_id, arcs[0], source1, raw))
+        summary = self.store.get_canonical_facts(job_id)["arcSummaries"][0]
+        self.assertEqual(len(summary["mainline"]), 280)
+        self.assertEqual(len(summary["turningPoints"]), 3)
+        self.assertEqual(len(summary["villainStatus"]), 120)
+        self.assertEqual(summary["needsReviewChapters"], [2])
+        self.assertEqual([entry["text"] for entry in summary["usedBeats"]], ["实证换岗"])
+        self.assertEqual(len(summary["usedHooks"]), 1)
+        self.assertTrue(self.store.save_arc_summary(job_id, arcs[0], source1, {**raw, "mainline": "忽略重复请求"}))
+        self.assertEqual(self.store.get_canonical_facts(job_id)["arcSummaries"], [summary])
+        self.assertTrue(self.store.save_arc_summary(job_id, arcs[1], source2, {"mainline": "第二单元对峙"}))
+        rolled = self.store.delete_uncommitted_facts(job_id, 4)
+        self.assertEqual(rolled["arcSummaries"], [summary])
+        self.assertTrue(self.store.save_arc_summary(job_id, arcs[1], source2, {"mainline": "第二单元对峙"}))
+        self.store.save_chapter(job_id, 2, {"content": "已被作者修改。"})
+        self.assertFalse(self.store.save_arc_summary(job_id, arcs[0], source1, raw))
+        self.assertEqual([row["arc"] for row in self.store.get_canonical_facts(job_id)["arcSummaries"]], [2])
+        self.assertEqual(self.store.get_job_record(job_id)["arcPlans"], arcs)
+
+        self.store.update_job(job_id, {"status": "completed"})
+        chapters = self.store.get_chapters(job_id)
+        self.store.apply_manuscript_revision(job_id, {
+            "revisionId": "edit-archived-chapter", "sourceVersion": manuscript_fingerprint(chapters),
+            "changes": [{"chapterNumber": 5, "title": "新章名", "content": "重写归档章节。"}],
+        })
+        self.assertEqual(self.store.get_canonical_facts(job_id)["arcSummaries"], [])
+
+    def test_arc_plan_transaction_never_keeps_partial_outlines_or_stale_context(self):
+        job_id = self.store.create_job({"totalChapters": 5})["id"]
+        self.store.save_chapter(job_id, 1, {"title": "旧稿开场", "content": SOURCE})
+        self.store.update_job(job_id, {"outlines": [{"chapterNumber": 1, "title": "旧稿开场"}]})
+        arc = {"arcIndex": 1, "startChapter": 2, "endChapter": 5, "arcTitle": "港口", "arcGoal": "揭示"}
+        outlines = [{"chapterNumber": n, "title": f"归档第{n}章"} for n in range(2, 6)]
+        before = self.store.get_job_record(job_id)
+        source = arc_context_version(self.store.get_canonical_facts(job_id), self.store.get_chapters(job_id), 2)
+        checkpoint = {"stage": "chapter_writing", "nextChapter": 2, "nextOutlineChapter": 6}
+        with closing(sqlite3.connect(self.store.path)) as db:
+            db.execute("""CREATE TRIGGER fixture_arc_abort BEFORE UPDATE ON jobs
+                          BEGIN SELECT RAISE(ABORT, 'arc save failed'); END""")
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "arc save failed"):
+            self.store.save_arc_plan(job_id, arc, outlines, total=5, expected_context=source, checkpoint=checkpoint)
+        self.assertEqual(self.store.get_job_record(job_id), before)
+        with closing(sqlite3.connect(self.store.path)) as db:
+            db.execute("DROP TRIGGER fixture_arc_abort")
+        self.store.save_chapter(job_id, 1, {"title": "旧稿开场", "content": SOURCE + "现在正文有变。"})
+        self.assertFalse(self.store.save_arc_plan(job_id, arc, outlines, total=5, expected_context=source, checkpoint=checkpoint))
+        source = arc_context_version(self.store.get_canonical_facts(job_id), self.store.get_chapters(job_id), 2)
+        self.assertTrue(self.store.save_arc_plan(job_id, arc, outlines, total=5, expected_context=source, checkpoint=checkpoint))
+        saved = self.store.get_job_record(job_id)
+        self.assertEqual(saved["arcPlans"], [arc])
+        self.assertEqual([row["chapterNumber"] for row in saved["outlines"]], [1, 2, 3, 4, 5])
+        self.assertEqual(saved["checkpoint"]["nextOutlineChapter"], 6)
+        self.assertFalse(self.store.save_arc_plan(job_id, arc, outlines, total=5, expected_context=source, checkpoint=checkpoint))
 
     def test_word_count_and_existing_config_formats(self):
         self.assertEqual(count_chinese_words(" 甲㐀。ABC_1, xy123 🚢１２ "), 4)
@@ -85,17 +162,22 @@ class PythonStorageTests(unittest.TestCase):
                           BEGIN SELECT RAISE(ABORT, 'fixture abort'); END""")
         before = self.store.get_job_record(job_id)
         with self.assertRaisesRegex(sqlite3.IntegrityError, "fixture abort"):
-            self.store.save_verified_chapter(job_id, 1, {"content": SOURCE}, INITIAL_MEMORY, long_memory=True)
+            self.store.save_verified_chapter(job_id, 1, {"content": SOURCE}, INITIAL_MEMORY, long_memory=True,
+                                             meme_title="同一梗")
         self.assertIsNone(self.store.get_chapter(job_id, 1))
         self.assertEqual(self.store.get_job_record(job_id), before)
         with closing(sqlite3.connect(self.store.path)) as db:
             db.execute("DROP TRIGGER fixture_abort")
 
-        self.store.save_verified_chapter(job_id, 1, {"content": SOURCE}, INITIAL_MEMORY, long_memory=True)
+        self.store.save_verified_chapter(job_id, 1, {"content": SOURCE}, INITIAL_MEMORY, long_memory=True,
+                                         meme_title="同一梗")
         before = self.store.get_canonical_facts(job_id)
         self.store.save_verified_chapter(job_id, 2, {"content": SOURCE, "status": "needs_review"},
-                                         INITIAL_MEMORY, long_memory=True)
+                                         INITIAL_MEMORY, long_memory=True, meme_title="另一梗")
+        self.store.save_verified_chapter(job_id, 2, {"content": SOURCE, "status": "needs_review"},
+                                         INITIAL_MEMORY, long_memory=True, meme_title="另一梗")
         self.assertEqual(self.store.get_job_record(job_id)["completedChapters"], 2)
+        self.assertEqual(self.store.get_job_record(job_id)["usedMemeTitles"], ["同一梗", "另一梗"])
         self.assertEqual(self.store.get_canonical_facts(job_id), before)
         self.assertEqual(self.store.save_checkpoint(job_id, {"stage": "writing"})["stage"], "writing")
         self.store.append_job_log(job_id, {"message": "已落库"})
@@ -104,6 +186,46 @@ class PythonStorageTests(unittest.TestCase):
         self.assertIn("savedAt", job["checkpoint"])
         self.assertEqual(job["logs"][-1]["message"], "已落库")
         self.assertEqual(job["repairLogs"][-1]["chapterNumber"], 2)
+
+    def test_active_injury_merges_by_side_and_rollback_restores_legacy_baseline(self):
+        job_id = self.store.create_job({"totalChapters": 20})["id"]
+        left = {"id": "legacy-left", "character": "姚青", "description": "左前臂骨折", "active": True,
+                "severity": "high", "sourceChapter": 3}
+        later = {"id": "legacy-later", "character": "船医", "description": "胸口旧伤", "sourceChapter": 14}
+        self.store.update_job(job_id, {"canonicalFacts": {"injuries": [left, later]}})
+
+        def commit(number, *changes):
+            self.store.save_verified_chapter(job_id, number, {"content": SOURCE}, {"injuries": list(changes)})
+            return {entry["id"]: entry for entry in self.store.get_canonical_facts(job_id)["injuries"]}
+
+        changed = commit(8, {"character": "姚青", "bodyPart": "左臂", "description": "左臂骨折已固定"},
+                         {"id": "new-right", "character": "姚青", "description": "右臂重伤", "severity": "medium"})
+        self.assertEqual(set(changed), {"legacy-left", "legacy-later", "new-right"})
+        self.assertEqual((changed["legacy-left"]["sourceChapter"], changed["legacy-left"]["updatedAtChapter"]), (3, 8))
+        self.assertEqual(changed["legacy-left"]["severity"], "high")
+        healed = commit(12, {"character": "姚青", "bodyPart": "左臂", "active": False})
+        self.assertFalse(healed["legacy-left"]["active"])
+        self.assertTrue(healed["new-right"]["active"])
+        self.assertEqual(healed["legacy-left"]["healedChapter"], 12)
+
+        reopened = Store(self.store.directory)
+        restored = reopened.delete_uncommitted_facts(job_id, 12)["injuries"]
+        self.assertEqual({entry["id"]: entry for entry in restored},
+                         {key: changed[key] for key in ("legacy-left", "new-right")})
+        self.assertEqual(reopened.delete_uncommitted_facts(job_id, 8)["injuries"], [left])
+
+    def test_replacing_a_chapter_delta_removes_its_previous_injury_update(self):
+        job_id = self.store.create_job({"totalChapters": 4})["id"]
+        chapter = {"content": SOURCE}
+        first = {"character": "姚青", "description": "左肩脱臼", "severity": "medium"}
+        original = self.store.save_verified_chapter(job_id, 1, chapter, {"injuries": [first]})["canonicalFacts"]["injuries"]
+        self.store.save_verified_chapter(job_id, 3, chapter, {"injuries": [
+            {"id": original[0]["id"], "character": "姚青", "active": False},
+        ]})
+        self.store.save_chapter(job_id, 3, {"content": SOURCE + "潮水再次涌来。"})
+        self.assertFalse(self.store.get_canonical_facts(job_id)["injuries"][0]["active"])
+        current = self.store.save_verified_chapter(job_id, 3, chapter, {})["canonicalFacts"]["injuries"]
+        self.assertEqual(current, original)
 
     def test_memory_replay_and_archive_invalidation(self):
         job_id = self.store.create_job({"totalChapters": 20})["id"]

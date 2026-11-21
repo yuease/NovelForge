@@ -2,13 +2,16 @@
 
 import asyncio
 import math
+import os
 import random
 import re
+import unicodedata
 import time
 from contextlib import aclosing
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 
+from .arc_planning import legacy_outline_placeholder, normalize_canon_locks, prior_arc_summaries, saved_arc_plans, validate_arc_plan
 from .chapter_style import can_save_unverified_draft
 from .docx_export import DOCX_CONTENT_TYPE, FANQIE_SIZE_LIMIT, build_fanqie_docx, format_fanqie_chapter_title, split_fanqie_paragraphs
 from .draft_quality import clean_chapter_draft, normalize_style_bible, strip_draft_headings
@@ -19,6 +22,8 @@ from .long_memory import normalize_volume_summary
 from .memes import MemeStore
 from .prompts import (
     STYLE_PRESETS,
+    build_arc_outlines_prompt,
+    build_arc_summary_prompt,
     build_book_plan_prompt,
     build_chapter_outlines_prompt,
     build_chapter_write_prompt,
@@ -30,8 +35,11 @@ from .prompts import (
     read_writing_options,
 )
 from .providers import get_provider_definition, is_masked_api_key, same_endpoint_origin
-from .storage import _is_committed, count_chinese_words, public_job, volume_source_hash
-from .verifier import _llm_options, parse_json_from_llm, recheck_downstream_chapters, review_chapter_stages, verify_and_repair_chapter
+from .storage import _is_committed, arc_context_version, count_chinese_words, public_job, volume_source_hash
+from .verifier import (
+    _llm_options, parse_json_from_llm, recheck_downstream_chapters,
+    review_chapter_stages, verify_and_repair_chapter,
+)
 
 
 _WORD_TARGET_DEFAULT = 2000
@@ -42,7 +50,8 @@ _TRANSIENT_ERRORS = {
     "HTTP_429", "TIMEOUT", "HTTP_503", "HTTP_502", "HTTP_504", "NETWORK_ERROR", "EMPTY_RESPONSE",
     "ECONNRESET", "ETIMEDOUT", "UND_ERR_CONNECT_TIMEOUT",
 }
-_MANUAL_RESUME = {"QUOTA_EXCEEDED", "CIRCUIT_OPEN", "OUTPUT_TRUNCATED", "OPENAI_RATE_LIMIT"}
+_MANUAL_RESUME = {"QUOTA_EXCEEDED", "CIRCUIT_OPEN", "OUTPUT_TRUNCATED", "OPENAI_RATE_LIMIT", "OUTLINE_PARSE_FAILED",
+                  "ARC_SUMMARY_INVALID", "ARC_SOURCE_CHANGED"}
 _COMEDY = re.compile(r"吐槽|搞笑|反差|打脸|震惊|直播|吃瓜|反转|嘴替|荒诞|尴尬|发疯")
 _PLACEHOLDERS = re.compile(r"【待补充|\[TODO\]|TBD|placeholder", re.I)
 _MARKDOWN_HEADING = re.compile(r"^#{1,6}\s*")
@@ -132,13 +141,36 @@ def review_action(event):
     return "repair" if event.get("canRepair") else "reject"
 
 
-def compute_dynamic_chapter_target(job, written_words, remaining_chapters):
+def _is_finale(chapter_number, total):
+    count = 3 if total >= 6 else 2 if total >= 4 else 1
+    return 0 < chapter_number <= total and chapter_number > total - count
+
+
+def compute_dynamic_chapter_target(job, written_words, remaining_chapters, *, chapter_number=None):
     base = _number(job.get("wordsPerChapter")) or _WORD_TARGET_DEFAULT
-    total = _number(job.get("targetWords")) or base * _number(job.get("totalChapters"))
+    chapters = _number(job.get("totalChapters"))
+    total = _number(job.get("targetWords")) or base * chapters
     if remaining_chapters <= 0:
         return base
+    number = chapters - remaining_chapters + 1 if chapter_number is None else chapter_number
+    floor = base if _is_finale(number, chapters) else _round(base * 0.85)
     ideal = _round(max(300, total - written_words) / remaining_chapters)
-    return min(_round(base * 1.5), max(300, _round(base * 0.65), ideal))
+    return min(_round(base * 1.5), max(300, floor, ideal))
+
+
+def _meme_title(sample):
+    title = _dict(sample).get("title")
+    return " ".join(unicodedata.normalize("NFKC", title).split()).casefold() if isinstance(title, str) else ""
+
+
+def _saved_outlines(job):
+    saved = {}
+    for value in _list(job.get("outlines")):
+        entry = _dict(value)
+        number = _chapter_number(entry)
+        if type(number) is int and 1 <= number <= job["totalChapters"]:
+            saved.setdefault(number, entry)
+    return saved
 
 
 def _display_title(chapter):
@@ -460,7 +492,9 @@ class PipelineRuntime:
                 recovered.append(_safe_job(updated))
                 stage = _dict(updated.get("checkpoint")).get("stage") or updated.get("stage")
                 await self._log(job_id, "warn", updated.get("stage"), f"检测到服务重启前的未完成任务，从断点恢复（stage={stage}）")
-                if auto_resume:
+                if auto_resume and _dict(updated.get("error")).get("code") not in (
+                    "OUTLINE_PARSE_FAILED", "ARC_SUMMARY_INVALID", "ARC_SOURCE_CHANGED",
+                ):
                     await self._launch(updated)
         return recovered
 
@@ -634,7 +668,7 @@ class PipelineRuntime:
         await self._boundary_interrupt(job_id, config.get("testScenario"), "topic_locked")
         return job
 
-    async def _book_plan(self, job, config, meme_level, meme_samples, draft_quality):
+    async def _book_plan(self, job, config, meme_level, meme_samples, draft_quality, *, rolling_arc_outlines=False):
         if job.get("bookPlan") is not None:
             return job
         job_id = job["id"]
@@ -644,7 +678,7 @@ class PipelineRuntime:
             title=job.get("title") or "", premise=job.get("premise") or "", genre=job.get("genre") or "都市爽文",
             pov=job.get("pov") or "第三人称限知", target_words=job["targetWords"], total_chapters=job["totalChapters"],
             hotspot_context=job.get("hotspotContext"), topic_package=job.get("topicPackage"), meme_level=meme_level,
-            meme_samples=meme_samples, draft_quality=draft_quality,
+            meme_samples=meme_samples, draft_quality=draft_quality, rolling_arc_outlines=rolling_arc_outlines,
         )
         reply = await self._llm(job_id, "book_plan", config, prompt, 0.7)
         fallback = {
@@ -654,6 +688,9 @@ class PipelineRuntime:
         }
         parsed = parse_json_from_llm(reply.get("text"))
         plan = parsed if isinstance(parsed, dict) else fallback
+        locks = plan.pop("canonLocks", None)
+        if rolling_arc_outlines and (locks := normalize_canon_locks(locks)):
+            plan["canonLocks"] = locks
         if draft_quality and "styleBible" in plan:
             style = normalize_style_bible(plan["styleBible"])
             if style is None:
@@ -667,18 +704,36 @@ class PipelineRuntime:
         self._publish(job_id, "job:progress", stage="book_plan", progress=10, bookPlan=plan)
         return job
 
-    async def _outlines(self, job, config):
+    async def _outlines(self, job, config, *, through=None):
         job_id, total = job["id"], int(job["totalChapters"])
-        saved = {}
-        for entry in _list(job.get("outlines")):
-            number = _chapter_number(_dict(entry))
-            if type(number) is int and 1 <= number <= total:
-                saved.setdefault(number, entry)
-        missing = [number for number in range(1, total + 1) if number not in saved]
+        saved = _saved_outlines(job)
+        placeholders = {n for n, row in saved.items() if legacy_outline_placeholder(row, n)}
+        if placeholders:
+            chapters = await asyncio.to_thread(self.store.get_chapters, job_id)
+            committed = {_chapter_number(chapter) for chapter in chapters if _is_committed(chapter)}
+            for number in placeholders - committed:
+                saved.pop(number, None)
+
+        def missing_numbers():
+            return [number for number in range(1, total + 1) if number not in saved]
+
+        def missing_ranges(numbers):
+            if not numbers:
+                return
+            start = end = numbers[0]
+            for number in numbers[1:]:
+                if number != end + 1 or number - start >= 5:
+                    yield start, end
+                    start = number
+                end = number
+            yield start, end
+
+        missing = [n for n in missing_numbers() if through is None or n <= through]
         if not missing:
             return saved
-        await self._set_stage(job_id, "chapter_outlines", 12)
-        await self._log(job_id, "info", "chapter_outlines", f"开始生成 {total} 章连续章纲...")
+        await self._set_stage(job_id, "chapter_outlines", 12 if through is None else None)
+        message = f"开始生成 {total} 章连续章纲..." if through is None else f"补齐历史章纲缺口（至第 {through} 章）。"
+        await self._log(job_id, "info", "chapter_outlines", message)
         facts = extract_relevant_facts(await asyncio.to_thread(self.store.get_canonical_facts, job_id)) if missing[0] > 1 else None
 
         async def fill(start, end):
@@ -692,29 +747,32 @@ class PipelineRuntime:
             decoded = parse_json_from_llm(reply.get("text"), [])
             batch = decoded if isinstance(decoded, list) else _list(_dict(decoded).get("chapters")) or _list(_dict(decoded).get("outlines"))
             for entry in batch:
-                number = _chapter_number(_dict(entry))
-                if type(number) is int and start <= number <= end:
+                entry = _dict(entry)
+                number = _chapter_number(entry)
+                title, summary = entry.get("title"), entry.get("summary")
+                has_story = (isinstance(summary, str) and summary.strip()) or any(
+                    isinstance(event, str) and event.strip() for event in _list(entry.get("keyEvents"))
+                )
+                if (type(number) is int and start <= number <= end and isinstance(title, str)
+                        and title.strip() and has_story and not legacy_outline_placeholder(entry, number)):
                     saved.setdefault(number, {**entry, "chapterNumber": number})
+            pending = missing_numbers()
+            await _write(self.store.save_checkpoint, job_id, {
+                "stage": "chapter_outlines", "nextOutlineChapter": pending[0] if pending else total + 1,
+            }, outlines=[saved[n] for n in sorted(saved)])
 
-        for start in missing:
-            if start in saved:
-                continue
-            end = min(total, start + 4)
+        for start, end in missing_ranges(missing):
             await fill(start, end)
             remaining = [number for number in range(start, end + 1) if number not in saved]
-            if remaining:
-                await fill(remaining[0], remaining[-1])
+            for first, last in missing_ranges(remaining):
+                await fill(first, last)
             remaining = [number for number in remaining if number not in saved]
-            for number in remaining:
-                saved[number] = {
-                    "chapterNumber": number, "title": f"第{number}章 危机递进", "goal": f"推进第{number}章核心冲突",
-                    "summary": f"第{number}章承接前文规则线索展开冲突并留下章末悬念。",
-                    "keyEvents": [f"第{number}章关键事件"], "hook": f"引出第{number + 1}章危机",
-                }
             if remaining:
-                await self._log(job_id, "warn", "chapter_outlines", f"第 {','.join(map(str, remaining))} 章章纲 JSON 解析不完整，已使用兜底章纲")
-            await self._update(job_id, {"outlines": [saved[n] for n in sorted(saved)]})
-            await self._checkpoint(job_id, "chapter_outlines", nextOutlineChapter=end + 1)
+                chapters = "、".join(map(str, remaining))
+                raise LLMError(f"第 {chapters} 章缺少可用章纲。已保存有效章纲，可从断点补齐缺章。",
+                               code="OUTLINE_PARSE_FAILED", status=502, retryable=True)
+        if through is not None:
+            return saved
         await self._update(job_id, {"progress": 15})
         chapters = await asyncio.to_thread(self.store.get_chapters, job_id)
         committed = {_chapter_number(chapter) for chapter in chapters if _is_committed(chapter)}
@@ -724,44 +782,158 @@ class PipelineRuntime:
         self._publish(job_id, "job:progress", stage="chapter_outlines", progress=15)
         return saved
 
+    async def _plan_arc(self, job, arcs, outlines, start, config, archive_config, *, story_ledger=False):
+        job_id, total = job["id"], job["totalChapters"]
+        checkpoint = {"stage": "chapter_outlines", "nextChapter": start, "nextOutlineChapter": start,
+                      "completedChapter": start - 1}
+        await self._set_stage(job_id, "chapter_outlines")
+        await self._checkpoint(job_id, **checkpoint)
+        await self._refresh_arc_archives(job_id, arcs, start, archive_config,
+                                         story_ledger=story_ledger, book_plan=job.get("bookPlan"))
+        preceding = await asyncio.to_thread(self.store.get_chapters, job_id, end_chapter=start - 1)
+        preceding = [row for row in preceding if _is_committed(row)][-5:]
+        facts = await asyncio.to_thread(self.store.get_canonical_facts, job_id)
+        source = arc_context_version(facts, preceding, start)
+        available = {(row.get("arc"), row["startChapter"], row["endChapter"]) for row in prior_arc_summaries(facts, start)}
+        if any((arc["arcIndex"], arc["startChapter"], arc["endChapter"]) not in available
+               for arc in arcs if arc["endChapter"] < start):
+            raise LLMError("已有单元的正文在规划前发生变化，请从断点重新归档。",
+                           code="ARC_SOURCE_CHANGED", status=409, retryable=True)
+        arc_index = max((arc["arcIndex"] for arc in arcs), default=0) + 1
+        prior_arcs = [arc for arc in arcs if arc["endChapter"] < start][-2:]
+        title_floor = prior_arcs[0]["startChapter"] if prior_arcs else max(1, start - 12)
+        titles = [outlines[n].get("title") for n in sorted(outlines) if title_floor <= n < start]
+        prompt = build_arc_outlines_prompt(
+            book_plan=job["bookPlan"], canonical_facts=facts, start_chapter=start, total_chapters=total,
+            arc_index=arc_index, preceding_chapters=preceding, recent_titles=titles,
+            continuation_direction=job.get("continuationDirection") or "", finalize_book=bool(job.get("finalizeBook")),
+            story_ledger=story_ledger,
+        )
+        await self._log(job_id, "info", "chapter_outlines", f"从第 {start} 章规划第 {arc_index} 剧情单元。")
+        error = ""
+        for attempt in range(2):
+            request = prompt if not attempt else {**prompt, "prompt": (
+                f"{prompt['prompt']}\n上次校验未通过：{error} 请纠正并完整重发本单元 JSON。"
+            )}
+            reply = await self._llm(job_id, "chapter_outlines", config, request, 0.6, retries=attempt)
+            try:
+                arc, batch = validate_arc_plan(parse_json_from_llm(reply.get("text")), arc_index=arc_index,
+                                               start=start, total=total, recent_titles=titles)
+            except ValueError as issue:
+                error = str(issue)
+                continue
+            next_outline = arc["endChapter"] + 1
+            saved = await _write(self.store.save_arc_plan, job_id, arc, batch, total=total, expected_context=source,
+                                 checkpoint={**checkpoint, "stage": "chapter_writing", "nextOutlineChapter": next_outline})
+            if not saved:
+                raise LLMError("规划期间已提交正文或单元边界发生变化，请从断点继续。",
+                               code="ARC_SOURCE_CHANGED", status=409, retryable=True)
+            arcs.append(arc)
+            outlines.update((row["chapterNumber"], row) for row in batch)
+            await self._log(job_id, "info", "chapter_outlines", f"已锁定第 {start}–{arc['endChapter']} 章单元「{arc['arcTitle']}」。")
+            return
+        raise LLMError(f"第 {start} 章起的单元章纲未通过校验：{error} 已保存断点，可继续补齐。",
+                       code="OUTLINE_PARSE_FAILED", status=502, retryable=True)
+
     async def _run_once(self, job_id):
         job = await self._update(job_id, {"status": "running", "error": None, "autoRetryState": None})
         options = read_writing_options(job)
+        rolling = options["rolling_arc_outlines"]
+        story_ledger = options["story_ledger"]
         config = {**_dict(job.get("llmConfig")), "testScenario": job.get("testScenario")}
         auxiliary = {**config, "model": config.get("lightModel") or config.get("model")}
+        archive_model = os.environ.get("NOVEL_FORGE_ARC_REVIEW_MODEL", "").strip() if story_ledger else ""
+        archive_config = {**auxiliary, "model": archive_model} if archive_model else auxiliary
         total = int(job["totalChapters"])
         meme_level = job.get("memeLevel") or "none"
 
         yield {"phase": "topic"}
         job = await self._topic(job, config)
-        samples = await self.meme_store.get_meme_inspiration_samples(
-            genre=job.get("genre") or "", meme_source_mode=job.get("memeSourceMode") or "active_only", limit=4,
-        ) if meme_level != "none" else []
+        samples = []
+        if meme_level != "none":
+            mode = job.get("memeSourceMode") or "active_only"
+            limit = min(12, max(4, total // 4))
+            pool = _dict(job.get("memeSamplePool"))
+            if pool.get("mode") == mode and pool.get("limit") == limit:
+                samples = _list(pool.get("samples"))
+            if not samples:
+                picks = await self.meme_store.get_meme_inspiration_samples(
+                    genre=job.get("genre") or "", meme_source_mode=mode, limit=limit,
+                )
+                unique = {}
+                for sample in picks:
+                    if key := _meme_title(sample):
+                        unique.setdefault(key, sample)
+                samples = list(unique.values())[:limit]
+                if samples:
+                    job = await self._update(job_id, {"memeSamplePool": {"mode": mode, "limit": limit, "samples": samples}})
+        used_samples = set(title for title in _list(job.get("usedMemeTitles")) if isinstance(title, str))
         yield {"phase": "plan"}
-        job = await self._book_plan(job, config, meme_level, samples, options["draft_quality"])
-        yield {"phase": "outlines"}
-        outlines = await self._outlines(job, config)
-        job = await self._set_stage(job_id, "chapter_writing")
+        job = await self._book_plan(job, config, meme_level, samples[:4], options["draft_quality"], rolling_arc_outlines=rolling)
         committed = {
             chapter["chapterNumber"]: chapter for chapter in await asyncio.to_thread(self.store.get_chapters, job_id)
             if _is_committed(chapter)
         }
         running_words = sum(_word_count(chapter) for chapter in committed.values())
         first_missing = next((number for number in range(1, total + 1) if number not in committed), total + 1)
-        if options["long_memory"] and (last_full_volume := (first_missing - 1) // 10 * 10):
-            await self._archive(job_id, last_full_volume, committed, auxiliary)
+        arcs = saved_arc_plans(job) if rolling else []
+        if not rolling:
+            yield {"phase": "outlines"}
+            outlines = await self._outlines(job, config)
+            if options["long_memory"] and (last_full_volume := (first_missing - 1) // 10 * 10):
+                if await self._needs_volume_archive(job_id, last_full_volume, committed):
+                    yield {"phase": "archive", "chapter": last_full_volume}
+                    await self._archive(job_id, last_full_volume, committed, auxiliary)
+            job = await self._set_stage(job_id, "chapter_writing")
+        else:
+            existing = _saved_outlines(job)
+            historical_tail = max([0, *existing, *committed, *(arc["endChapter"] for arc in arcs)])
+            need_historical = bool(historical_tail and any(
+                n not in existing or (legacy_outline_placeholder(existing[n], n) and n not in committed)
+                for n in range(1, historical_tail + 1)
+            ))
+            pending_archives = await self._pending_arc_archives(job_id, arcs, first_missing) if first_missing <= total else []
+            in_outlines = False
+            if need_historical:
+                yield {"phase": "outlines"}
+                in_outlines = True
+                outlines = await self._outlines(job, config, through=historical_tail)
+            else:
+                outlines = existing
+            if pending_archives:
+                yield {"phase": "archive", "chapter": pending_archives[-1]["endChapter"]}
+                in_outlines = False
+                await self._refresh_arc_archives(job_id, arcs, first_missing, archive_config,
+                                                 story_ledger=story_ledger, book_plan=job.get("bookPlan"))
+            if first_missing <= total and first_missing not in outlines:
+                if not in_outlines:
+                    yield {"phase": "outlines", **({"chapter": first_missing} if first_missing > 1 else {})}
+                await self._plan_arc(job, arcs, outlines, first_missing, config, archive_config, story_ledger=story_ledger)
+            elif not in_outlines and not pending_archives:
+                yield {"phase": "outlines"}
+            job = await self._set_stage(job_id, "chapter_writing", 15 if _number(job.get("progress")) < 15 else None)
 
-        for number, outline in sorted(outlines.items()):
+        for number in range(1, total + 1):
             if number in committed:
                 continue
+            if rolling and number not in outlines:
+                yield {"phase": "outlines", "chapter": number}
+                await self._plan_arc(job, arcs, outlines, number, config, archive_config, story_ledger=story_ledger)
+                await self._set_stage(job_id, "chapter_writing")
+            outline = outlines[number]
+            next_outline = max(outlines) + 1 if rolling else None
+            outline_cursor = {"nextOutlineChapter": next_outline} if rolling else {}
             yield {"phase": "chapter", "chapter": number}
             # A previous attempt can leave provisional facts. Preserve committed facts past an imported gap.
             if not any(saved > number for saved in committed):
                 await _write(self.store.delete_uncommitted_facts, job_id, number)
-            await self._checkpoint(job_id, "chapter_writing", nextChapter=number, completedChapter=number - 1)
+            await self._checkpoint(job_id, "chapter_writing", nextChapter=number, completedChapter=number - 1, **outline_cursor)
             await self._boundary_interrupt(job_id, config.get("testScenario"), "chapter_writing")
             self._publish(job_id, "chapter:started", chapterNumber=number, totalChapters=total, title=outline.get("title"))
             recent = [committed[n] for n in sorted(committed) if n < number][-5:]
+            recent_chapters = [
+                committed.get(n, {}).get("content") or "" for n in range(max(1, number - 3), number)
+            ] if options["chapter_ai_gate"] else None
             prev = (recent[-1].get("content") or "") if recent else ""
             summaries = [{"chapterNumber": ch["chapterNumber"], "summary": ch.get("summary") or "",
                           "needsReview": ch.get("status") == "needs_review"} for ch in recent]
@@ -769,30 +941,37 @@ class PipelineRuntime:
             context = " ".join(str(item or "") for item in (
                 outline.get("title"), outline.get("summary"), *_list(outline.get("keyEvents")), _excerpt(prev, 300, tail=True),
             ))
-            relevant = extract_relevant_facts(facts, context_text=context)
+            relevant = extract_relevant_facts(facts, context_text=context, current_chapter=number, story_ledger=story_ledger)
             remaining = total - len(committed)
-            target = compute_dynamic_chapter_target(job, running_words, remaining)
+            target = compute_dynamic_chapter_target(job, running_words, remaining, chapter_number=number)
+            finale = _is_finale(number, total)
             pov = job.get("pov") or "第三人称限知"
             style_key = job.get("stylePreset") or job.get("style")
             style = job.get("styleGuide") or STYLE_PRESETS.get(style_key, STYLE_PRESETS["番茄爽文"])
+            sample = None
+            if number <= 3 or number % 3 == 0 or _COMEDY.search(f"{context} {outline.get('goal') or ''}"):
+                sample = next((entry for entry in samples if _meme_title(entry) not in used_samples), None)
             prompt = build_chapter_write_prompt(
                 book_plan=job["bookPlan"], outline=outline, prev_chapter_ending=prev, recent_summaries=summaries,
                 canonical_facts=facts, relevant_facts=relevant, input_budget=options["input_budget"],
                 draft_quality=options["draft_quality"], long_memory=options["long_memory"], pov=pov,
+                chapter_ai_gate=options["chapter_ai_gate"],
+                rolling_arc_outlines=rolling, story_ledger=story_ledger,
                 target_words=target, total_chapters=total, style_guide=style, meme_level=meme_level,
-                meme_samples=samples[:2] if number <= 3 or number % 3 == 0 or _COMEDY.search(
-                    f"{context} {outline.get('goal') or ''}"
-                ) else [],
+                meme_samples=[sample] if sample is not None else [],
             )
+            meme_title = _meme_title(sample) if sample and any(
+                line.startswith(f"- 【{sample['title']}】") for line in prompt["system"].splitlines()
+            ) else None
             written = await self._llm(job_id, "chapter_writing", config, prompt, config.get("temperature", 0.7))
             chapter_text = str(written.get("text") or "").strip()
             if output_was_truncated(written.get("finishReason")):
                 raise LLMError("写章输出达到上限，请从断点继续。", code="OUTPUT_TRUNCATED", status=502, retryable=True)
             words = count_chinese_words(chapter_text)
-            minimum = max(200, _round(target * (0.82 if remaining <= 2 else 0.72)))
-            maximum = _round(target * (1.25 if remaining <= 2 else 1.38))
+            minimum = max(200, _round(target * (0.82 if finale else 0.72)))
+            maximum = _round(target * (1.25 if finale else 1.38))
             if (words < max(200, _round(target * 0.72)) or words > _round(target * 1.38)
-                    or remaining <= 2 and (words < target * 0.85 or words > target * 1.2)):
+                    or finale and (words < target * 0.85 or words > target * 1.2)):
                 chapter_text = await self._adjust_words(job_id, number, chapter_text, words, target, outline, pov, auxiliary)
             title = _MARKDOWN_HEADING.sub("", str(outline.get("title") or f"第{number}章")).strip()
             if options["draft_quality"]:
@@ -801,8 +980,19 @@ class PipelineRuntime:
 
             max_repairs = max(0, int(_number(job.get("maxRepairRetries"), 2)))
             started = time.monotonic()
+
+            async def extract_missing_facts(body):
+                fact_prompt = build_fact_extraction_prompt(
+                    chapter_number=number, chapter_text=body, outline=outline, canonical_facts=facts,
+                    long_memory=options["long_memory"], story_ledger=story_ledger, book_plan=job.get("bookPlan"),
+                )
+                reply = await self._llm(job_id, "fact_extraction", auxiliary, fact_prompt, 0.2)
+                return _dict(parse_json_from_llm(reply.get("text"))) if not output_was_truncated(reply.get("finishReason")) else {}
+
             async with aclosing(review_chapter_stages(
                 job_id=job_id, chapter_number=number, chapter_text=chapter_text, outline=outline, canonical_facts=facts,
+                book_plan=job.get("bookPlan"), recent_chapters=recent_chapters, rolling_arc_outlines=rolling,
+                story_ledger=story_ledger, extract_missing_facts=extract_missing_facts if story_ledger else None,
                 prev_chapter_ending=prev, pov=pov, target_words=target, min_words=minimum, max_words=maximum,
                 llm_config=config, verify_llm_config=auxiliary, test_scenario=config.get("testScenario"),
                 max_retries=max_repairs, chapter_ai_gate=options["chapter_ai_gate"], long_memory=options["long_memory"],
@@ -847,23 +1037,34 @@ class PipelineRuntime:
 
             delta = None if needs_review else result["factsDelta"]
             if not needs_review and not isinstance(delta, dict):
-                fact_prompt = build_fact_extraction_prompt(chapter_number=number, chapter_text=body,
-                                                           existing_facts=relevant, canonical_facts=facts,
-                                                           long_memory=options["long_memory"])
-                reply = await self._llm(job_id, "fact_extraction", auxiliary, fact_prompt, 0.2)
-                delta = _dict(parse_json_from_llm(reply.get("text"))) if not output_was_truncated(reply.get("finishReason")) else {}
+                delta = await extract_missing_facts(body)
             saved = await self._commit_chapter(job, number, title, body, outline, result, needs_review, delta,
-                                               options["long_memory"])
+                                               options["long_memory"], meme_title=meme_title, next_outline_chapter=next_outline,
+                                               story_ledger=story_ledger)
+            if meme_title:
+                used_samples.add(meme_title)
             committed[number] = saved
             running_words += _word_count(saved)
-            if options["long_memory"] and number % 10 == 0:
-                await self._archive(job_id, number, committed, auxiliary)
+            if rolling and number < total:
+                arc = next((arc for arc in arcs if arc["endChapter"] == number), None)
+                if arc is not None and any(n not in committed for n in range(number + 1, total + 1)):
+                    yield {"phase": "archive", "chapter": number}
+                    await self._archive_arc(job_id, arc, archive_config, story_ledger=story_ledger, book_plan=job.get("bookPlan"))
+                    if (number + 1) in outlines:
+                        await self._set_stage(job_id, "chapter_writing")
+            elif not rolling and options["long_memory"] and number % 10 == 0:
+                if await self._needs_volume_archive(job_id, number, committed):
+                    yield {"phase": "archive", "chapter": number}
+                    await self._archive(job_id, number, committed, auxiliary)
+                    if number < total:
+                        await self._set_stage(job_id, "chapter_writing")
 
         yield {"phase": "calibrate"}
-        word_range = (_round(job["targetWords"] * 0.9), _round(job["targetWords"] * 1.1))
+        word_range = (_round(job["targetWords"] * 0.9), _round(job["targetWords"] * 1.18))
         await self._calibrate(job, outlines, committed, running_words, word_range, auxiliary)
         yield {"phase": "audit"}
-        report = await self._audit(job, outlines, config, auxiliary, options["long_memory"])
+        report = await self._audit(job, outlines, config, auxiliary, options["long_memory"], rolling_arc_outlines=rolling,
+                                   story_ledger=story_ledger)
         gate = await self._completion_gate(job, report, word_range)
         if not gate["passed"]:
             await self._checkpoint(job_id, "full_audit", nextChapter=total + 1)
@@ -890,7 +1091,8 @@ class PipelineRuntime:
             return revised
         return body
 
-    async def _commit_chapter(self, job, number, title, body, outline, result, needs_review, delta, long_memory):
+    async def _commit_chapter(self, job, number, title, body, outline, result, needs_review, delta, long_memory, *,
+                              meme_title=None, next_outline_chapter=None, story_ledger=False):
         job_id, total = job["id"], job["totalChapters"]
         status = "needs_review" if needs_review else ("repaired" if result["repairCount"] else "verified")
         verification = result["verification"]
@@ -899,12 +1101,13 @@ class PipelineRuntime:
         saved = await _write(self.store.save_verified_chapter, job_id, number, {
             "title": title, "content": body, "summary": _summary(outline, body), "status": status,
             "verification": verification, "repairCount": result["repairCount"],
-        }, delta, long_memory=long_memory)
+        }, delta, long_memory=long_memory, meme_title=meme_title, story_ledger=story_ledger)
         if not needs_review:
             self._publish(job_id, "facts:updated", chapterNumber=number, canonicalFacts=saved["canonicalFacts"])
         progress = min(92, 15 + _round(number / total * 77))
         job = await self._update(job_id, {"progress": progress})
-        await self._checkpoint(job_id, "chapter_writing", nextChapter=number + 1, completedChapter=number)
+        outline_cursor = {"nextOutlineChapter": next_outline_chapter} if next_outline_chapter is not None else {}
+        await self._checkpoint(job_id, "chapter_writing", nextChapter=number + 1, completedChapter=number, **outline_cursor)
         chapter = saved["chapter"]
         if needs_review:
             await self._log(job_id, "warn", "chapter_writing", f"第{number}章返修用尽，正文已保存为待复核，继续写下一章。",
@@ -918,6 +1121,56 @@ class PipelineRuntime:
             tokenUsage=job.get("tokenUsage"), stageStats=job.get("stageStats"))
         return chapter
 
+    async def _pending_arc_archives(self, job_id, arcs, before):
+        preceding = [arc for arc in arcs if arc["endChapter"] < before]
+        if not preceding:
+            return []
+        facts = await asyncio.to_thread(self.store.get_canonical_facts, job_id)
+        archived = {(row.get("arc"), row["startChapter"], row["endChapter"]) for row in prior_arc_summaries(facts, before)
+                    if row.get("sourceHash")}
+        return [arc for arc in preceding if (arc["arcIndex"], arc["startChapter"], arc["endChapter"]) not in archived]
+
+    async def _needs_volume_archive(self, job_id, end, committed):
+        start = end - 9
+        if end < 10 or not all(number in committed for number in range(start, end + 1)):
+            return False
+        source_hash = volume_source_hash([committed[number] for number in range(start, end + 1)])
+        facts = await asyncio.to_thread(self.store.get_canonical_facts, job_id)
+        return not any(summary["endChapter"] == end and summary.get("sourceHash") == source_hash
+                       for summary in facts["volumeSummaries"])
+
+    async def _refresh_arc_archives(self, job_id, arcs, before, config, *, story_ledger=False, book_plan=None):
+        for arc in await self._pending_arc_archives(job_id, arcs, before):
+            await self._archive_arc(job_id, arc, config, story_ledger=story_ledger, book_plan=book_plan)
+
+    async def _archive_arc(self, job_id, arc, config, *, story_ledger=False, book_plan=None):
+        start, end = arc["startChapter"], arc["endChapter"]
+        source_error = f"第 {start}–{end} 章正文未齐或在归档期间发生变化，请从断点继续。"
+        chapters = await asyncio.to_thread(self.store.get_chapters, job_id, start_chapter=start, end_chapter=end)
+        if ([row["chapterNumber"] for row in chapters] != list(range(start, end + 1))
+                or not all(_is_committed(row) for row in chapters)):
+            raise LLMError(source_error, code="ARC_SOURCE_CHANGED", status=409, retryable=True)
+        source_hash = volume_source_hash(chapters)
+        facts = await asyncio.to_thread(self.store.get_canonical_facts, job_id)
+        if any(row.get("arc") == arc["arcIndex"] and row.get("sourceHash") == source_hash
+               and row["startChapter"] == start and row["endChapter"] == end
+               for row in prior_arc_summaries(facts, end + 1)):
+            return
+        await self._set_stage(job_id, "arc_archive")
+        arc_label = f"「{arc['arcTitle']}」" if arc.get("arcTitle") else ""
+        await self._log(job_id, "info", "arc_archive", f"正在归档第 {start}–{end} 章剧情单元{arc_label}...")
+        prompt = build_arc_summary_prompt(arc, chapters, story_ledger=story_ledger, book_plan=book_plan, canonical_facts=facts)
+        reply = await self._llm(job_id, "arc_archive", config, prompt, 0.15,
+                                max_tokens=protected_output_budget(16_384, DEFAULT_MAX_TOKENS))
+        raw = None if output_was_truncated(reply.get("finishReason")) else parse_json_from_llm(reply.get("text"))
+        mainline = _dict(raw).get("mainline")
+        if not isinstance(mainline, str) or not mainline.strip():
+            raise LLMError(f"第 {start}–{end} 章单元摘要无效。正文已保存，从断点继续会先补归档。",
+                           code="ARC_SUMMARY_INVALID", status=502, retryable=True)
+        if not await _write(self.store.save_arc_summary, job_id, arc, source_hash, raw, story_ledger=story_ledger):
+            raise LLMError(source_error, code="ARC_SOURCE_CHANGED", status=409, retryable=True)
+        await self._log(job_id, "info", "arc_archive", f"已完成第 {start}–{end} 章单元归档。")
+
     async def _archive(self, job_id, end, committed, config):
         start = end - 9
         if not all(number in committed for number in range(start, end + 1)):
@@ -928,6 +1181,8 @@ class PipelineRuntime:
         if any(summary["endChapter"] == end and summary.get("sourceHash") == source_hash
                for summary in facts["volumeSummaries"]):
             return
+        await self._set_stage(job_id, "volume_archive")
+        await self._log(job_id, "info", "volume_archive", f"正在归档第 {start}–{end} 章卷摘要...")
         started = time.monotonic()
         usage = {}
         try:
@@ -948,21 +1203,35 @@ class PipelineRuntime:
                            code="VOLUME_SUMMARY_INVALID", status=502)
         if not await _write(self.store.save_volume_summary, job_id, end, source_hash, summary):
             raise LLMError(f"第{start}–{end}章在归档期间有变动，请从断点继续。", code="VOLUME_SOURCE_CHANGED", status=409)
+        await self._log(job_id, "info", "volume_archive", f"已完成第 {start}–{end} 章卷摘要归档。")
 
     async def _calibrate(self, job, outlines, committed, running_words, word_range, auxiliary):
         if word_range[0] <= running_words <= word_range[1] or not committed:
             return
         extension_start = _number(job.get("extendedFromChapter"))
-        pool = [chapter for number, chapter in committed.items() if number > extension_start]
+        total = job["totalChapters"]
+        base = _number(job.get("wordsPerChapter")) or _WORD_TARGET_DEFAULT
+        shrinking = running_words > word_range[1]
+        def shrink_floor(number):
+            return base if _is_finale(number, total) else 300
+
+        pool = [chapter for number, chapter in committed.items() if number > extension_start and (
+            not shrinking or _word_count(chapter) > shrink_floor(number)
+        )]
         if not pool:
             return
-        select = min if running_words < word_range[0] else max
-        chapter = select(pool, key=_word_count)
+        if shrinking:
+            protected_start = total - min(3, total // 5) + 1
+            chapter = max(pool, key=lambda entry: (entry["chapterNumber"] < protected_start, _word_count(entry)))
+        else:
+            chapter = min(pool, key=_word_count)
         number = chapter["chapterNumber"]
-        target = max(300, _word_count(chapter) + job["targetWords"] - running_words)
+        floor = shrink_floor(number) if shrinking else 300
+        target = max(floor, _word_count(chapter) + job["targetWords"] - running_words)
         body = await self._adjust_words(job["id"], number, chapter["content"], _word_count(chapter), target,
                                         outlines.get(number), job.get("pov"), auxiliary)
-        if body != chapter["content"] and not _PLACEHOLDERS.search(body):
+        if (body != chapter["content"] and not _PLACEHOLDERS.search(body)
+                and (not shrinking or count_chinese_words(body) >= floor)):
             await _write(self.store.save_chapter, job["id"], number, {
                 **chapter, "wordCount": count_chinese_words(body), "content": body,
                 "summary": _summary(outlines.get(number), body),
@@ -970,7 +1239,8 @@ class PipelineRuntime:
                 "repairCount": _number(chapter.get("repairCount")) + 1,
             })
 
-    async def _repair_audit_chapters(self, job, outlines, chapters, issues, config, auxiliary, long_memory):
+    async def _repair_audit_chapters(self, job, outlines, chapters, issues, config, auxiliary, long_memory, *,
+                                     rolling_arc_outlines=False, story_ledger=False):
         job_id, pov = job["id"], job.get("pov")
         for chapter in chapters:
             number = chapter["chapterNumber"]
@@ -981,6 +1251,7 @@ class PipelineRuntime:
                 job_id=job_id, chapter_number=number, chapter_text=chapter["content"], outline=outlines.get(number),
                 canonical_facts=facts, pov=pov, target_words=job["wordsPerChapter"], llm_config=config,
                 verify_llm_config=auxiliary, long_memory=long_memory, max_retries=1, store=self.store, client=self.client,
+                book_plan=job.get("bookPlan"), rolling_arc_outlines=rolling_arc_outlines, story_ledger=story_ledger,
             )
             if not result["passed"]:
                 continue
@@ -989,17 +1260,19 @@ class PipelineRuntime:
                 **chapter, "content": text, "wordCount": count_chinese_words(text),
                 "summary": _summary(outlines.get(number), text), "status": "repaired",
                 "verification": result["verification"], "repairCount": _number(chapter.get("repairCount")) + result["repairCount"],
-            }, result["factsDelta"], long_memory=long_memory)
+            }, result["factsDelta"], long_memory=long_memory, story_ledger=story_ledger)
             try:
                 await recheck_downstream_chapters(
                     changed_from_chapter=number, chapters=[ch for ch in chapters if number < ch["chapterNumber"] <= number + 3],
                     outlines=list(outlines.values()), canonical_facts=saved["canonicalFacts"], pov=pov,
                     target_words=job["wordsPerChapter"], llm_config=auxiliary, store=self.store, client=self.client,
+                    book_plan=job.get("bookPlan"), long_memory=long_memory, rolling_arc_outlines=rolling_arc_outlines,
+                    story_ledger=story_ledger,
                 )
             except Exception as error:
                 await self._log(job_id, "warn", "full_audit", f"第{number}章复修后的下游复核中断：{error}")
 
-    async def _audit(self, job, outlines, config, auxiliary, long_memory):
+    async def _audit(self, job, outlines, config, auxiliary, long_memory, *, rolling_arc_outlines=False, story_ledger=False):
         job_id, next_chapter = job["id"], job["totalChapters"] + 1
         await self._checkpoint(job_id, "full_audit", nextChapter=next_chapter)
         await self._set_stage(job_id, "full_audit", 95)
@@ -1021,6 +1294,7 @@ class PipelineRuntime:
             facts = await asyncio.to_thread(self.store.get_canonical_facts, job_id)
             prompt = build_full_book_audit_prompt(
                 book_plan=job["bookPlan"], chapters_summary=summaries, chapter_evidence=evidence, canonical_facts=facts,
+                rolling_arc_outlines=rolling_arc_outlines,
                 word_stats={"targetWords": target, "totalWords": words, "totalChapters": job["totalChapters"],
                             "completedChapters": len(chapters), "deviationPct": round((words - target) / target * 100, 2) if target else 0},
             )
@@ -1036,7 +1310,8 @@ class PipelineRuntime:
                 issues = {_number(value) for value in (
                     *_list(report.get("issueChapters")), *(_dict(item).get("chapterNumber") for item in blockers),
                 )}
-                await self._repair_audit_chapters(job, outlines, chapters, issues, config, auxiliary, long_memory)
+                await self._repair_audit_chapters(job, outlines, chapters, issues, config, auxiliary, long_memory,
+                                                  rolling_arc_outlines=rolling_arc_outlines, story_ledger=story_ledger)
         return report
 
     async def _completion_gate(self, job, report, word_range):

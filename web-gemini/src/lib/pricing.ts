@@ -210,7 +210,7 @@ export interface JobCostEstimate {
 }
 
 const SETUP_STAGES = new Set(['topic_selection', 'book_plan', 'chapter_outlines'])
-const AUX_STAGES = new Set(['chapter_verify', 'fact_extraction'])
+const AUX_STAGES = new Set(['chapter_verify', 'fact_extraction', 'arc_archive', 'volume_archive'])
 
 export function estimateJobCostCny(
   job: JobRecord | null | undefined,

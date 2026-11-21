@@ -18,6 +18,7 @@ from urllib.parse import quote
 
 import httpx
 
+from .arc_planning import CANON_LOCKS_MARKER
 from .providers import get_provider_definition, is_masked_api_key, provider_requires_key, same_endpoint_origin
 
 
@@ -25,6 +26,7 @@ DEFAULT_TIMEOUT_MS = 300_000
 DEFAULT_MAX_TOKENS = 65_536
 DEFAULT_RETRIES = 5
 STYLE_BIBLE_MARKER = "[BOOK_PLAN_STYLE_BIBLE]"
+STORY_LEDGER_MARKER = "[STORY_LEDGER]"
 _CJK = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf]")
 _JS_SPACE = re.compile(r"[\u0009-\u000d\u0020\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]+")
 _URI_COMPONENT_SAFE = "-_.!~*'()"
@@ -723,7 +725,7 @@ _MOCK_TASKS = {
     "de_ai": r"去AI味|DeAI",
     "chapter_write": r"撰写第\s*\d+\s*章正文|ChapterWrite",
 }
-_MOCK_MARKERS = ("topic_candidates", "book_plan", "chapter_outlines", "word_count_adjust", "fact_extraction",
+_MOCK_MARKERS = ("topic_candidates", "book_plan", "chapter_outlines", "arc_outlines", "arc_summary", "word_count_adjust", "fact_extraction",
                  "verify", "repair", "de_ai", "full_audit", "chapter_write")
 _BRONZE_KEY = "刻有“玄天七号”的青铜钥匙"
 
@@ -878,6 +880,56 @@ def _mock_outlines(text, scenario):
     return outlines
 
 
+def _mock_arc_outlines(text, scenario):
+    start = int(_mock_field(text, r"起始章节[：:]\s*(\d+)", "1"))
+    total = int(_mock_field(text, r"全书总章数[：:]\s*(\d+)", str(start)))
+    minimum = int(_mock_field(text, r"最少章数[：:]\s*(\d+)", "3"))
+    maximum = int(_mock_field(text, r"最多章数[：:]\s*(\d+)", "6"))
+    end = start + min(maximum, max(minimum, 5)) - 1
+    rows = _mock_outlines(f"起始章节：{start}\n结束章节：{end}", scenario)
+    if end == total:
+        rows[-1]["goal"] = "清算最后的交易，交代旧案与各方选择的后果"
+        rows[-1]["summary"] += " 本章揭开旧案、兑现未揭伏笔并收束冲突。"
+        rows[-1]["hook"] = "主线收束，角色各自承担选择的后果。"
+    return {"arcTitle": f"第{start}至{end}章调查与交锋", "arcGoal": f"确认第{end}章证据来源并逼出新的决策。",
+            "villainChips": [{"villain": "赵天豪", "newChips": [f"第{start}章协商代理权"],
+                              "exitPlan": "exit" if end == total else "retain"}], "chapters": rows}
+
+
+def _mock_arc_summary(prompt, *, story_ledger=False):
+    try:
+        rows, _ = json.JSONDecoder().raw_decode(prompt.split("【正文依据】", 1)[1].lstrip())
+        first = rows[0]["chapterNumber"]
+        last = rows[-1]["chapterNumber"]
+        turns, beats, hooks = [], [], []
+        for row in rows:
+            n = row["chapterNumber"]
+            body = row.get("content") or row.get("middle") or row.get("beginning") or ""
+            tail = row.get("ending") or body
+            if n in (first, (first + last) // 2, last):
+                turns.append({"chapter": n, "text": row.get("title") or f"第{n}章获取证据"})
+            fragments = [line.strip() for line in body.splitlines() if line.strip()]
+            if fragments and len(beats) < 4:
+                beats.append({"chapter": n, "text": f"第{n}章的证据交接与当面拆招",
+                              "quote": fragments[min(1, len(fragments) - 1)][:45]})
+            if tail.strip() and len(hooks) < 3:
+                hooks.append({"chapter": n, "text": f"第{n}章以具体物证带出行动",
+                              "quote": tail.strip()[-45:]})
+        summary = {"mainline": f"第{first}至{last}章完成调查与交接，双方掌握的证据与下一步行动发生变化。",
+                   "turningPoints": turns, "usedBeats": beats, "usedHooks": hooks,
+                   "villainStatus": f"赵天豪：第{last}章旧证据被迫交接，暂退幕后。"}
+        if story_ledger:
+            summary["driftChecks"] = [
+                {"chapter": row["chapterNumber"], "kind": "value", "issue": "可用余额混入尚未到账的款项",
+                 "fixHint": "保留已到账的余额，把这笔款单列为待到账。", "quote": _MOCK_UNPOSTED_DRIFT}
+                for row in rows if any(_MOCK_UNPOSTED_DRIFT in (row.get(key) or "")
+                                       for key in ("content", "beginning", "middle", "ending"))
+            ][:4]
+        return summary
+    except (IndexError, KeyError, TypeError, ValueError):
+        raise LLMError("Mock 单元归档缺少正文输入。", code="INVALID_RESPONSE", status=502) from None
+
+
 _MOCK_CLUE_SCENES = {
     2: "{p}独自回到林家老宅的地下室，撬开墙角那块松动的青砖。暗格之中静静躺着一枚古朴的青铜钥匙，钥匙柄上清晰地铭刻着“玄天七号”四个篆字。{p}神色微凝，将青铜钥匙贴身收好，决定暂不向任何人透露此事。",
     6: "黑市拍卖会的灯光昏暗而压抑。当展台上出现一枚残缺的玄天纹章时，{p}下意识摸了摸贴身携带的那枚刻有“玄天七号”的青铜钥匙——两者的纹路竟然严丝合缝。坐在一旁的苏清雪察觉到{p}神色有异，低声询问，但{p}只是微微摇头，没有道破钥匙的秘密。",
@@ -887,14 +939,28 @@ _MOCK_CLUE_SCENES = {
 _MOCK_FILLER = (
     "窗外的霓虹灯影在玻璃上流转，映照出{p}沉静而锐利的侧脸。每一步落子都经过了精密的算计，绝不容许半点差池。从股权结构到地下资金流向，{p}早已在脑海中推演过无数次，此刻不过是按图索骥。",
     "苏清雪站在走廊尽头，看着{p}从容离去的背影，心中掀起了惊涛骇浪。她原本以为这场博弈早已注定结局，却没想到局势会在短短半小时内彻底逆转，对方掌握的情报深度甚至超越了顶尖财阀的智囊团。",
-    "桌上的加密通讯器微微震动，新的密报已经传回。{p}扫了一眼屏幕上的坐标，唇角勾起一抹冷冽的弧度。真正的收网时刻正在逼近，城南码头与金融街的暗线同时启动，不给对手留下一丝喘息之机。",
+    "桌上的加密通讯器微微震动，新的密报已经传回。{p}扫了一眼屏幕上的坐标，拿笔圈出相隔三条街的两座仓库。他把通知抄给城南码头和金融街的线人，约好两边的货车必须在换班之前同时出发。",
     "街角的风卷起几片落叶，远处的车灯由远及近。暗流之下的交锋才刚刚开始，谁能笑到最后，还要看接下来的每一步棋。夜色深处，几方势力的代表各自拨通了加密电话，整座城市的暗网悄然沸腾。",
     "会议室内的投影仪光束微微闪烁，一份份经过交叉比对的财务报表铺满长桌。{p}修长的手指点在关键数据上，语气平静却带着不容置疑的压迫感：“给你们十二个小时，把原本属于林家的东西悉数奉还。”",
     "茶水在白瓷杯中微微晃动，倒映出天花板上冰冷的吊灯。赵天豪的呼吸明显粗重了几分，他死死盯着屏幕上的实时行情曲线，怎么也想不明白对方究竟是如何提前三天预判了所有做空节点。",
 )
 
+_MOCK_CHAPTER_ENDINGS = (
+    "门卫把出入单退回窗口，说司机的笔迹变了。{p}翻到纸背，发现上一张签收单的墨痕还印在上面。他把两张单子对着值班室的灯摆齐，沿着缺了半笔的姓氏，在交接名单上划去第一个人。",
+    "船工把扳手搁在桥墩上，抱起那只漏水的铁桶。卸掉底部的夹层以后，桶比铅盒还轻。{p}叫住他，把沿河仓库的钥匙递过去，请他路过第三座石桥时捎一封信给守桥人。",
+    "收音机接连报错了两个车站。修理铺老板断开电源，把绕在天线上的细铜线抽出来，铜线末端还拴着一枚烧焦的邮票。{p}把信封移到窗边烘干，邮戳下面慢慢显出寄件人留下的门牌。",
+    "值班护士敲了敲保温瓶，催人先喝完热水再走。{p}接过杯子，从瓶套内侧摸到一块磨圆的骨牌。柜台下面排着一串同样的骨牌，唯独倒数第二个位置上压着一张去北站的车票。",
+    "仓库顶上落下一撮干草。会计抬头望了望，把印泥盖好，按约定给卖鱼人留下一盏灯。窗外潮水退得很急，{p}拎起椅背上的外衣，从堤岸另一边的小路绕去取那盒底片。",
+    "敲钟人把账本朝外翻了半页，匆匆抹掉页脚的铅笔字。{p}用手掌压住被夜风掀起的纸角，请他把上次忘了归档的钥匙也放进抽屉。随后两人分别锁门，赶在封街前离开。",
+)
 
-def _mock_chapter(text, chapter, scenario):
+_MOCK_UNPOSTED_DRIFT = "账房却把尚未到账的款项计入可用余额。"
+_MOCK_LEDGER_KNOWLEDGE = "苏清雪说：“我亲眼看见钟楼暗门。我会帮你守住它。”"
+_MOCK_LEDGER_CLOCK = re.compile(r"(第\d+天)的(清晨)，(初冬)的风穿过码头，离潮门关闭还剩(\d+天)。")
+_MOCK_LEDGER_BALANCE = re.compile(r"码头备用金(?:入账(\d+元)，目前余额为|的期初余额为)(\d+元)。")
+
+
+def _mock_chapter(text, chapter, scenario, *, story_ledger=False):
     pov = _mock_field(text, r"叙事视角[：:]\s*([^\n]+)", "第三人称限知")
     words = int(_mock_field(text, r"(?:本章)?目标字数[：:]\s*(\d+)", "2000")) or 2000
     protag = "我" if "第一人称" in pov else "林渊"
@@ -915,15 +981,22 @@ def _mock_chapter(text, chapter, scenario):
         paragraphs.append(f"面对赵天豪派来的伏兵，{protag}冷哼一声，直接挥动完好无损的左臂猛然劈下，将面前实木桌案震得粉碎。【此处待补充具体打斗细节】")
     else:
         paragraphs.append(f"客厅内的气氛骤然紧绷，赵天豪冷笑着放下茶杯，试图用言语试探{protag}的底线。然而{protag}神色淡然，只用三言两语便将对方的陷阱原封不动地推了回去，反手亮出的证据更是让在场众人脸色剧变。")
+    if story_ledger and scenario.get("mode") in ("story-ledger", "story-ledger-drift"):
+        clock = f"第{chapter}天的清晨，初冬的风穿过码头，离潮门关闭还剩{max(0, 30 - chapter)}天。"
+        balance = "码头备用金的期初余额为100元。" if chapter == 1 else f"码头备用金入账10元，目前余额为{90 + 10 * chapter}元。"
+        paragraphs.append(clock + balance + _MOCK_LEDGER_KNOWLEDGE)
+        if scenario.get("mode") == "story-ledger-drift" and chapter == scenario.get("driftChapter", 2):
+            paragraphs.append(_MOCK_UNPOSTED_DRIFT)
     aim = max(200, math.floor(words * 0.97 + 0.5))
-    length = sum(len(_CJK.findall(part)) for part in paragraphs)
+    ending = _MOCK_CHAPTER_ENDINGS[(chapter - 1) % len(_MOCK_CHAPTER_ENDINGS)].format(p=protag)
+    length = sum(len(_CJK.findall(part)) for part in [*paragraphs, ending])
     for index in range(200):
         if length >= aim:
             break
         filler = _MOCK_FILLER[(index + chapter) % len(_MOCK_FILLER)].format(p=protag)
         paragraphs.append(filler)
         length += len(_CJK.findall(filler))
-    return "\n\n".join(paragraphs)
+    return "\n\n".join([*paragraphs, ending])
 
 
 def _mock_word_count_adjust(text, chapter):
@@ -944,7 +1017,26 @@ def _mock_word_count_adjust(text, chapter):
     return body
 
 
-def _mock_facts(chapter, scenario):
+def _mock_story_memory(body):
+    memory = {}
+    if match := _MOCK_LEDGER_CLOCK.search(body):
+        memory["storyClock"] = {**dict(zip(("day", "timeOfDay", "season", "countdown"), match.groups())), "quote": match[0]}
+    elif "在清晨的薄雾中拉开" in body:
+        memory["storyClock"] = {"timeOfDay": "清晨", "quote": "在清晨的薄雾中拉开"}
+    elif "夜色如墨，冷风顺着半掩的窗缝灌入室内" in body:
+        memory["storyClock"] = {"timeOfDay": "夜晚", "quote": "夜色如墨，冷风顺着半掩的窗缝灌入室内"}
+    if match := _MOCK_LEDGER_BALANCE.search(body):
+        balance = {"label": "码头备用金", "value": match[2], "quote": match[0]}
+        if match[1]:
+            balance["change"] = "+" + match[1]
+        memory["ledgerBalances"] = [balance]
+    if _MOCK_LEDGER_KNOWLEDGE in body:
+        memory["characterStates"] = {"苏清雪": {"seen": True, "stanceTier": "ally", "knownFacts": ["亲眼看见钟楼暗门"],
+                                              "quote": _MOCK_LEDGER_KNOWLEDGE}}
+    return memory
+
+
+def _mock_facts(chapter, scenario, *, story_ledger=False, body=""):
     delta = {
         "characters": {"林渊": {"name": "林渊", "status": "active", "role": "主角",
                               "location": "老宅地下室" if chapter == 2 else "都市"}},
@@ -955,6 +1047,8 @@ def _mock_facts(chapter, scenario):
     if scenario.get("mode") == "fault-injection" and chapter == 1:
         delta["injuries"].append({"character": "林渊", "description": "左臂骨裂，暂时失去行动能力",
                                   "severity": "high", "active": True})
+    if story_ledger and (memory := _mock_story_memory(body)):
+        delta["memory"] = memory
     if not _mock_foreshadowing(scenario):
         return delta
     if chapter == 2:
@@ -973,7 +1067,7 @@ def _mock_facts(chapter, scenario):
     return delta
 
 
-def _mock_verify(text, chapter, scenario):
+def _mock_verify(text, chapter, scenario, *, story_ledger=False):
     before, marker, after = text.partition("【待审校正文】")
     body = (after if marker else before).partition("输出 JSON")[0]
     issues = []
@@ -984,7 +1078,7 @@ def _mock_verify(text, chapter, scenario):
                        "message": f"第{chapter}章存在伤势前后矛盾：林渊第1章左臂骨裂尚未痊愈，却在本章“挥动完好无损的左臂”",
                        "sourceChapter": 1})
     return {"passed": not issues, "chapterNumber": chapter, "issues": issues, "aiIssues": [],
-            "factsDelta": None if issues else _mock_facts(chapter, scenario),
+            "factsDelta": None if issues else _mock_facts(chapter, scenario, story_ledger=story_ledger, body=body),
             "summary": f"发现 {len(issues)} 处一致性问题" if issues else f"第{chapter}章一致性审校通过"}
 
 
@@ -1041,6 +1135,7 @@ async def call_mock_llm(*, system="", prompt="", timeout_ms=DEFAULT_TIMEOUT_MS, 
     chapter_match = re.search(r"第\s*(\d+)\s*章", prompt) or re.search(r"第\s*(\d+)\s*章", system)
     chapter = int(chapter_match[1]) if chapter_match else 1
     mode = scenario.get("mode")
+    story_ledger = STORY_LEDGER_MARKER in system
     if mode == "always-timeout":
         wait_ms = min(timeout_ms or 200, 150)
         await asyncio.sleep(wait_ms / 1000)
@@ -1055,19 +1150,33 @@ async def call_mock_llm(*, system="", prompt="", timeout_ms=DEFAULT_TIMEOUT_MS, 
     if task == "topic_candidates":
         text = _mock_json(_mock_topic_candidates(combined))
     elif task == "book_plan":
-        text = _mock_json(_mock_book_plan(combined, scenario, system.endswith(STYLE_BIBLE_MARKER)))
+        plan = _mock_book_plan(combined, scenario, system.endswith(STYLE_BIBLE_MARKER))
+        if CANON_LOCKS_MARKER in system:
+            plan["canonLocks"] = {
+                "powerScale": "没有经验值或充值升级机制，人物依靠现有技能和情报推进。",
+                "currencyAndEra": "现代都市使用人民币，按实际到账和资产估值分别记账。",
+                "worldTaboos": ["重生仅属于主角的既有经历；世界里不存在穿书或任务系统。"],
+                "keyAssets": ["青铜钥匙背刻玄天七号。"] if _mock_foreshadowing(scenario) else ["核心信物是黑色玉佩。"],
+            }
+        text = _mock_json(plan)
     elif task == "chapter_outlines":
         text = _mock_json(_mock_outlines(combined, scenario))
+    elif task == "arc_outlines":
+        text = _mock_json(_mock_arc_outlines(combined, scenario))
+    elif task == "arc_summary":
+        text = _mock_json(_mock_arc_summary(prompt, story_ledger=story_ledger))
     elif task == "chapter_write":
-        text = _mock_chapter(combined, chapter, scenario)
+        text = _mock_chapter(combined, chapter, scenario, story_ledger=story_ledger)
     elif task == "word_count_adjust":
         text = _mock_word_count_adjust(combined, chapter)
     elif task == "fact_extraction":
-        text = _mock_json(_mock_facts(chapter, scenario))
+        body = prompt.partition(f"【第{chapter}章正文】")[2].partition("请按以下 JSON 格式输出")[0] if story_ledger else ""
+        text = _mock_json(_mock_facts(chapter, scenario, story_ledger=story_ledger, body=body))
     elif task == "verify":
-        text = _mock_json(_mock_verify(combined, chapter, scenario))
+        text = _mock_json(_mock_verify(combined, chapter, scenario, story_ledger=story_ledger))
     elif task == "repair":
-        text = _mock_chapter(combined, chapter, {})
+        ledger_scenario = scenario if story_ledger and mode in ("story-ledger", "story-ledger-drift") else {}
+        text = _mock_chapter(combined, chapter, ledger_scenario, story_ledger=story_ledger)
     elif task == "de_ai":
         _, marker, body = combined.partition("【待润色正文】")
         text = body.strip() if marker else combined
