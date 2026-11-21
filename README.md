@@ -102,6 +102,7 @@ FastAPI 在一个 Python 进程中运行 LangGraph、模型网关、评估与修
 | `NOVEL_FORGE_PROVIDER_CIRCUIT` | `1` | Provider 连续故障熔断器（设为 `0` 关闭） |
 | `NOVEL_FORGE_DEGRADE_ON_VERIFY_EXHAUSTED` | `0` | 审校返修耗尽时是否允许非致命文风问题降级为 `needs_review` |
 | `NOVEL_FORGE_LEDGER_BATCH_THRESHOLD` | `30` | 修订台账超过该意见条数时自动分批生成（设为 `0` 退回单次） |
+| `NOVEL_FORGE_REVISION_SOFT_FALLBACK` | `1` | 修订 v2 第三层局部安全降级（设为 `0` 关闭降级，保留格式容错与 3 次校验） |
 
 ---
 
@@ -112,3 +113,11 @@ FastAPI 在一个 Python 进程中运行 LangGraph、模型网关、评估与修
 ```
 
 测试覆盖 FastAPI 路由、LangGraph 阶段回环、进程重启续跑、写作质量控制、模型保护、评估与修订 v2、总编和 DOCX 导出。集成测试使用临时数据库、Mock 模型或本地模拟接口。
+
+更多架构决策与长篇压测故障复盘见 [docs/ENGINEERING_NOTES.md](docs/ENGINEERING_NOTES.md)。
+
+---
+
+## 开源协议
+
+本项目基于 [GNU Affero General Public License v3.0 (AGPL-3.0)](LICENSE) 开源。任何对本项目的修改、二次分发或作为网络服务对外提供时，均须按 AGPL-3.0 协议开放完整源代码。
