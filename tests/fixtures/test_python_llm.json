@@ -1,0 +1,122 @@
+{
+  "test_mock_outputs_and_token_estimates_are_deterministic": {
+    "replies": [
+      {
+        "usage": {
+          "promptTokens": 40,
+          "completionTokens": 1242,
+          "totalTokens": 1282,
+          "cacheHitTokens": 0
+        },
+        "textSha256": "21a5c6746a4d1c038e01a5dc2f19bec1e743fb0d3cbea542f00ab68cb69c27aa"
+      },
+      {
+        "usage": {
+          "promptTokens": 16,
+          "completionTokens": 760,
+          "totalTokens": 776,
+          "cacheHitTokens": 0
+        },
+        "textSha256": "92963334af696fc80c521f261bd12157c283c199ee10f1db3fc08d785e0d36b7"
+      },
+      {
+        "usage": {
+          "promptTokens": 16,
+          "completionTokens": 2854,
+          "totalTokens": 2870,
+          "cacheHitTokens": 0
+        },
+        "textSha256": "3cc00a77286bcc85f7bea855401c4fd9d7b7748c6439ba9638c1a801a8d29e46"
+      },
+      {
+        "usage": {
+          "promptTokens": 30,
+          "completionTokens": 1253,
+          "totalTokens": 1283,
+          "cacheHitTokens": 0
+        },
+        "textSha256": "9e12756e434305a7dbeee434c6488e596db569c96966e6eb99f5307855ec8482"
+      },
+      {
+        "usage": {
+          "promptTokens": 6,
+          "completionTokens": 153,
+          "totalTokens": 159,
+          "cacheHitTokens": 0
+        },
+        "textSha256": "5cf6c0b5ac13a5b430b8f28cf4ebe115a54264a87e5ea8662d2cd2ebdffeb11d"
+      },
+      {
+        "usage": {
+          "promptTokens": 20,
+          "completionTokens": 67,
+          "totalTokens": 87,
+          "cacheHitTokens": 0
+        },
+        "textSha256": "439511c71fcb3834ff05ca9c15580d8c2f8091082d6674291a39257bc5c2f53e"
+      },
+      {
+        "usage": {
+          "promptTokens": 13,
+          "completionTokens": 1256,
+          "totalTokens": 1269,
+          "cacheHitTokens": 0
+        },
+        "textSha256": "d51381d208267f862c2d57f67cbcbdecb4154e1076f13e15363fd8bfb384aac4"
+      },
+      {
+        "usage": {
+          "promptTokens": 29,
+          "completionTokens": 1964,
+          "totalTokens": 1993,
+          "cacheHitTokens": 0
+        },
+        "textSha256": "3c74b5d819003dda0826d2142e8dfac022110b2e2d73e415b478082e7aafe71e"
+      },
+      {
+        "usage": {
+          "promptTokens": 23,
+          "completionTokens": 12,
+          "totalTokens": 35,
+          "cacheHitTokens": 0
+        },
+        "textSha256": "b259d25aa1644fcfc33f1fc8bf4a3faf029cd9e39d3221f5ba846fe1d1c49661"
+      },
+      {
+        "usage": {
+          "promptTokens": 5,
+          "completionTokens": 256,
+          "totalTokens": 261,
+          "cacheHitTokens": 0
+        },
+        "textSha256": "0d7edd9e540efcbc860a62e27b07e5925cf01426da94aed0a182191b3fcd6e3e"
+      },
+      {
+        "usage": {
+          "promptTokens": 5,
+          "completionTokens": 2,
+          "totalTokens": 7,
+          "cacheHitTokens": 0
+        },
+        "textSha256": "565339bc4d33d72817b583024112eb7f5cdf3e5eef0252d6ec1b9c9a94e12bb3"
+      },
+      {
+        "usage": {
+          "promptTokens": 8,
+          "completionTokens": 4,
+          "totalTokens": 12,
+          "cacheHitTokens": 0
+        },
+        "textSha256": "4fa441609d41f6a34b562de151606ffc538b083d5db8f9839523240e3144ebb8"
+      }
+    ],
+    "tokens": [
+      0,
+      1,
+      7,
+      8,
+      5,
+      2
+    ]
+  }
+}

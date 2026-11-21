@@ -1,0 +1,1085 @@
+"""Asynchronous LLM transports and retry policies used by the writing pipeline."""
+
+import asyncio
+import json
+import logging
+import math
+import os
+import random
+import re
+import threading
+import time
+import weakref
+from asyncio import sleep as _sleep
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from urllib.parse import quote
+
+import httpx
+
+from .providers import get_provider_definition, is_masked_api_key, provider_requires_key, same_endpoint_origin
+
+
+DEFAULT_TIMEOUT_MS = 300_000
+DEFAULT_MAX_TOKENS = 65_536
+DEFAULT_RETRIES = 5
+STYLE_BIBLE_MARKER = "[BOOK_PLAN_STYLE_BIBLE]"
+_CJK = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf]")
+_JS_SPACE = re.compile(r"[\u0009-\u000d\u0020\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]+")
+_URI_COMPONENT_SAFE = "-_.!~*'()"
+_VERTEX_SAFETY_SETTINGS = [
+    {"category": f"HARM_CATEGORY_{category}", "threshold": "BLOCK_NONE"}
+    for category in ("HARASSMENT", "HATE_SPEECH", "SEXUALLY_EXPLICIT", "DANGEROUS_CONTENT")
+]
+log = logging.getLogger(__name__)
+
+
+class LLMError(RuntimeError):
+    def __init__(self, message, *, code="LLM_ERROR", status=500, retryable=False,
+                 finish_reason=None, retry_after_ms=None, retry_at=None,
+                 circuit_retry_at=None, request_max_tokens=None, rejected_output_tokens=None):
+        super().__init__(message)
+        self.code = code
+        self.status = status
+        self.retryable = retryable
+        self.finish_reason = finish_reason
+        self.retry_after_ms = retry_after_ms
+        self.retry_at = retry_at
+        self.circuit_retry_at = circuit_retry_at
+        self.request_max_tokens = request_max_tokens
+        self.rejected_output_tokens = rejected_output_tokens
+
+
+def estimate_tokens(text=""):
+    if not text:
+        return 0
+    text = str(text)
+    cjk = len(_CJK.findall(text))
+    words = sum(bool(word) for word in _JS_SPACE.split(_CJK.sub(" ", text)))
+    return max(1, math.ceil(cjk * 1.5 + words * 1.3))
+
+
+def output_was_truncated(reason):
+    if reason is None:
+        return False
+    return str(reason).strip().lower() in {"length", "max_tokens", "max_output_tokens", "token_limit"}
+
+
+def _guard_output():
+    return os.environ.get("NOVEL_FORGE_OUTPUT_GUARD") != "0"
+
+
+def protected_output_budget(previous, increased):
+    return increased if _guard_output() else previous
+
+
+def next_output_budget(current, rejected_at=math.inf):
+    upper = min(DEFAULT_MAX_TOKENS, rejected_at - 1)
+    if type(current) is not int or not 0 < current < upper:
+        return None
+    doubled = min(2 * current, DEFAULT_MAX_TOKENS)
+    return doubled if doubled <= upper else (current + upper + 1) // 2
+
+
+def _env_positive_int(name, default):
+    try:
+        value = float(os.environ.get(name, ""))
+        if value.is_integer() and 0 < value <= 2**53 - 1:
+            return int(value)
+    except ValueError:
+        pass
+    return default
+
+
+@dataclass(frozen=True)
+class _Credentials:
+    provider: str
+    base_url: str
+    api_key: str
+    model: str
+    thinking_mode: str
+
+
+async def _resolve_credentials(provider, base_url, api_key, model, thinking_mode, use_saved_connection, store):
+    provider = str(provider or "mock").lower()
+    if provider == "mock":
+        return _Credentials(provider, "", "", model or "mock-novel-v1", thinking_mode or "disabled")
+    definition = get_provider_definition(provider) or {}
+    if store is None:
+        presets = definition.get("models") or [""]
+        stored = {
+            "baseUrl": definition.get("baseUrl", ""),
+            "apiKey": os.environ.get(definition["env"], "") if definition.get("env") else "",
+            "model": "gemini-3.8-flash" if provider == "vertex" else presets[0],
+        }
+    else:
+        try:
+            stored = await asyncio.to_thread(store.get_provider_config, provider)
+        except (OSError, ValueError):
+            stored = {}
+    resolved_base = (base_url if not use_saved_connection else "") or stored.get("baseUrl") or ""
+    if not use_saved_connection and api_key and not is_masked_api_key(api_key):
+        key = api_key.strip()
+    elif same_endpoint_origin(resolved_base, stored.get("baseUrl")):
+        key = stored.get("apiKey") or ""
+    else:
+        key = ""
+    clean_model = str(model).strip() if model and model != "mock-novel-v1" else ""
+    return _Credentials(provider, resolved_base, key, clean_model or stored.get("model") or "",
+                        thinking_mode or stored.get("thinkingMode") or "disabled")
+
+
+def _is_local(base_url):
+    return bool(re.match(r"^https?://(?:127\.0\.0\.1|localhost)(?::|/|$)", base_url, re.I))
+
+
+def _circuit_key(creds):
+    if creds.provider == "mock" or os.environ.get("NOVEL_FORGE_PROVIDER_CIRCUIT") == "0":
+        return None
+    if not creds.base_url:
+        return creds.provider, ""
+    try:
+        url = httpx.URL(creds.base_url)
+        if url.scheme not in ("http", "https") or not url.host:
+            return None
+        if url.port == (443 if url.scheme == "https" else 80):
+            url = url.copy_with(port=None)
+        return creds.provider, str(url.copy_with(username=None, password=None, query=None, fragment=None)).rstrip("/")
+    except (httpx.InvalidURL, ValueError):
+        return None
+
+
+@dataclass
+class _Circuit:
+    failures: int = 0
+    open_until: float = 0
+    probing: bool = False
+    epoch: int = 0
+    waiters: set[asyncio.Future[str | None]] = field(default_factory=set)
+
+
+_circuits = {}
+_state_lock = threading.Lock()
+
+
+def reset_provider_circuit_state():
+    with _state_lock:
+        for state in _circuits.values():
+            _wake_probe_waiters(state)
+        _circuits.clear()
+
+
+def _clock():
+    return time.monotonic()
+
+
+def _as_iso_retry_at(monotonic_deadline):
+    stamp = time.time() + max(0, monotonic_deadline - _clock())
+    return datetime.fromtimestamp(stamp, timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _circuit_error(retry_at):
+    return LLMError(f"供应商连接已熔断，冷却截至 {retry_at}。可在冷却后从断点继续，或切换连接。",
+                    code="CIRCUIT_OPEN", status=503, retryable=True, retry_at=retry_at)
+
+
+def _check_cooldown(state):
+    if state is not None and state.open_until > _clock():
+        raise _circuit_error(_as_iso_retry_at(state.open_until))
+
+
+def _check_circuit(key):
+    if key is not None:
+        with _state_lock:
+            _check_cooldown(_circuits.get(key))
+
+
+def _enter_circuit(key, *, claim=False):
+    if key is None:
+        return None, None
+    with _state_lock:
+        state = _circuits.get(key)
+        _check_cooldown(state)
+        if state is not None and state.probing:
+            future = asyncio.get_running_loop().create_future()
+            state.waiters.add(future)
+            return None, (state, future)
+        if not claim:
+            return None, None
+        if state is None:
+            state = _circuits[key] = _Circuit()
+        probing = state.open_until > 0
+        if probing:
+            state.probing = True
+        return (key, state, state.epoch, probing), None
+
+
+async def _wait_for_probe(waiter):
+    state, future = waiter
+    try:
+        retry_at = await future
+    finally:
+        with _state_lock:
+            state.waiters.discard(future)
+    if retry_at is not None:
+        raise _circuit_error(retry_at)
+
+
+def _complete_probe_waiter(future, retry_at):
+    if not future.done():
+        future.set_result(retry_at)
+
+
+def _wake_probe_waiters(state, retry_at=None):
+    # Each future is delivered on its own loop. Waiting callers can cancel independently.
+    for future in state.waiters:
+        try:
+            future.get_loop().call_soon_threadsafe(_complete_probe_waiter, future, retry_at)
+        except RuntimeError:
+            # A waiter may have closed its loop while a probe on another loop was in flight.
+            pass
+    state.waiters.clear()
+
+
+def _settle_circuit(claim, error=None, *, cancelled=False):
+    if claim is None:
+        return
+    key, state, epoch, probing = claim
+    with _state_lock:
+        if _circuits.get(key) is not state or state.epoch != epoch:
+            return
+        state.probing = False
+        if cancelled:
+            _wake_probe_waiters(state)
+            return
+        if error is None or error.code in {"EMPTY_RESPONSE", "INVALID_RESPONSE"}:
+            state.failures = 0
+            state.open_until = 0
+            _wake_probe_waiters(state)
+            return
+        retry_at = None
+        failed = error.code in {"NETWORK_ERROR", "TIMEOUT"} or (
+            error.code.startswith("HTTP_") and (error.status == 408 or error.status >= 500)
+        )
+        if failed:
+            state.failures += 1
+            if state.failures >= 3 or probing:
+                cooldown = _env_positive_int("NOVEL_FORGE_PROVIDER_CIRCUIT_COOLDOWN_MS", 60_000)
+                state.open_until = _clock() + cooldown / 1000
+                state.epoch += 1
+                retry_at = error.circuit_retry_at = _as_iso_retry_at(state.open_until)
+        elif not probing and (error.status == 429 or re.fullmatch(r"HTTP_4\d\d", error.code)):
+            state.failures = 0
+        _wake_probe_waiters(state, retry_at)
+
+
+@dataclass
+class _RateGate:
+    last_started: float = -math.inf
+    cooldown_until: float = 0
+    lock_ref: weakref.ReferenceType | None = None
+
+    def lock(self):
+        lock = self.lock_ref() if self.lock_ref else None
+        if lock is None:
+            lock = asyncio.Lock()
+            self.lock_ref = weakref.ref(lock)
+        return lock
+
+
+_rate_gates = weakref.WeakKeyDictionary()
+
+
+@asynccontextmanager
+async def _rate_slot(creds, transport, allow_parallel):
+    if _is_local(creds.base_url):
+        yield
+        return
+    loop = asyncio.get_running_loop()
+    rate_key = creds.provider, creds.model.lower()
+    with _state_lock:
+        gate = _rate_gates.setdefault(loop, {}).setdefault(rate_key, _RateGate())
+    minimum_gap = 0.25
+    if transport == "vertex":
+        minimum_gap = 2.5 if re.search(r"argon|pro", creds.model, re.I) else 0.9
+    lock = gate.lock()
+    held = False
+    try:
+        await lock.acquire()
+        held = True
+        while (remaining := max(gate.cooldown_until, gate.last_started + minimum_gap) - _clock()) > 0:
+            await _sleep(remaining)
+        gate.last_started = _clock()
+        if allow_parallel:
+            lock.release()
+            held = False
+        yield
+    except LLMError as error:
+        if error.code == "HTTP_429":
+            penalty = max(15, (error.retry_after_ms or 0) / 1000)
+            gate.cooldown_until = max(gate.cooldown_until, _clock() + penalty)
+        raise
+    finally:
+        if held:
+            lock.release()
+
+
+def _http_error(label, response, api_key, retry_rate_limit):
+    snippet = response.text
+    if api_key:
+        snippet = snippet.replace(api_key, "[已隐藏密钥]")
+    snippet = snippet[:300]
+    status = response.status_code
+    if status != 429:
+        return LLMError(f"{label} API error {status}: {snippet}", code=f"HTTP_{status}",
+                        status=status, retryable=status >= 500)
+
+    hard_quota = re.search(
+        r"insufficient_quota|exceeded your current quota|reached your usage limit|"
+        r"resets in \d+\s*hour|余额不足|quota.*exhausted|daily.*limit|到达?限额|额度.*用完",
+        snippet, re.I,
+    ) and not re.search(r"per\s*minute|rpm|tpm|try again in \d+\s*s", snippet, re.I)
+    try:
+        seconds = float(response.headers.get("retry-after", "nan"))
+        retry_after = min(60_000, seconds * 1000) if math.isfinite(seconds) and seconds >= 0 else None
+    except ValueError:
+        retry_after = None
+    if hard_quota:
+        return LLMError(f"{label} 额度已耗尽 (429): {snippet}（可在监控页切换模型或提供商后继续续跑）",
+                        code="QUOTA_EXCEEDED", status=429, retry_after_ms=retry_after)
+    return LLMError(f"{label} 触发限流 (429): {snippet}",
+                    code="HTTP_429" if retry_rate_limit else "OPENAI_RATE_LIMIT",
+                    status=429, retryable=retry_rate_limit, retry_after_ms=retry_after)
+
+
+def _rejects_output_limit(error):
+    return error.status in (400, 422) and re.search(
+        r"\b(?:max_(?:completion_|output_)?tokens|maxOutputTokens|(?:completion|output)[ -]tokens)\b",
+        str(error), re.I,
+    ) and re.search(
+        r"\b(?:at most|between|exceed\w*|maximum|range|less than|too (?:large|high)|upper bound|up to)\b|不得超过|上限",
+        str(error), re.I,
+    )
+
+
+def _truncated_error(reason, text, budget, rejected_at, task):
+    detail = "可见输出被截断" if text.strip() else "达到输出上限后没有可见正文，可能是思考用量占满预算"
+    stage = f"【{task}】" if task else ""
+    return LLMError(f"{stage}{detail}（{budget} tokens，{reason}）。可以调整模型或渠道后从断点继续。",
+                    code="OUTPUT_TRUNCATED", status=502, finish_reason=reason, request_max_tokens=budget,
+                    rejected_output_tokens=rejected_at if math.isfinite(rejected_at) else None)
+
+
+def strip_vertex_model_suffix(model=""):
+    return re.sub(r"-(?:search|build)$", "", str(model or "gemini-3.8-flash").strip(), flags=re.I)
+
+
+def resolve_vertex_thinking_config(model=""):
+    model = strip_vertex_model_suffix(model).lower()
+    if model.startswith("gemini-4-"):
+        return {"thinkingLevel": "LOW"}
+    if "3.8-flash" in model:
+        return {"thinkingBudget": 0}
+    if "flash" in model:
+        return {"thinkingLevel": "MINIMAL"}
+    return None
+
+
+def _encode_component(value):
+    return quote(value, safe=_URI_COMPONENT_SAFE)
+
+
+def build_vertex_endpoint(base_url, model=""):
+    root = (base_url or get_provider_definition("vertex")["baseUrl"]).rstrip("/")
+    if root.endswith(":generateContent"):
+        return root
+    if not root.endswith("/models"):
+        root += "/models"
+    return f"{root}/{_encode_component(strip_vertex_model_suffix(model))}:generateContent"
+
+
+@asynccontextmanager
+async def _http_client(client, creds, transport):
+    if client is not None:
+        yield client
+        return
+    options = {"trust_env": False, "timeout": None}
+    if transport == "vertex" and not _is_local(creds.base_url):
+        proxy = next((os.environ[var] for var in ("VERTEX_PROXY", "HTTPS_PROXY", "HTTP_PROXY") if os.environ.get(var)), "")
+        if proxy:
+            options["proxy"] = proxy
+    try:
+        owned = httpx.AsyncClient(**options)
+    except (ImportError, ValueError):
+        raise LLMError("代理配置无法使用，请检查代理地址与协议。", code="CONFIG_REQUIRED", status=400) from None
+    async with owned:
+        yield owned
+
+
+async def _post(client, endpoint, body, headers):
+    try:
+        request = httpx.Request("POST", endpoint, json=body, headers=headers,
+                                extensions={"timeout": httpx.Timeout(None).as_dict()})
+        return await client.send(request, auth=None, follow_redirects=False)
+    except httpx.TimeoutException:
+        raise LLMError("LLM 网络请求超时。", code="TIMEOUT", status=408, retryable=True) from None
+    except httpx.RequestError as error:
+        if isinstance(error, (httpx.UnsupportedProtocol, httpx.LocalProtocolError)):
+            raise LLMError("供应商的 API 地址或请求配置无效。", code="CONFIG_REQUIRED", status=400) from None
+        raise LLMError(f"网络请求失败（{type(error).__name__}）。", code="NETWORK_ERROR", status=502, retryable=True) from None
+    except httpx.InvalidURL:
+        raise LLMError("供应商的 API 地址无效。", code="CONFIG_REQUIRED", status=400) from None
+
+
+def _object(value):
+    return value if isinstance(value, dict) else {}
+
+
+def _records(value):
+    return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
+
+
+def _head(value):
+    entries = _records(value)
+    return entries[0] if entries else {}
+
+
+def _text(value):
+    return value if isinstance(value, str) else ""
+
+
+def _stat(usage, name, fallback=0):
+    value = usage.get(name)
+    return value if type(value) in (int, float) and math.isfinite(value) else fallback
+
+
+def _reply(text, finish_reason, usage, prompt_key, completion_key, total_key, system, prompt, *,
+           cache_hit_tokens=0, thoughts_tokens=None, zero_total_is_missing=False):
+    input_tokens = _stat(usage, prompt_key, estimate_tokens(system + prompt))
+    output_tokens = _stat(usage, completion_key, estimate_tokens(text)) + (thoughts_tokens or 0)
+    total = _stat(usage, total_key, input_tokens + output_tokens)
+    if zero_total_is_missing and not total:
+        total = input_tokens + output_tokens
+    counted = {"promptTokens": input_tokens, "completionTokens": output_tokens, "totalTokens": total,
+               "cacheHitTokens": cache_hit_tokens}
+    if thoughts_tokens is not None:
+        counted["thoughtsTokens"] = thoughts_tokens
+    return {"text": text, "finishReason": finish_reason, "cacheHitTokens": cache_hit_tokens, "usage": counted}
+
+
+async def _call_transport(client, transport, creds, system, prompt, temperature, max_tokens):
+    provider, api_key = creds.provider, creds.api_key
+    root = creds.base_url.rstrip("/")
+    if not root:
+        raise LLMError("请先保存供应商的 API 地址。", code="CONFIG_REQUIRED", status=400)
+    headers = {}
+    label = get_provider_definition(provider)["label"]
+    thinking = None
+    if transport in ("openai", "deepseek"):
+        endpoint = f"{root}/chat/completions"
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        model = creds.model or ("deepseek-flash" if transport == "deepseek" else "gpt-4o-mini")
+        messages = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": prompt}]
+        modern = provider == "openai" and re.match(r"^(?:gpt-[5-9](?:[.-]|$)|o[134](?:-|$))", model, re.I)
+        fixed_temperature = provider == "moonshot" and re.match(r"^kimi-k[2-9](?:[.-]|$)", model, re.I)
+        body = {"model": model, "messages": messages, "max_completion_tokens" if modern else "max_tokens": max_tokens}
+        if not (modern or fixed_temperature):
+            body["temperature"] = temperature
+        if transport == "deepseek":
+            label = "DeepSeek"
+            body["thinking"] = {"type": "enabled" if creds.thinking_mode == "enabled" else "disabled"}
+    elif transport == "anthropic":
+        label = "Anthropic"
+        endpoint = root + ("/messages" if root.endswith("/v1") else "/v1/messages")
+        headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01"}
+        body = {"model": creds.model or "claude-3-5-sonnet-latest", "max_tokens": max_tokens,
+                "temperature": temperature, "messages": [{"role": "user", "content": prompt}]}
+        if system:
+            body["system"] = system
+    else:
+        generation = {"temperature": temperature, "maxOutputTokens": max_tokens}
+        body = {"contents": [{"role": "user", "parts": [{"text": prompt}]}], "generationConfig": generation}
+        if system:
+            body["systemInstruction"] = {"parts": [{"text": system}]}
+        if transport == "vertex":
+            label = "Vertex"
+            endpoint = build_vertex_endpoint(root, creds.model)
+            headers = {"x-goog-api-key": api_key}
+            thinking = resolve_vertex_thinking_config(creds.model)
+            if thinking:
+                generation["thinkingConfig"] = thinking
+            body["safetySettings"] = _VERTEX_SAFETY_SETTINGS
+        else:
+            label = "Gemini"
+            model = _encode_component(creds.model or "gemini-2.5-flash")
+            endpoint = f"{root}/models/{model}:generateContent?key={_encode_component(api_key)}"
+
+    response = await _post(client, endpoint, body, headers)
+    if (response.status_code == 400 and thinking and re.search(r"thinking", response.text, re.I)
+            and re.search(r"unsupported|not supported|invalid", response.text, re.I)):
+        del body["generationConfig"]["thinkingConfig"]
+        response = await _post(client, endpoint, body, headers)
+    if not response.is_success:
+        raise _http_error(label, response, api_key, provider != "openai")
+    try:
+        data = _object(response.json())
+    except (ValueError, UnicodeError):
+        raise LLMError(f"{label} 返回了无效的 JSON。", code="INVALID_RESPONSE", status=502) from None
+
+    if transport in ("openai", "deepseek"):
+        choice = _head(data.get("choices"))
+        text = _text(_object(choice.get("message")).get("content"))
+        finish = choice.get("finish_reason")
+        if not text.strip() and max_tokens >= 500:
+            raise LLMError("OpenAI API returned empty content", code="EMPTY_RESPONSE", status=502,
+                           retryable=True, finish_reason=finish)
+        usage = _object(data.get("usage"))
+        return _reply(text, finish, usage, "prompt_tokens", "completion_tokens", "total_tokens", system, prompt,
+                      cache_hit_tokens=_stat(usage, "prompt_cache_hit_tokens"),
+                      zero_total_is_missing=transport == "openai")
+
+    if transport == "anthropic":
+        text = "".join(_text(part.get("text")) for part in _records(data.get("content")))
+        return _reply(text, data.get("stop_reason"), _object(data.get("usage")), "input_tokens", "output_tokens",
+                      None, system, prompt)
+
+    candidate = _head(data.get("candidates"))
+    parts = _records(_object(candidate.get("content")).get("parts"))
+    text = "".join(_text(part.get("text")) for part in parts if not part.get("thought"))
+    finish = candidate.get("finishReason")
+    if transport == "vertex" and not text.strip() and finish == "MAX_TOKENS":
+        raise LLMError("Vertex 返回空内容 (finishReason: MAX_TOKENS，思考消耗完输出预算，请调大 maxTokens)",
+                       code="EMPTY_RESPONSE", status=502, retryable=True, finish_reason=finish)
+    usage = _object(data.get("usageMetadata"))
+    return _reply(text, finish, usage, "promptTokenCount", "candidatesTokenCount", "totalTokenCount", system, prompt,
+                  thoughts_tokens=_stat(usage, "thoughtsTokenCount") if transport == "vertex" else None)
+
+
+async def _provider_attempt(client, transport, creds, key, system, prompt, temperature, budget, timeout_ms, parallel):
+    while True:
+        _, waiter = _enter_circuit(key)
+        if waiter is not None:
+            await _wait_for_probe(waiter)
+            continue
+        claim = None
+        try:
+            async with asyncio.timeout(timeout_ms / 1000), _rate_slot(creds, transport, parallel):
+                # Recheck after pacing: a parallel call may have claimed the probe in the meantime.
+                claim, waiter = _enter_circuit(key, claim=True)
+                if waiter is None:
+                    result = await _call_transport(client, transport, creds, system, prompt, temperature, budget)
+        except TimeoutError:
+            error = _timeout_error(timeout_ms)
+            _settle_circuit(claim, error)
+            raise error from None
+        except LLMError as error:
+            _settle_circuit(claim, error)
+            raise
+        except BaseException:
+            _settle_circuit(claim, cancelled=True)
+            raise
+        if waiter is not None:
+            await _wait_for_probe(waiter)
+            continue
+        _settle_circuit(claim)
+        return result
+
+
+def _timeout_error(timeout_ms):
+    return LLMError(f"LLM request timed out after {timeout_ms}ms", code="TIMEOUT", status=408, retryable=True)
+
+
+def _backoff(creds, error, attempt):
+    if error.retry_after_ms is not None:
+        return min(60, error.retry_after_ms / 1000)
+    if _is_local(creds.base_url):
+        return min(0.5, 0.1 * attempt)
+    if error.code == "HTTP_429":
+        steps = (10, 20, 35, 50, 60)
+        return steps[min(attempt - 1, len(steps) - 1)] + random.randrange(2500) / 1000
+    return 1.5 * 2 ** (attempt - 1) if attempt < 6 else 30
+
+
+def _elapsed(started):
+    return max(1, round((_clock() - started) * 1000))
+
+
+async def call_llm(*, provider="mock", base_url="", api_key="", model="", thinking_mode="disabled",
+                   system="", prompt="", temperature=0.7, max_tokens=DEFAULT_MAX_TOKENS,
+                   timeout_ms=DEFAULT_TIMEOUT_MS, retries=None, max_retries=None, test_scenario=None,
+                   use_saved_connection=False, allow_parallel=False, retry_empty_response=True,
+                   apply_output_floor=True, store=None, client: httpx.AsyncClient | None = None):
+    """Call a model, returning the same camelCase response fields as the Node gateway."""
+    started = _clock()
+    effective_timeout = max(1000, int(timeout_ms or DEFAULT_TIMEOUT_MS))
+    creds = await _resolve_credentials(provider, base_url, api_key, model, thinking_mode, use_saved_connection, store)
+    if creds.provider == "mock":
+        result = await call_mock_llm(system=system, prompt=prompt, timeout_ms=effective_timeout,
+                                     test_scenario=test_scenario)
+        return {**result, "durationMs": _elapsed(started), "cacheHitTokens": 0,
+                "usage": {**result["usage"], "cacheHitTokens": 0}}
+    definition = get_provider_definition(creds.provider)
+    if definition is None:
+        raise LLMError(f"Unsupported LLM provider: {provider}", code="UNSUPPORTED_PROVIDER", status=400)
+
+    transport = definition["transport"]
+    attempts = max(1, int(retries if retries is not None else max_retries if max_retries is not None else DEFAULT_RETRIES) + 1)
+    guard = _guard_output()
+    budget = int(max_tokens)
+    if guard and apply_output_floor:
+        budget = max(budget, min(_env_positive_int("NOVEL_FORGE_MIN_OUTPUT_TOKENS", 0), DEFAULT_MAX_TOKENS))
+    if transport == "vertex":
+        budget = max(1024, budget or DEFAULT_MAX_TOKENS)
+    stage_match = re.match(r"^\[TASK:([A-Z_0-9]+)\]", system, re.I)
+    stage = stage_match[1] if stage_match else None
+    rejected_at = math.inf
+    truncation = None
+    tried = set()
+    fallbacks = 0
+    attempt = 1
+    key = _circuit_key(creds)
+
+    _check_circuit(key)
+    async with _http_client(client, creds, transport) as active_client:
+        while attempt <= attempts:
+            _check_circuit(key)
+            tried.add(budget)
+            try:
+                result = await _provider_attempt(active_client, transport, creds, key, system, prompt,
+                                                 temperature, budget, effective_timeout, allow_parallel)
+                finish = result.get("finishReason")
+                if guard and output_was_truncated(finish):
+                    raise _truncated_error(finish, result["text"], budget, rejected_at, stage)
+                if guard and not result["text"].strip():
+                    raise LLMError("模型未返回可见内容。", code="EMPTY_RESPONSE", status=502,
+                                   retryable=True, finish_reason=finish)
+                return {**result, "durationMs": _elapsed(started)}
+            except LLMError as error:
+                if error.code == "CIRCUIT_OPEN" or (error.status == 429 and creds.provider == "openai"):
+                    raise
+                if guard and error.code in {"EMPTY_RESPONSE", "OUTPUT_TRUNCATED"} and output_was_truncated(error.finish_reason):
+                    truncation = error if error.code == "OUTPUT_TRUNCATED" else _truncated_error(
+                        error.finish_reason, "", budget, rejected_at, stage,
+                    )
+                    next_budget = next_output_budget(budget, rejected_at)
+                    if not retry_empty_response or attempt == attempts or next_budget is None or next_budget in tried:
+                        raise truncation from None
+                    log.warning("%s 输出截断（%s），预算 %d → %d tokens。", creds.provider, error.finish_reason, budget, next_budget)
+                    budget = next_budget
+                    attempt += 1
+                    continue
+                if not retry_empty_response and (error.code == "EMPTY_RESPONSE" or output_was_truncated(error.finish_reason)):
+                    raise
+                if _rejects_output_limit(error):
+                    rejected_at = min(rejected_at, budget)
+                    next_budget = next_output_budget(truncation.request_max_tokens, rejected_at) if truncation else budget // 2
+                    if fallbacks < 2 and budget >= 2048 and next_budget is not None and next_budget not in tried:
+                        budget = next_budget
+                        fallbacks += 1
+                        continue
+                    if truncation:
+                        truncation.rejected_output_tokens = rejected_at
+                        raise truncation from None
+                if not error.retryable or attempt == attempts:
+                    raise
+                _check_circuit(key)
+                await _sleep(_backoff(creds, error, attempt))
+                attempt += 1
+
+
+async def test_connection(*, provider="deepseek", base_url="", api_key="", model="", thinking_mode="disabled",
+                          timeout_ms=15_000, store=None, client: httpx.AsyncClient | None = None):
+    started = _clock()
+    creds = await _resolve_credentials(provider, base_url, api_key, model, thinking_mode, False, store)
+    result = {"provider": creds.provider, "model": creds.model, "baseUrl": creds.base_url,
+              "thinkingMode": creds.thinking_mode}
+    try:
+        if provider_requires_key(creds.provider) and not creds.api_key:
+            raise LLMError(f"未配置 {creds.provider} API Key", code="CONFIG_REQUIRED", status=400)
+        reply = await call_llm(provider=creds.provider, base_url=creds.base_url, api_key=creds.api_key,
+                               model=creds.model, thinking_mode=creds.thinking_mode, timeout_ms=timeout_ms,
+                               system="你是连通性探测助手，请简短回复。", prompt="回复OK", temperature=0,
+                               max_tokens=protected_output_budget(4096, 16_384), retries=0, store=store, client=client)
+    except LLMError as error:
+        return {**result, "ok": False, "latencyMs": _elapsed(started), "replyPreview": "",
+                "usage": None, "error": str(error)}
+    return {**result, "ok": True, "latencyMs": reply["durationMs"], "replyPreview": reply["text"].strip()[:80],
+            "usage": reply["usage"], "error": None}
+
+
+# Deterministic scenarios for the writing pipeline and acceptance tests.
+_mock_attempts = {}
+_MOCK_TASKS = {
+    "topic_candidates": r"3\s*个候选方案|候选选题",
+    "full_audit": r"全书审计|全书终审|FullBookAudit",
+    "book_plan": r"全书总纲|BookPlan",
+    "chapter_outlines": r"连续章纲|ChapterOutlines",
+    "word_count_adjust": r"篇幅调整|扩写|精简",
+    "fact_extraction": r"事实提取|FactExtraction",
+    "verify": r"一致性审校|ConsistencyVerify",
+    "repair": r"问题修复|ChapterRepair",
+    "de_ai": r"去AI味|DeAI",
+    "chapter_write": r"撰写第\s*\d+\s*章正文|ChapterWrite",
+}
+_MOCK_MARKERS = ("topic_candidates", "book_plan", "chapter_outlines", "word_count_adjust", "fact_extraction",
+                 "verify", "repair", "de_ai", "full_audit", "chapter_write")
+_BRONZE_KEY = "刻有“玄天七号”的青铜钥匙"
+
+
+def reset_mock_state():
+    with _state_lock:
+        _mock_attempts.clear()
+
+
+def _first_mock_attempt(kind, scenario, chapter=None):
+    key = kind, scenario.get("runId") or "default", chapter
+    with _state_lock:
+        attempt = _mock_attempts.get(key, 0) + 1
+        _mock_attempts[key] = attempt
+        return attempt == 1
+
+
+def _mock_field(text, pattern, default):
+    match = re.search(pattern, text)
+    return match[1].strip() if match and match[1] else default
+
+
+def _mock_foreshadowing(scenario):
+    return scenario.get("mode") in {"foreshadowing", "long-range-key"}
+
+
+def _mock_json(value, *, compact=False):
+    return json.dumps(value, ensure_ascii=False, indent=None if compact else 2,
+                      separators=(",", ":") if compact else None)
+
+
+def _mock_topic_candidates(text):
+    genre = _mock_field(text, r"题材[：:]\s*([^\n]+)", "都市重生爽文")
+    pov = _mock_field(text, r"视角[：:]\s*([^\n]+)", "第三人称限知")
+    seed = _mock_field(text, r"参考素材标题[：:]\s*([^\n]+)", "暗夜执掌者")
+    return {"candidates": [
+        {
+            "title": f"{seed[:8]}：逆命执掌者",
+            "premise": "主角林渊在家族覆灭与背叛之夜重生回十年前，凭借前世金融与地下情报记忆，携手盟友苏清雪反手布局，一步步夺回失地并揭开跨越两代人的权谋真相。",
+            "coreConflict": "林渊必须在十年前资金链断裂前反杀赵天豪与幕后财阀的联合围剿，同时守住家族核心机密。",
+            "protagonistMotivation": "改写前世至亲惨死的结局，查明林家覆灭的真正幕后黑手。",
+            "goldenThreeChapters": [
+                "第1章：重生回股权转让鸿门宴当晚，当众撕毁协议并反手录音留证。",
+                "第2章：夜返老宅暗格取回核心账本与神秘信物，锁定第一桶启动资金。",
+                "第3章：次日开盘精准狙击仇家股票，对方资金链当场断裂，幕后黑手初露端倪。",
+            ],
+            "mainPlot": "前期立足破局与资本反杀，中期追查神秘组织与跨市博弈，后期收网洗冤并完成秩序重塑。",
+            "recommendedPov": pov, "tags": [genre, "重生", "强反转", "长线伏笔"],
+            "genreFit": 96, "novelty": 91, "longFormPotential": 95,
+        },
+        {
+            "title": "倒计时十天：我提前买断整个时代的底牌",
+            "premise": "主角意外获得未来十年的新闻与行情简报，在风口来临前连续截胡竞争对手的命脉项目，从底层逆袭为幕后操盘手。",
+            "coreConflict": "信息差优势与暗中觊觎者的围追堵截。",
+            "protagonistMotivation": "摆脱被资本收割的宿命，建立独立商业帝国。",
+            "goldenThreeChapters": [
+                "第1章：被公司裁员当天收到十年后首条加密简报。",
+                "第2章：抵押房产全仓押注冷门专利，众人嘲笑疯癫。",
+                "第3章：新政突发落地，专利估值暴涨百倍，前上司登门求合作。",
+            ],
+            "mainPlot": "从单点套利到全产业链布局，最终直面顶层财团规则制定者。",
+            "recommendedPov": pov, "tags": [genre, "信息差", "商战"],
+            "genreFit": 88, "novelty": 84, "longFormPotential": 86,
+        },
+        {
+            "title": "双面档案：城西钟楼下的十年旧案",
+            "premise": "一名普通调查记者在整理旧档案时发现自己竟然是十年前重大悬案的唯一幸存者，每翻开一页卷宗都引来致命追杀。",
+            "coreConflict": "追寻真相与自身记忆空白之间的撕裂。",
+            "protagonistMotivation": "拼凑完整记忆，为当年的无辜者讨回公道。",
+            "goldenThreeChapters": [
+                "第1章：匿名快递送来十年前的现场照片，背面写着主角的名字。",
+                "第2章：档案室深夜失火，主角抢出半份残缺名单。",
+                "第3章：名单上的第一个名字正是现任市局顾问。",
+            ],
+            "mainPlot": "逐一核对名单线索，层层剥开保护伞，最终在钟楼密室揭晓真相。",
+            "recommendedPov": pov, "tags": [genre, "悬疑", "强主线"],
+            "genreFit": 82, "novelty": 89, "longFormPotential": 83,
+        },
+    ]}
+
+
+def _mock_book_plan(text, scenario, include_style_bible):
+    total = int(_mock_field(text, r"总章数[：:]\s*(\d+)", "10")) or 10
+    middle = (total + 1) // 2
+    plan = {
+        "title": _mock_field(text, r"书名[：:]\s*([^\n]+)", "逆天归来：暗夜执掌者"),
+        "genre": _mock_field(text, r"题材[：:]\s*([^\n]+)", "都市重生爽文"),
+        "pov": _mock_field(text, r"视角[：:]\s*([^\n]+)", "第三人称限知"),
+        "logline": "主角林渊重回十年前，凭借前世记忆与神秘遗物布局破局，揭开跨时代阴谋并逆袭登顶。",
+        "worldview": {"setting": "现代架空都市与暗流涌动的隐秘宗门/财阀势力交织",
+                      "coreRules": ["实力与情报决定话语权", "秘密只在核心知情人之间流通"]},
+    }
+    if include_style_bible:
+        plan["styleBible"] = {
+            "narrativeVoice": "偏冷的近景叙述，交锋用短句，交代线索时放慢节奏。",
+            "dialogueRules": ["林渊先问证据再表态。", "苏清雪直接点明风险，少用反问。", "赵天豪把威胁说成交易条件。"],
+            "domainTaboos": ["年代尚未普及的即时通讯工具不可提前出现。"],
+            "forbiddenCliches": ["瞳孔骤缩", "空气仿佛凝固", "心里掀起惊涛骇浪"],
+        }
+    plan["mainCharacters"] = [
+        {"name": "林渊", "role": "主角", "traits": ["冷静", "果断", "重情义"], "goal": "查明前世覆灭真相并护住至亲"},
+        {"name": "苏清雪", "role": "女主/盟友", "traits": ["聪慧", "外冷内热"], "goal": "摆脱家族联姻控制"},
+        {"name": "赵天豪", "role": "前期反派", "traits": ["傲慢", "多疑"], "goal": "吞并林家产业"},
+    ]
+    plan["volumes"] = [
+        {"volume": 1, "title": "第一卷：暗夜潜龙", "chapters": [1, middle], "summary": "重生归来，站稳脚跟并埋下关键线索。"},
+        {"volume": 2, "title": "第二卷：风云破局", "chapters": [middle + 1, total], "summary": "全面反击，回收伏笔，揭晓终极秘密。"},
+    ]
+    if _mock_foreshadowing(scenario):
+        clue = {"id": "fs_bronze_key", "clue": _BRONZE_KEY, "plantedChapter": 2, "reinforcedChapters": [6, 11],
+                "payoffChapter": 18, "description": "第2章于老宅暗格发现青铜钥匙，第6章确认其来源，第11章定位钟楼机关，第18章开启密室终极真相。"}
+    else:
+        clue = {"id": "fs_1", "clue": "神秘黑色玉佩", "plantedChapter": 1, "reinforcedChapters": [3],
+                "payoffChapter": total, "description": "贯穿全书的核心信物。"}
+    plan["foreshadowingPlan"] = [clue]
+    return plan
+
+
+_MOCK_PLOT = {
+    2: ("林渊返回老宅暗格，找到刻有“玄天七号”的青铜钥匙（重要伏笔）。",
+        ["林渊在老宅地下室暗格发现青铜钥匙", "钥匙背面刻着“玄天七号”"]),
+    6: ("黑市拍卖会上出现同源纹章，林渊确认随身青铜钥匙与玄天阁有关。",
+        ["林渊取出青铜钥匙比对纹章", "苏清雪留意到钥匙却不知其真正用途"]),
+    11: ("林渊破解古籍残卷，得知“玄天七号”青铜钥匙对应城西废弃钟楼的地下密室。",
+         ["破译钟楼坐标", "青铜钥匙成为开启密室的唯一凭证"]),
+    18: ("林渊持“玄天七号”青铜钥匙开启城西钟楼密室，伏笔正式回收，真相大白！",
+         ["青铜钥匙插入钟楼暗锁", "密室开启，林家覆灭真相水落石出"]),
+}
+
+
+def _mock_outlines(text, scenario):
+    start = int(_mock_field(text, r"起始章节[：:]\s*(\d+)", "1")) or 1
+    end = int(_mock_field(text, r"结束章节[：:]\s*(\d+)", "10")) or 10
+    foreshadowing = _mock_foreshadowing(scenario)
+    outlines = []
+    for chapter in range(start, end + 1):
+        title = f"破局第{chapter}步"
+        summary = f"第{chapter}章推进主线冲突，林渊应对来自赵家的试探并进一步扩大优势。"
+        events = [f"林渊完成第{chapter}阶段布局", "信息增量揭示新线索"]
+        if chapter == 1:
+            title = "重生之夜"
+            summary = "林渊重生回到命运转折夜，当场反制暗算，确立主角优势。"
+            events = ["林渊醒来确认重生时间点", "识破赵天豪的鸿门宴"]
+        elif foreshadowing and chapter in _MOCK_PLOT:
+            summary, events = _MOCK_PLOT[chapter]
+            if chapter == 18:
+                title = "钟楼密钥终局"
+        outlines.append({
+            "chapterNumber": chapter, "title": f"第{chapter}章 {title}", "goal": f"推进第{chapter}章主线剧情",
+            "summary": summary, "keyEvents": events, "hook": f"章末突然传来意外消息，指向第{chapter + 1}章的新危机。",
+        })
+    return outlines
+
+
+_MOCK_CLUE_SCENES = {
+    2: "{p}独自回到林家老宅的地下室，撬开墙角那块松动的青砖。暗格之中静静躺着一枚古朴的青铜钥匙，钥匙柄上清晰地铭刻着“玄天七号”四个篆字。{p}神色微凝，将青铜钥匙贴身收好，决定暂不向任何人透露此事。",
+    6: "黑市拍卖会的灯光昏暗而压抑。当展台上出现一枚残缺的玄天纹章时，{p}下意识摸了摸贴身携带的那枚刻有“玄天七号”的青铜钥匙——两者的纹路竟然严丝合缝。坐在一旁的苏清雪察觉到{p}神色有异，低声询问，但{p}只是微微摇头，没有道破钥匙的秘密。",
+    11: "灯下翻阅完刚到手的古籍残卷，{p}终于彻底看懂了“玄天七号”青铜钥匙的指向。残卷末端明确标注：玄天七号所对应的并非普通保险柜，而是城西废弃钟楼地底的三重机关密室。",
+    18: "暴雨倾盆而下，城西废弃钟楼内一片死寂。{p}走上前，从怀中取出那枚自第2章起便贴身保管的“玄天七号”青铜钥匙，稳稳插入石壁暗锁。伴随沉重的齿轮转动声，密室石门缓缓开启，尘封十年的真相终于展现在眼前！",
+}
+_MOCK_FILLER = (
+    "窗外的霓虹灯影在玻璃上流转，映照出{p}沉静而锐利的侧脸。每一步落子都经过了精密的算计，绝不容许半点差池。从股权结构到地下资金流向，{p}早已在脑海中推演过无数次，此刻不过是按图索骥。",
+    "苏清雪站在走廊尽头，看着{p}从容离去的背影，心中掀起了惊涛骇浪。她原本以为这场博弈早已注定结局，却没想到局势会在短短半小时内彻底逆转，对方掌握的情报深度甚至超越了顶尖财阀的智囊团。",
+    "桌上的加密通讯器微微震动，新的密报已经传回。{p}扫了一眼屏幕上的坐标，唇角勾起一抹冷冽的弧度。真正的收网时刻正在逼近，城南码头与金融街的暗线同时启动，不给对手留下一丝喘息之机。",
+    "街角的风卷起几片落叶，远处的车灯由远及近。暗流之下的交锋才刚刚开始，谁能笑到最后，还要看接下来的每一步棋。夜色深处，几方势力的代表各自拨通了加密电话，整座城市的暗网悄然沸腾。",
+    "会议室内的投影仪光束微微闪烁，一份份经过交叉比对的财务报表铺满长桌。{p}修长的手指点在关键数据上，语气平静却带着不容置疑的压迫感：“给你们十二个小时，把原本属于林家的东西悉数奉还。”",
+    "茶水在白瓷杯中微微晃动，倒映出天花板上冰冷的吊灯。赵天豪的呼吸明显粗重了几分，他死死盯着屏幕上的实时行情曲线，怎么也想不明白对方究竟是如何提前三天预判了所有做空节点。",
+)
+
+
+def _mock_chapter(text, chapter, scenario):
+    pov = _mock_field(text, r"叙事视角[：:]\s*([^\n]+)", "第三人称限知")
+    words = int(_mock_field(text, r"(?:本章)?目标字数[：:]\s*(\d+)", "2000")) or 2000
+    protag = "我" if "第一人称" in pov else "林渊"
+    fault_mode = scenario.get("mode") == "fault-injection"
+    fault_chapter = scenario.get("faultChapter")
+    inject = fault_mode and chapter == (2 if fault_chapter is None else fault_chapter) and _first_mock_attempt(
+        "fault", scenario, chapter,
+    )
+    if chapter == 1:
+        paragraphs = [f"夜色如墨，冷风顺着半掩的窗缝灌入室内。{protag}猛地睁开双眼，胸口剧烈起伏，掌心还残留着前世坠楼时的冰冷触感。墙上的电子日历清晰地显示着十年前的日期——一切都还来得及。"]
+        if fault_mode:
+            paragraphs.append(f"门外突然传来急促的脚步声，几名黑衣打手破门而入。{protag}虽然反应极快，但在格挡铁棍时左臂被重重砸中，骨裂的剧痛瞬间袭来，左臂暂时失去了行动能力。")
+    else:
+        paragraphs = [f"第{chapter}章的序幕在清晨的薄雾中拉开。{protag}站在落地窗前，指尖轻轻敲击着桌面，将昨夜收集到的所有情报在脑海中重新推演了一遍。"]
+    if _mock_foreshadowing(scenario) and chapter in _MOCK_CLUE_SCENES:
+        paragraphs.append(_MOCK_CLUE_SCENES[chapter].format(p=protag))
+    if inject:
+        paragraphs.append(f"面对赵天豪派来的伏兵，{protag}冷哼一声，直接挥动完好无损的左臂猛然劈下，将面前实木桌案震得粉碎。【此处待补充具体打斗细节】")
+    else:
+        paragraphs.append(f"客厅内的气氛骤然紧绷，赵天豪冷笑着放下茶杯，试图用言语试探{protag}的底线。然而{protag}神色淡然，只用三言两语便将对方的陷阱原封不动地推了回去，反手亮出的证据更是让在场众人脸色剧变。")
+    aim = max(200, math.floor(words * 0.97 + 0.5))
+    length = sum(len(_CJK.findall(part)) for part in paragraphs)
+    for index in range(200):
+        if length >= aim:
+            break
+        filler = _MOCK_FILLER[(index + chapter) % len(_MOCK_FILLER)].format(p=protag)
+        paragraphs.append(filler)
+        length += len(_CJK.findall(filler))
+    return "\n\n".join(paragraphs)
+
+
+def _mock_word_count_adjust(text, chapter):
+    target = int(_mock_field(text, r"目标字数[：:]\s*(\d+)", "2000")) or 2000
+    body = text.partition("【待调整正文】")[2].strip()
+    if not body:
+        return _mock_chapter(text, chapter, {})
+    current = len(_CJK.findall(body))
+    if current < 0.92 * target:
+        extra = f"夜色更深，第{chapter}章的暗流仍在持续发酵，林渊将刚获得的线索逐一归档，确认下一阶段的行动坐标与时间窗口。"
+        missing = max(0, math.floor(target * 0.97 + 0.5) - current)
+        return body + ("\n\n" + extra) * min(120, math.ceil(missing / len(_CJK.findall(extra))))
+    if current > 1.08 * target:
+        paragraphs = re.split(r"\n{2,}", body)
+        while len(paragraphs) > 2 and current > math.floor(target * 1.03 + 0.5):
+            current -= len(_CJK.findall(paragraphs.pop()))
+        return "\n\n".join(paragraphs)
+    return body
+
+
+def _mock_facts(chapter, scenario):
+    delta = {
+        "characters": {"林渊": {"name": "林渊", "status": "active", "role": "主角",
+                              "location": "老宅地下室" if chapter == 2 else "都市"}},
+        "injuries": [],
+        "timeline": [{"dayOrTime": f"第{chapter}章时间线", "event": f"第{chapter}章核心事件推进", "characters": ["林渊"]}],
+        "items": {}, "secrets": [], "foreshadowing": [],
+    }
+    if scenario.get("mode") == "fault-injection" and chapter == 1:
+        delta["injuries"].append({"character": "林渊", "description": "左臂骨裂，暂时失去行动能力",
+                                  "severity": "high", "active": True})
+    if not _mock_foreshadowing(scenario):
+        return delta
+    if chapter == 2:
+        key = "玄天七号青铜钥匙"
+        delta["items"][key] = {"name": key, "owner": "林渊", "location": "林渊贴身保管", "status": "intact"}
+        delta["secrets"].append({"secret": f"{key}的存在与来历", "holders": ["林渊"],
+                                 "excludedCharacters": ["苏清雪", "赵天豪"]})
+    clue = {
+        2: {"plantedChapter": 2, "status": "planted"},
+        6: {"status": "reinforced", "details": "与黑市玄天纹章同源"},
+        11: {"status": "reinforced", "details": "对应城西废弃钟楼地下密室"},
+        18: {"status": "paid_off", "payoffChapter": 18, "details": "成功开启钟楼密室并揭晓真相"},
+    }.get(chapter)
+    if clue:
+        delta["foreshadowing"].append({"id": "fs_bronze_key", "clue": _BRONZE_KEY, **clue})
+    return delta
+
+
+def _mock_verify(text, chapter, scenario):
+    before, marker, after = text.partition("【待审校正文】")
+    body = (after if marker else before).partition("输出 JSON")[0]
+    issues = []
+    if re.search(r"【待补充|\[TODO\]|\bTBD\b|\bplaceholder\b", body, re.I):
+        issues.append({"type": "placeholder", "severity": "error", "message": f"第{chapter}章包含未完成的占位符文本"})
+    if "完好无损的左臂" in body and "左臂骨裂" in text:
+        issues.append({"type": "injury_contradiction", "severity": "error",
+                       "message": f"第{chapter}章存在伤势前后矛盾：林渊第1章左臂骨裂尚未痊愈，却在本章“挥动完好无损的左臂”",
+                       "sourceChapter": 1})
+    return {"passed": not issues, "chapterNumber": chapter, "issues": issues, "aiIssues": [],
+            "factsDelta": None if issues else _mock_facts(chapter, scenario),
+            "summary": f"发现 {len(issues)} 处一致性问题" if issues else f"第{chapter}章一致性审校通过"}
+
+
+def _mock_full_audit(scenario):
+    if scenario.get("mode") == "audit-fail-once" and _first_mock_attempt("audit", scenario):
+        return {
+            "passed": False, "score": 58, "summary": "终审未通过：部分伏笔回收缺少明确章节证据引用。",
+            "mainConflictChapter": 1, "protagonistChoiceChapter": 2, "foreshadowingPayoffs": [], "evidence": [],
+            "issues": ["第18章伏笔回收证据引用缺失"], "consistencySummary": "需补全终章证据链后复审",
+            "recommendations": ["补全关键章节证据引用"],
+        }
+    return {
+        "passed": True, "score": 95, "summary": "全书主线完整，主角选择后果明确，人物行为与伤势/物品/秘密边界一致，核心伏笔回收闭环。",
+        "mainConflictChapter": 1, "protagonistChoiceChapter": 2,
+        "foreshadowingPayoffs": [{"clue": "核心伏笔线索", "plantedChapter": 2, "payoffChapter": 18, "status": "paid_off"}],
+        "evidence": [{"claim": "主线冲突确立", "chapter": 1, "quote": "重生回十年前并当场反制暗算"},
+                     {"claim": "核心伏笔回收", "chapter": 18, "quote": "开启密室并揭晓最终真相"}],
+        "consistencySummary": "人物状态、伤势、物品位置及秘密知情边界全书一致",
+        "recommendations": ["可进一步丰富次要配角对话质感"],
+    }
+
+
+def build_mock_volume_summary(chapters):
+    """Mirror the deterministic archive produced from the first, fifth and tenth chapters."""
+    if len(chapters) != 10:
+        raise ValueError("Mock volume summaries require ten chapters")
+    turns = [{"chapter": chapter["chapterNumber"], "text": chapter.get("summary") or chapter.get("title") or ""}
+             for chapter in (chapters[0], chapters[4], chapters[9])]
+    return {"mainline": "；".join(f'第{point["chapter"]}章：{point["text"][:80]}' for point in turns),
+            "turningPoints": turns}
+
+
+def _mock_volume_prompt(prompt):
+    try:
+        evidence = json.loads(prompt.split("\n", 1)[1])
+        return build_mock_volume_summary(evidence)
+    except (IndexError, KeyError, TypeError, ValueError):
+        raise LLMError("Mock 卷摘要缺少完整的十章输入。", code="INVALID_RESPONSE", status=502) from None
+
+
+def _detect_mock_task(text):
+    if re.search(r"\[TASK:VOLUME_SUMMARY\]", text, re.I):
+        return "volume_summary"
+    for task in _MOCK_MARKERS:
+        if re.search(rf"\[TASK:{task}\]", text, re.I):
+            return task
+    return next((task for task, pattern in _MOCK_TASKS.items() if re.search(pattern, text, re.I)), "generic")
+
+
+async def call_mock_llm(*, system="", prompt="", timeout_ms=DEFAULT_TIMEOUT_MS, test_scenario=None):
+    scenario = {"mode": test_scenario} if isinstance(test_scenario, str) else _object(test_scenario)
+    combined = f"{system}\n{prompt}"
+    task = _detect_mock_task(combined)
+    chapter_match = re.search(r"第\s*(\d+)\s*章", prompt) or re.search(r"第\s*(\d+)\s*章", system)
+    chapter = int(chapter_match[1]) if chapter_match else 1
+    mode = scenario.get("mode")
+    if mode == "always-timeout":
+        wait_ms = min(timeout_ms or 200, 150)
+        await asyncio.sleep(wait_ms / 1000)
+        raise LLMError(f"Simulated LLM timeout after {wait_ms}ms", code="TIMEOUT", status=408, retryable=True)
+    if mode == "timeout-once" and task == "chapter_write":
+        chapter_to_fail = scenario.get("failAtChapter")
+        if chapter == (3 if chapter_to_fail is None else chapter_to_fail) and _first_mock_attempt("timeout", scenario, chapter):
+            await asyncio.sleep(0.030)
+            raise LLMError(f"Simulated timeout on chapter {chapter} (attempt 1)", code="TIMEOUT", status=408, retryable=True)
+
+    await asyncio.sleep(0.008)
+    if task == "topic_candidates":
+        text = _mock_json(_mock_topic_candidates(combined))
+    elif task == "book_plan":
+        text = _mock_json(_mock_book_plan(combined, scenario, system.endswith(STYLE_BIBLE_MARKER)))
+    elif task == "chapter_outlines":
+        text = _mock_json(_mock_outlines(combined, scenario))
+    elif task == "chapter_write":
+        text = _mock_chapter(combined, chapter, scenario)
+    elif task == "word_count_adjust":
+        text = _mock_word_count_adjust(combined, chapter)
+    elif task == "fact_extraction":
+        text = _mock_json(_mock_facts(chapter, scenario))
+    elif task == "verify":
+        text = _mock_json(_mock_verify(combined, chapter, scenario))
+    elif task == "repair":
+        text = _mock_chapter(combined, chapter, {})
+    elif task == "de_ai":
+        _, marker, body = combined.partition("【待润色正文】")
+        text = body.strip() if marker else combined
+    elif task == "full_audit":
+        text = _mock_json(_mock_full_audit(scenario))
+    elif task == "volume_summary":
+        text = _mock_json(_mock_volume_prompt(prompt))
+    elif prompt.strip() == "回复OK":
+        text = "OK"
+    else:
+        text = _mock_json({"ok": True, "message": "Mock LLM response", "chapter": chapter}, compact=True)
+    prompt_tokens = estimate_tokens(combined)
+    completion_tokens = estimate_tokens(text)
+    return {"text": text, "usage": {"promptTokens": prompt_tokens, "completionTokens": completion_tokens,
+                                    "totalTokens": prompt_tokens + completion_tokens}}

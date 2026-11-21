@@ -1,0 +1,8 @@
+/.venv/
+/data/
+node_modules/
+__pycache__/
+*.pyc
+*.tsbuildinfo
+/web-gemini/dist/
+/logs/

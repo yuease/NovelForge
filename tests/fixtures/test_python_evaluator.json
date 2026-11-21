@@ -1,0 +1,39 @@
+{
+  "test_json_fingerprint_and_signals_match_legacy_reports": [
+    "298e728372d9f92f896a3a7e31887c4f2a48430c89d70d0e33ec45493541fda9",
+    {
+      "totalChapters": 2,
+      "reactionStats": {
+        "瞳孔(一/微/骤)缩": {
+          "totalCount": 1,
+          "chapterCount": 1,
+          "sampleChapters": [
+            2
+          ]
+        },
+        "指节发白": {
+          "totalCount": 3,
+          "chapterCount": 2,
+          "sampleChapters": [
+            1,
+            2
+          ]
+        }
+      },
+      "endingHookStats": {
+        "临走补一句“还有一件事”": {
+          "count": 1,
+          "chapters": [
+            1
+          ]
+        },
+        "通讯/手机突发消息打断": {
+          "count": 1,
+          "chapters": [
+            2
+          ]
+        }
+      }
+    }
+  ]
+}

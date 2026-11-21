@@ -1,0 +1,917 @@
+{
+  "test_clip_quantiles_and_entry_priority": [
+    {
+      "system": "规则",
+      "prompt": "{\"ending\":\"过时旧事。\\n保留这个完整句子。\\n完整结尾🙂。\",\"summary\":\"开头摘要保留。后续不一定。\"}"
+    },
+    {
+      "system": "规则",
+      "prompt": "{\"head\":\"无标点的长段文字🙂无标点的长段文字🙂无标点的长\"}"
+    },
+    {
+      "system": "规则",
+      "prompt": "{\"continuity\":[{\"setting\":\"月港的硬约束\"}],\"cast\":[{\"lead\":\"林默\"},{\"role\":\"舵手\"}],\"ending\":\"旧情节。旧情节。旧情节。旧情节。旧情节。旧情节。留在原地。\",\"samples\":[\"下一条\"]}"
+    }
+  ],
+  "test_grounded_quotes_and_degradation": {
+    "blocking": [
+      {
+        "type": "ai_flavor",
+        "severity": "error",
+        "priority": "P1",
+        "category": "formulaic_reaction",
+        "message": "改写",
+        "quote": "「甲板尽头发现AB暗记，...确切证明箱中有信。」",
+        "suggestion": "改写"
+      }
+    ],
+    "far": [],
+    "sections": [
+      [
+        {
+          "issues": [],
+          "wordCount": 16
+        },
+        true,
+        []
+      ],
+      [
+        {
+          "issues": [],
+          "wordCount": 16
+        },
+        false,
+        []
+      ],
+      [
+        {
+          "issues": [],
+          "wordCount": 16
+        },
+        true,
+        []
+      ],
+      [
+        {
+          "issues": [],
+          "wordCount": 16
+        },
+        false,
+        []
+      ],
+      [
+        {
+          "issues": [
+            {
+              "type": "placeholder",
+              "severity": "error",
+              "message": "第4章包含未完成的占位符文本: \"TBD\""
+            }
+          ],
+          "wordCount": 21
+        },
+        false,
+        []
+      ],
+      [
+        {
+          "issues": [
+            {
+              "type": "injury_contradiction",
+              "severity": "error",
+              "message": "第4章伤势矛盾：林默在第2章记录“左臂骨裂”尚未痊愈，本章却出现“完好无损的左臂”",
+              "sourceChapter": 2,
+              "character": "林默"
+            }
+          ],
+          "wordCount": 28
+        },
+        false,
+        []
+      ],
+      [
+        {
+          "issues": [
+            {
+              "type": "secret_leak",
+              "severity": "error",
+              "message": "第4章秘密知情边界越界：林默在第1章被标记为不知情（夹层藏有账本），本章却无铺垫知晓该秘密",
+              "sourceChapter": 1,
+              "character": "林默"
+            }
+          ],
+          "wordCount": 12
+        },
+        false,
+        []
+      ],
+      [
+        {
+          "issues": [
+            {
+              "type": "pov_violation",
+              "severity": "warning",
+              "message": "第4章视角越界：第一人称视角下直接描写了「林默」的不可见内心活动"
+            }
+          ],
+          "wordCount": 26
+        },
+        true,
+        []
+      ],
+      [
+        {
+          "issues": [
+            {
+              "type": "word_count",
+              "severity": "error",
+              "message": "第4章字数过少（当前 2 字，低于下限 12 字）"
+            }
+          ],
+          "wordCount": 2
+        },
+        false,
+        []
+      ],
+      [
+        {
+          "issues": [
+            {
+              "type": "empty_chapter",
+              "severity": "error",
+              "message": "第4章正文为空"
+            }
+          ],
+          "wordCount": 0
+        },
+        false,
+        []
+      ]
+    ]
+  },
+  "test_style_guide_heading_and_seam_cleanup": [
+    {
+      "narrativeVoice": "紧贴视角 克制🙂",
+      "dialogueRules": [
+        "沉稳",
+        "短促"
+      ],
+      "domainTaboos": [
+        "朝代保持一致"
+      ],
+      "forbiddenCliches": [
+        "空气凝固",
+        "瞳孔骤缩"
+      ]
+    },
+    [
+      "叙事：紧贴视角 克制🙂",
+      "对白：沉稳",
+      "对白：短促",
+      "考据禁区：朝代保持一致",
+      "禁用套话：空气凝固",
+      "禁用套话：瞳孔骤缩"
+    ],
+    [
+      "许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。",
+      "暮色慢慢落在码头最外侧那盏多年未曾换下的旧油灯上。风从沉睡的街道尽头带来潮水即将上涨的气息。\n\n许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。",
+      "暮色慢慢落在码头最外侧那盏多年未曾换下的新油灯上。风从沉睡的街道尽头带来潮水即将上涨的气息。\n\n许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。",
+      "暮色慢慢落在码头最外侧那盏多年未曾换下的旧油灯上。“风从沉睡的街道尽头带来潮水即将上涨的气息。\n\n许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。",
+      "暮色慢慢落在码头最外侧那盏多年未曾换下的旧油灯上。风从沉睡的街道尽头带来潮水即将上涨的气息。\n\n许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。",
+      "第3章 下一章\n\n许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。",
+      "第2章 雾港回声\n许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。许言拾起漏在门边的钥匙并抬头确认界碑。"
+    ]
+  ],
+  "test_normalization_ordered_replay_and_rankings": {
+    "deltas": [
+      {
+        "version": 1,
+        "characterStates": [
+          {
+            "name": "林默",
+            "seen": true,
+            "currentGoal": "找回船灯",
+            "relationships": {
+              "苏红": "愿意结盟"
+            }
+          }
+        ],
+        "constraints": [
+          {
+            "id": "constraints-4-1",
+            "isNew": true,
+            "text": "潮门规则",
+            "characters": [
+              "林默"
+            ]
+          },
+          {
+            "id": "constraints-4-3",
+            "isNew": true,
+            "text": "Emoji 也是原文"
+          }
+        ],
+        "commitments": [
+          {
+            "id": "commitments-4-1",
+            "isNew": true,
+            "text": "天亮前回来",
+            "deadline": "次日天亮"
+          }
+        ],
+        "subplots": [
+          {
+            "id": "subplots-4-1",
+            "isNew": true,
+            "text": "调查失落的座钟"
+          }
+        ]
+      },
+      {
+        "version": 1,
+        "characterStates": [
+          {
+            "name": "林默",
+            "seen": false,
+            "currentGoal": null,
+            "stance": "改为观望",
+            "relationships": {
+              "苏红": "暂不同行"
+            }
+          }
+        ],
+        "commitments": [
+          {
+            "id": "commitments-4-1",
+            "isNew": false,
+            "status": "fulfilled",
+            "deadline": null
+          },
+          {
+            "id": "unknown-id",
+            "isNew": false,
+            "text": "没有前序记录"
+          }
+        ],
+        "subplots": [
+          {
+            "id": "subplots-4-1",
+            "isNew": false,
+            "status": "resolved"
+          }
+        ]
+      },
+      null
+    ],
+    "memory": {
+      "characterStates": {
+        "林默": {
+          "sourceChapter": 4,
+          "lastSeenChapter": 4,
+          "currentGoal": null,
+          "emotion": null,
+          "stance": "改为观望",
+          "relationships": {
+            "苏红": {
+              "change": "暂不同行",
+              "sourceChapter": 4,
+              "updatedAtChapter": 8
+            }
+          },
+          "updatedAtChapter": 8
+        }
+      },
+      "constraints": [
+        {
+          "id": "constraints-4-1",
+          "sourceChapter": 4,
+          "status": "active",
+          "characters": [
+            "林默"
+          ],
+          "updatedAtChapter": 4,
+          "text": "潮门规则"
+        },
+        {
+          "id": "constraints-4-3",
+          "sourceChapter": 4,
+          "status": "active",
+          "characters": [],
+          "updatedAtChapter": 4,
+          "text": "Emoji 也是原文"
+        }
+      ],
+      "commitments": [
+        {
+          "id": "commitments-4-1",
+          "sourceChapter": 4,
+          "status": "fulfilled",
+          "characters": [],
+          "deadline": null,
+          "updatedAtChapter": 8,
+          "text": "天亮前回来"
+        }
+      ],
+      "subplots": [
+        {
+          "id": "subplots-4-1",
+          "sourceChapter": 4,
+          "status": "resolved",
+          "characters": [],
+          "updatedAtChapter": 8,
+          "text": "调查失落的座钟"
+        }
+      ]
+    },
+    "lead": "林默",
+    "active": [
+      {
+        "id": "constraints-4-1",
+        "sourceChapter": 4,
+        "status": "active",
+        "characters": [
+          "林默"
+        ],
+        "updatedAtChapter": 4,
+        "text": "潮门规则"
+      },
+      {
+        "id": "constraints-4-3",
+        "sourceChapter": 4,
+        "status": "active",
+        "characters": [],
+        "updatedAtChapter": 4,
+        "text": "Emoji 也是原文"
+      }
+    ],
+    "volume": {
+      "mainline": "潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮潮🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂",
+      "turningPoints": [
+        {
+          "chapter": 1,
+          "text": "起点"
+        },
+        {
+          "chapter": 10,
+          "text": "转折"
+        },
+        {
+          "chapter": 2,
+          "text": "甲"
+        },
+        {
+          "chapter": 3,
+          "text": "乙"
+        }
+      ]
+    },
+    "characters": [
+      {
+        "key": "林默",
+        "value": {
+          "sourceChapter": 1,
+          "name": "林默",
+          "state": {
+            "sourceChapter": 4,
+            "lastSeenChapter": 4,
+            "currentGoal": null,
+            "emotion": null,
+            "stance": "改为观望",
+            "relationships": {
+              "苏红": {
+                "change": "暂不同行",
+                "sourceChapter": 4,
+                "updatedAtChapter": 8
+              }
+            },
+            "updatedAtChapter": 8
+          }
+        }
+      },
+      {
+        "key": "角色00",
+        "value": {
+          "sourceChapter": 1,
+          "name": "角色00"
+        }
+      },
+      {
+        "key": "角色34",
+        "value": {
+          "sourceChapter": 35,
+          "name": "角色34"
+        }
+      },
+      {
+        "key": "角色33",
+        "value": {
+          "sourceChapter": 34,
+          "name": "角色33"
+        }
+      },
+      {
+        "key": "角色32",
+        "value": {
+          "sourceChapter": 33,
+          "name": "角色32"
+        }
+      },
+      {
+        "key": "角色31",
+        "value": {
+          "sourceChapter": 32,
+          "name": "角色31"
+        }
+      },
+      {
+        "key": "角色30",
+        "value": {
+          "sourceChapter": 31,
+          "name": "角色30"
+        }
+      },
+      {
+        "key": "角色29",
+        "value": {
+          "sourceChapter": 30,
+          "name": "角色29"
+        }
+      },
+      {
+        "key": "角色28",
+        "value": {
+          "sourceChapter": 29,
+          "name": "角色28"
+        }
+      },
+      {
+        "key": "角色27",
+        "value": {
+          "sourceChapter": 28,
+          "name": "角色27"
+        }
+      },
+      {
+        "key": "角色26",
+        "value": {
+          "sourceChapter": 27,
+          "name": "角色26"
+        }
+      },
+      {
+        "key": "角色25",
+        "value": {
+          "sourceChapter": 26,
+          "name": "角色25"
+        }
+      },
+      {
+        "key": "角色24",
+        "value": {
+          "sourceChapter": 25,
+          "name": "角色24"
+        }
+      },
+      {
+        "key": "角色23",
+        "value": {
+          "sourceChapter": 24,
+          "name": "角色23"
+        }
+      },
+      {
+        "key": "角色22",
+        "value": {
+          "sourceChapter": 23,
+          "name": "角色22"
+        }
+      },
+      {
+        "key": "角色21",
+        "value": {
+          "sourceChapter": 22,
+          "name": "角色21"
+        }
+      },
+      {
+        "key": "角色20",
+        "value": {
+          "sourceChapter": 21,
+          "name": "角色20"
+        }
+      },
+      {
+        "key": "角色19",
+        "value": {
+          "sourceChapter": 20,
+          "name": "角色19"
+        }
+      },
+      {
+        "key": "角色18",
+        "value": {
+          "sourceChapter": 19,
+          "name": "角色18"
+        }
+      },
+      {
+        "key": "角色17",
+        "value": {
+          "sourceChapter": 18,
+          "name": "角色17"
+        }
+      }
+    ]
+  },
+  "test_all_templates_with_legacy_and_extended_options": [
+    {
+      "system": "7e6aaab689e0e928582c5d2593b4b305dbfd30b55cf5f6ae6088e8df6159508d",
+      "prompt": "f4f3a0ed2b6b9a19c31bdb6787057e172df464fed8e3d1abb8e9be6952cce99d"
+    },
+    {
+      "system": "45861ef39dcef7f4b5ff3878b4dcae6b8ff4a609ab9d20f9506c8b4aa5c10cd0",
+      "prompt": "ca3a618f9f3b3f025cda16dfcb3caa354fcfe56ef3d885d463d541f099b799cd"
+    },
+    {
+      "system": "44b5a8b1df985c9d9423f5178df9b09e713c300ca233a64eff5b94c8f8706918",
+      "prompt": "236506f33e4e89495b1d70717defcac73a9b2eb69978f3942f76ad3b412be8f5"
+    },
+    {
+      "system": "b25592232a84506db5eb091ca3aea7cd7382a8df13c3447dc20d7b67a7b9307d",
+      "prompt": "4eefabe33ff275fba3aec5463203785a4523e106926b352edb330284f5183a58"
+    },
+    {
+      "system": "ce33d10e80bf559366707494807aa29ba5e4cc6fe670c634e0f44d9700cbf22f",
+      "prompt": "1ded4365172c9a9edfe18ebed62c1f6967dae83de35c101786998a5677692ceb"
+    },
+    {
+      "system": "83c38539ac2ea740356160afa70c13d5db42ca769a82fd83d6b3fa18d062bbb7",
+      "prompt": "5e3c392be1100e55e97aa77c44da2d8de51162ab69c84ba443e30571eaa5cae6"
+    },
+    {
+      "system": "b25592232a84506db5eb091ca3aea7cd7382a8df13c3447dc20d7b67a7b9307d",
+      "prompt": "92fdfbf75091ace67ec7cc266300ea1431715113a628f7cb04594ffe4c60f3c7"
+    },
+    {
+      "system": "59c7a9ae6d79804acf6c5541bc8a821d161b59f58ffe7359175c7527c2bc1605",
+      "prompt": "8a58f6d98d7df623ffbb59aa05e372fcde5dbb3a3303971efa5aca52067c6b8a"
+    },
+    {
+      "system": "046c0a133d1a4f2e22243385fa8f2c7bb658a29aa1cb8791d4f709f70e1139ad",
+      "prompt": "2b6cc82059898e6f6cffc3ba3abacf3b80c5c92059c88702737699e2e6a22bb1"
+    },
+    {
+      "system": "7670fdb597269c7618889b0f85391d9980a0da768058af6d650580ce8a32a2de",
+      "prompt": "6babe82b74ed781bd85940c14053c9b515738f6b44d8cf09e1cdf49d635dd40e"
+    },
+    {
+      "system": "65f6e000388b0008461ae8e5deebf17902b298affe25b8efa2f25b461772fc84",
+      "prompt": "654314a7cde280033e39959989c3280cf5e31be1b2f7e7c384b9cd4498d96d18"
+    },
+    {
+      "system": "66be4e9dc1d1360e9673ad63842c94afb16283efcda6e9ee314db5c19b435634",
+      "prompt": "c4c149becb76870e83a8058c32d8e261dc5f3bab9f3d75674d786c5a43f08b2d"
+    },
+    {
+      "system": "8db7843821668e8b6ea3de2a34d1590f9e2bc4e494454311debad9cd7d1fe250",
+      "prompt": "c29b17d539456c7499ac1a49fd9f3f243d032cf755b98df4bc63496711321664"
+    },
+    {
+      "system": "27c5e2cff94ffdeee618bb2c91543bdec305719f9bd2640d3ae0ebe0cc07ad42",
+      "prompt": "64d9c2e09d6ef71037483f1d8a2492e43fec17651c406c53d982b3d1a45872dd"
+    },
+    {
+      "system": "0f617fdfe763c9b969193d74be95bd0e9141702fc1853197679cf7ecaf37dee0",
+      "prompt": "e4134b1cfcf40701cc3ff8dda2b24a6c5c075d89ebfbd02973b645692c89d650"
+    }
+  ],
+  "test_fact_selection_prioritizes_matches_before_recency": {
+    "characters": {
+      "角色01": {
+        "name": "角色01",
+        "status": "active",
+        "location": "",
+        "role": "",
+        "sourceChapter": 1
+      },
+      "角色02": {
+        "name": "角色02",
+        "status": "active",
+        "location": "",
+        "role": "",
+        "sourceChapter": 2
+      },
+      "角色03": {
+        "name": "角色03",
+        "status": "active",
+        "location": "",
+        "role": "",
+        "sourceChapter": 3
+      },
+      "角色04": {
+        "name": "角色04",
+        "status": "active",
+        "location": "",
+        "role": "",
+        "sourceChapter": 4
+      },
+      "角色05": {
+        "name": "角色05",
+        "status": "active",
+        "location": "",
+        "role": "",
+        "sourceChapter": 5
+      },
+      "角色06": {
+        "name": "角色06",
+        "status": "active",
+        "location": "",
+        "role": "",
+        "sourceChapter": 6
+      },
+      "角色07": {
+        "name": "角色07",
+        "status": "active",
+        "location": "",
+        "role": "",
+        "sourceChapter": 7
+      },
+      "角色08": {
+        "name": "角色08",
+        "status": "active",
+        "location": "",
+        "role": "",
+        "sourceChapter": 8
+      },
+      "角色09": {
+        "name": "角色09",
+        "status": "active",
+        "location": "",
+        "role": "",
+        "sourceChapter": 9
+      },
+      "角色10": {
+        "name": "角色10",
+        "status": "active",
+        "location": "",
+        "role": "",
+        "sourceChapter": 10
+      },
+      "角色11": {
+        "name": "角色11",
+        "status": "active",
+        "location": "",
+        "role": "",
+        "sourceChapter": 11
+      },
+      "角色12": {
+        "name": "角色12",
+        "status": "active",
+        "location": "",
+        "role": "",
+        "sourceChapter": 12
+      },
+      "角色13": {
+        "name": "角色13",
+        "status": "active",
+        "location": "",
+        "role": "",
+        "sourceChapter": 13
+      },
+      "角色14": {
+        "name": "角色14",
+        "status": "active",
+        "location": "",
+        "role": "",
+        "sourceChapter": 14
+      },
+      "角色15": {
+        "name": "角色15",
+        "status": "active",
+        "location": "",
+        "role": "",
+        "sourceChapter": 15
+      },
+      "角色16": {
+        "name": "角色16",
+        "status": "active",
+        "location": "",
+        "role": "",
+        "sourceChapter": 16
+      },
+      "角色17": {
+        "name": "角色17",
+        "status": "active",
+        "location": "",
+        "role": "",
+        "sourceChapter": 17
+      },
+      "角色18": {
+        "name": "角色18",
+        "status": "active",
+        "location": "",
+        "role": "",
+        "sourceChapter": 18
+      },
+      "角色19": {
+        "name": "角色19",
+        "status": "active",
+        "location": "",
+        "role": "",
+        "sourceChapter": 19
+      },
+      "角色20": {
+        "name": "角色20",
+        "status": "active",
+        "location": "",
+        "role": "",
+        "sourceChapter": 20
+      },
+      "角色21": {
+        "name": "角色21",
+        "status": "active",
+        "location": "",
+        "role": "",
+        "sourceChapter": 21
+      },
+      "角色22": {
+        "name": "角色22",
+        "status": "active",
+        "location": "",
+        "role": "",
+        "sourceChapter": 22
+      },
+      "角色23": {
+        "name": "角色23",
+        "status": "active",
+        "location": "",
+        "role": "",
+        "sourceChapter": 23
+      },
+      "角色24": {
+        "name": "角色24",
+        "status": "active",
+        "location": "",
+        "role": "",
+        "sourceChapter": 24
+      },
+      "角色25": {
+        "name": "角色25",
+        "status": "active",
+        "location": "",
+        "role": "",
+        "sourceChapter": 25
+      },
+      "角色26": {
+        "name": "角色26",
+        "status": "active",
+        "location": "",
+        "role": "",
+        "sourceChapter": 26
+      },
+      "角色27": {
+        "name": "角色27",
+        "status": "active",
+        "location": "",
+        "role": "",
+        "sourceChapter": 27
+      },
+      "角色28": {
+        "name": "角色28",
+        "status": "active",
+        "location": "",
+        "role": "",
+        "sourceChapter": 28
+      },
+      "角色29": {
+        "name": "角色29",
+        "status": "active",
+        "location": "",
+        "role": "",
+        "sourceChapter": 29
+      },
+      "角色30": {
+        "name": "角色30",
+        "status": "active",
+        "location": "",
+        "role": "",
+        "sourceChapter": 30
+      },
+      "角色31": {
+        "name": "角色31",
+        "status": "active",
+        "location": "",
+        "role": "",
+        "sourceChapter": 31
+      },
+      "角色32": {
+        "name": "角色32",
+        "status": "active",
+        "location": "",
+        "role": "",
+        "sourceChapter": 32
+      },
+      "角色33": {
+        "name": "角色33",
+        "status": "active",
+        "location": "",
+        "role": "",
+        "sourceChapter": 33
+      },
+      "角色34": {
+        "name": "角色34",
+        "status": "active",
+        "location": "",
+        "role": "",
+        "sourceChapter": 34
+      },
+      "林默": {
+        "name": "林默",
+        "status": "active",
+        "location": "港口",
+        "role": "主角"
+      }
+    },
+    "activeInjuries": [
+      {
+        "character": "林默",
+        "active": true,
+        "sourceChapter": 3,
+        "description": "左臂受伤"
+      }
+    ],
+    "items": {
+      "铜钥匙": {
+        "name": "铜钥匙",
+        "owner": "林默",
+        "location": "袖袋",
+        "sourceChapter": 3
+      },
+      "物件28": {
+        "sourceChapter": 28,
+        "location": "船舱里船舱里船舱里船舱里船舱里船舱里"
+      },
+      "物件29": {
+        "sourceChapter": 29,
+        "location": "船舱里船舱里船舱里船舱里船舱里船舱里"
+      }
+    },
+    "secrets": [
+      {
+        "secret": "潮门规则",
+        "sourceChapter": 3,
+        "holders": [
+          "苏红"
+        ],
+        "excludedCharacters": [
+          "船长"
+        ]
+      }
+    ],
+    "openForeshadowing": [
+      {
+        "id": "still-open",
+        "clue": "谁在内舱",
+        "sourceChapter": 1,
+        "status": "planted"
+      }
+    ],
+    "recentTimeline": [
+      {
+        "event": "船员在章35靠岸",
+        "chapterNumber": 35,
+        "characters": [
+          "林默"
+        ]
+      },
+      {
+        "event": "船员在章36靠岸",
+        "chapterNumber": 36,
+        "characters": [
+          "林默"
+        ]
+      },
+      {
+        "event": "船员在章37靠岸",
+        "chapterNumber": 37,
+        "characters": [
+          "林默"
+        ]
+      },
+      {
+        "event": "船员在章38靠岸",
+        "chapterNumber": 38,
+        "characters": [
+          "林默"
+        ]
+      },
+      {
+        "event": "船员在章39靠岸",
+        "chapterNumber": 39,
+        "characters": [
+          "林默"
+        ]
+      }
+    ]
+  }
+}

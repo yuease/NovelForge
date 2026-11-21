@@ -1,0 +1,198 @@
+{
+  "title": "雾港🚢",
+  "fingerprint": "a234a3d6d3c256d37526e165feb0b3941640e4d910c80bf8a2c9fe6a83649e5e",
+  "archiveHash": "9add11e0289933793d3edb17f9f3465bda6460102e3f1296f32a42002ae7da65",
+  "job": {
+    "id": "legacy-node-book",
+    "title": "雾港🚢",
+    "premise": "",
+    "genre": "都市爽文",
+    "pov": "第三人称限知",
+    "targetWords": 30000,
+    "wordsPerChapter": 2000,
+    "totalChapters": 1,
+    "completedChapters": 2,
+    "totalWords": 42,
+    "status": "pending",
+    "stage": "init",
+    "progress": 0,
+    "llmConfig": {
+      "provider": "mock",
+      "baseUrl": "",
+      "apiKey": "",
+      "model": "mock-novel-v1",
+      "thinkingMode": "disabled",
+      "temperature": 0.7,
+      "timeoutMs": 300000,
+      "maxRetries": 5
+    },
+    "topicPackage": null,
+    "inspirationMode": "auto",
+    "testScenario": null,
+    "hotspotContext": null,
+    "styleGuide": "",
+    "memeLevel": "none",
+    "memeSourceMode": "active_only",
+    "maxRepairRetries": 2,
+    "enableDeAi": true,
+    "autoResumeOnRateLimit": true,
+    "autoRetryState": null,
+    "enableEvaluation": false,
+    "evalConfig": null,
+    "bookPlan": null,
+    "outlines": [],
+    "chapterIndex": {
+      "1": {
+        "chapterNumber": 1,
+        "title": "雾港🚢",
+        "wordCount": 21,
+        "status": "completed",
+        "repairCount": 0,
+        "updatedAt": "2025-01-01T00:00:00.000Z"
+      },
+      "2": {
+        "chapterNumber": 2,
+        "title": "雾港🚢",
+        "wordCount": 21,
+        "status": "needs_review",
+        "repairCount": 0,
+        "updatedAt": "2025-01-01T00:00:00.000Z"
+      }
+    },
+    "canonicalFacts": {
+      "characters": {},
+      "injuries": [],
+      "timeline": [],
+      "items": {},
+      "secrets": [],
+      "locations": {},
+      "foreshadowing": [],
+      "relations": [],
+      "factHistory": [
+        {
+          "chapter": 1,
+          "timestamp": "2025-01-01T00:00:00.000Z",
+          "delta": {
+            "memory": {
+              "version": 1,
+              "characterStates": [
+                {
+                  "name": "姚青",
+                  "seen": true,
+                  "currentGoal": "找回船灯"
+                }
+              ],
+              "constraints": [
+                {
+                  "id": "constraints-1-1",
+                  "isNew": true,
+                  "text": "潮门只能在退潮时开启"
+                }
+              ],
+              "commitments": [
+                {
+                  "id": "commitments-1-1",
+                  "isNew": true,
+                  "text": "天亮前回来",
+                  "deadline": "次日天亮"
+                }
+              ],
+              "subplots": [
+                {
+                  "id": "subplots-1-1",
+                  "isNew": true,
+                  "text": "调查旧船"
+                }
+              ]
+            }
+          }
+        }
+      ],
+      "characterStates": {
+        "姚青": {
+          "sourceChapter": 1,
+          "lastSeenChapter": 1,
+          "currentGoal": "找回船灯",
+          "emotion": null,
+          "stance": null,
+          "relationships": {},
+          "updatedAtChapter": 1
+        }
+      },
+      "constraints": [
+        {
+          "id": "constraints-1-1",
+          "sourceChapter": 1,
+          "status": "active",
+          "characters": [],
+          "updatedAtChapter": 1,
+          "text": "潮门只能在退潮时开启"
+        }
+      ],
+      "commitments": [
+        {
+          "id": "commitments-1-1",
+          "sourceChapter": 1,
+          "status": "active",
+          "characters": [],
+          "deadline": "次日天亮",
+          "updatedAtChapter": 1,
+          "text": "天亮前回来"
+        }
+      ],
+      "subplots": [
+        {
+          "id": "subplots-1-1",
+          "sourceChapter": 1,
+          "status": "active",
+          "characters": [],
+          "updatedAtChapter": 1,
+          "text": "调查旧船"
+        }
+      ],
+      "volumeSummaries": []
+    },
+    "checkpoint": null,
+    "tokenUsage": {
+      "promptTokens": 0,
+      "completionTokens": 0,
+      "totalTokens": 0
+    },
+    "stageStats": {},
+    "logs": [],
+    "repairLogs": [],
+    "auditReport": null,
+    "evaluationStatus": null,
+    "evaluationProgress": "",
+    "evaluationReport": null,
+    "error": null,
+    "createdAt": "2025-01-01T00:00:00.000Z",
+    "updatedAt": "2025-01-01T00:00:00.000Z"
+  },
+  "chapters": [
+    {
+      "chapterNumber": 1,
+      "title": "雾港🚢",
+      "content": "潮门只在退潮时开启。姚青说天亮前回来。\r\n继续航行",
+      "summary": "去往码头",
+      "wordCount": 21,
+      "status": "completed",
+      "verification": null,
+      "repairCount": 0,
+      "updatedAt": "2025-01-01T00:00:00.000Z",
+      "createdAt": "2025-01-01T00:00:00.000Z"
+    },
+    {
+      "chapterNumber": 2,
+      "title": "雾港🚢",
+      "content": "潮门只在退潮时开启。姚青说天亮前回来。\r\n继续航行",
+      "summary": "去往码头",
+      "wordCount": 21,
+      "status": "needs_review",
+      "verification": null,
+      "repairCount": 0,
+      "updatedAt": "2025-01-01T00:00:00.000Z",
+      "createdAt": "2025-01-01T00:00:00.000Z"
+    }
+  ]
+}

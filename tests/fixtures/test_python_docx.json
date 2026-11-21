@@ -1,0 +1,9 @@
+{
+  "test_all_xml_parts_match_the_compatible_document": {
+    "[Content_Types].xml": "df3cf9f0d680dd163320b48cb39e90eca75b4d797269a33e797d4dc705c52df3",
+    "_rels/.rels": "e9369a2425724259c87f4b280c2466ca505ff37212fdb8daeccdfd73ffb27101",
+    "word/_rels/document.xml.rels": "c4424d40b3965466e429ebc82690c78d98dc094bb3163b45d731182baa3fac73",
+    "word/styles.xml": "4b20e05ee01f784890fe10f71714c82ec404856aabe2473232c636e78fed5b8c",
+    "word/document.xml": "cfe9ea5673b3763206defb58b42a7483fd52812ea0c98af551b381ef7981becb"
+  }
+}

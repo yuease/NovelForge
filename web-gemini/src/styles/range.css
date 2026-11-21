@@ -1,0 +1,19 @@
+/* Range input thumb */
+.nf-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--nf-surface);
+  border: 2px solid var(--nf-primary);
+  box-shadow: var(--shadow-card);
+  transition: transform .15s, box-shadow .15s;
+}
+.nf-range::-webkit-slider-thumb:hover { transform: scale(1.12); box-shadow: 0 0 0 6px rgb(66 133 244 / .14); }
+.nf-range::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--nf-surface);
+  border: 2px solid var(--nf-primary);
+}

@@ -1,0 +1,261 @@
+@import "tailwindcss";
+
+/* =========================================================================
+   NovelForge · Gemini design tokens
+   Palette derived from the Gemini spark: blue / red / yellow / green.
+   RULE: components only use these tokens. Never use Tailwind's raw palette
+   (no `bg-sky-500`, `text-emerald-700`, `amber-*` ...).
+   ========================================================================= */
+
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
+
+@theme {
+  /* Brand – the four Gemini colors */
+  --color-g-blue: #4285f4;
+  --color-g-red: #ea4335;
+  --color-g-yellow: #fbbc04;
+  --color-g-green: #34a853;
+
+  /* Semantic, mapped to CSS vars so dark mode can swap them */
+  --color-canvas: var(--nf-canvas);
+  --color-surface: var(--nf-surface);
+  --color-surface-2: var(--nf-surface-2);
+  --color-surface-3: var(--nf-surface-3);
+  --color-line: var(--nf-line);
+  --color-line-strong: var(--nf-line-strong);
+  --color-ink: var(--nf-ink);
+  --color-body: var(--nf-body);
+  --color-muted: var(--nf-muted);
+
+  --color-primary: var(--nf-primary);
+  --color-primary-strong: var(--nf-primary-strong);
+  --color-primary-soft: var(--nf-primary-soft);
+  --color-on-primary: var(--nf-on-primary);
+
+  --color-success: var(--nf-success);
+  --color-success-soft: var(--nf-success-soft);
+  --color-warning: var(--nf-warning);
+  --color-warning-soft: var(--nf-warning-soft);
+  --color-danger: var(--nf-danger);
+  --color-danger-soft: var(--nf-danger-soft);
+  --color-info: var(--nf-primary);
+  --color-info-soft: var(--nf-primary-soft);
+
+  /* Type scale – only these */
+  --text-caption: 12px;
+  --text-caption--line-height: 1.5;
+  --text-body: 14px;
+  --text-body--line-height: 1.6;
+  --text-title: 16px;
+  --text-title--line-height: 1.45;
+  --text-headline: 22px;
+  --text-headline--line-height: 1.3;
+  --text-display: 32px;
+  --text-display--line-height: 1.2;
+
+  /* Radius – only these */
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 20px;
+  --radius-xl: 28px;
+
+  --font-sans: "Google Sans Text", "Google Sans", Inter, "PingFang SC", "Microsoft YaHei UI", "Microsoft YaHei", system-ui, sans-serif;
+  --font-display: "Google Sans", "Google Sans Text", Inter, "PingFang SC", "Microsoft YaHei UI", system-ui, sans-serif;
+  --font-serif: "Noto Serif SC", "Source Han Serif SC", "Songti SC", SimSun, Georgia, serif;
+  --font-mono: "JetBrains Mono", "Cascadia Code", Consolas, monospace;
+
+  --shadow-card: 0 1px 2px rgb(60 64 67 / .06), 0 1px 3px 1px rgb(60 64 67 / .04);
+  --shadow-raised: 0 1px 3px rgb(60 64 67 / .10), 0 4px 12px 2px rgb(60 64 67 / .08);
+  --shadow-float: 0 8px 28px rgb(32 33 36 / .14), 0 2px 6px rgb(32 33 36 / .08);
+
+  --ease-emphasized: cubic-bezier(.2, 0, 0, 1);
+  --ease-standard: cubic-bezier(.2, 0, 0, 1);
+
+  --animate-spark-spin: spark-spin 6s linear infinite;
+  --animate-shimmer: shimmer 1.6s linear infinite;
+  --animate-flow: gradient-flow 3s linear infinite;
+  --animate-breathe: breathe 2.4s ease-in-out infinite;
+
+  @keyframes spark-spin { to { transform: rotate(360deg); } }
+  @keyframes shimmer { from { background-position: 200% 0; } to { background-position: -200% 0; } }
+  @keyframes gradient-flow { from { background-position: 0% 50%; } to { background-position: 200% 50%; } }
+  @keyframes breathe { 0%, 100% { opacity: .55; transform: scale(.92); } 50% { opacity: 1; transform: scale(1); } }
+}
+
+:root {
+  --nf-canvas: #f8fafd;
+  --nf-surface: #ffffff;
+  --nf-surface-2: #f0f4f9;
+  --nf-surface-3: #e9eef6;
+  --nf-line: #e3e8ef;
+  --nf-line-strong: #c4c7c5;
+  --nf-ink: #1f1f1f;
+  --nf-body: #444746;
+  --nf-muted: #6b6f72;
+
+  --nf-primary: #0b57d0;
+  --nf-primary-strong: #0842a0;
+  --nf-primary-soft: #e8f0fe;
+  --nf-on-primary: #ffffff;
+
+  --nf-success: #146c2e;
+  --nf-success-soft: #e6f4ea;
+  --nf-warning: #8a5a00;
+  --nf-warning-soft: #fef7e0;
+  --nf-danger: #b3261e;
+  --nf-danger-soft: #fce8e6;
+
+  /* The signature gradient. Use sparingly: brand, primary CTA glow, progress, AI states. */
+  --nf-gradient: linear-gradient(100deg, #4285f4 0%, #9b72cb 35%, #d96570 65%, #fbbc04 100%);
+  --nf-gradient-spark: conic-gradient(from 200deg, #ea4335, #fbbc04, #34a853, #4285f4, #ea4335);
+  --nf-gradient-soft: linear-gradient(120deg, rgb(66 133 244 / .10), rgb(155 114 203 / .08) 45%, rgb(251 188 4 / .08));
+
+  color-scheme: light;
+}
+
+[data-theme="dark"] {
+  --nf-canvas: #131314;
+  --nf-surface: #1e1f20;
+  --nf-surface-2: #282a2c;
+  --nf-surface-3: #333537;
+  --nf-line: #333537;
+  --nf-line-strong: #444746;
+  --nf-ink: #e3e3e3;
+  --nf-body: #c4c7c5;
+  --nf-muted: #9aa0a6;
+
+  --nf-primary: #a8c7fa;
+  --nf-primary-strong: #d3e3fd;
+  --nf-primary-soft: rgb(168 199 250 / .14);
+  --nf-on-primary: #062e6f;
+
+  --nf-success: #6dd58c;
+  --nf-success-soft: rgb(109 213 140 / .14);
+  --nf-warning: #fdd663;
+  --nf-warning-soft: rgb(253 214 99 / .14);
+  --nf-danger: #f2b8b5;
+  --nf-danger-soft: rgb(242 184 181 / .14);
+
+  --nf-gradient-soft: linear-gradient(120deg, rgb(66 133 244 / .16), rgb(155 114 203 / .12) 45%, rgb(251 188 4 / .08));
+  --shadow-card: 0 0 0 1px rgb(255 255 255 / .04);
+  --shadow-raised: 0 4px 16px rgb(0 0 0 / .4);
+  --shadow-float: 0 12px 36px rgb(0 0 0 / .55);
+
+  color-scheme: dark;
+}
+
+@layer base {
+  html { background: var(--nf-canvas); }
+  body {
+    margin: 0;
+    background: var(--nf-canvas);
+    color: var(--nf-ink);
+    font-family: var(--font-sans);
+    font-size: var(--text-body);
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+    font-synthesis: none;
+    transition: background-color .3s var(--ease-standard), color .3s var(--ease-standard);
+  }
+  h1, h2, h3, h4 { font-family: var(--font-display); color: var(--nf-ink); margin: 0; }
+  button:not(:disabled), summary, select:not(:disabled), [role="button"] { cursor: pointer; }
+  button:disabled { cursor: not-allowed; }
+  input::placeholder, textarea::placeholder { color: var(--nf-muted); opacity: .8; }
+  ::selection { background: rgb(66 133 244 / .22); }
+  :focus-visible { outline: 2px solid var(--nf-primary); outline-offset: 2px; }
+  * { scrollbar-color: var(--nf-line-strong) transparent; scrollbar-width: thin; }
+}
+
+/* ---------- Signature utilities ---------- */
+@layer components {
+  .nf-gradient-text {
+    background: var(--nf-gradient);
+    background-size: 200% 100%;
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+  .nf-gradient-text.is-animated { animation: var(--animate-flow); }
+
+  .nf-gradient-bg { background: var(--nf-gradient); background-size: 200% 100%; }
+  .nf-gradient-bg.is-animated { animation: var(--animate-flow); }
+
+  /* Rotating conic border – for "AI is working" surfaces. */
+  .nf-glow-border {
+    position: relative;
+    border-color: transparent !important;
+    box-shadow: 0 0 28px -8px rgb(66 133 244 / .45), 0 0 36px -14px rgb(234 67 53 / .35);
+  }
+  .nf-glow-border::before {
+    content: "";
+    position: absolute;
+    inset: -1px;
+    z-index: 1;
+    padding: 1.5px;
+    border-radius: inherit;
+    pointer-events: none;
+    background: conic-gradient(from var(--nf-angle), #4285f4, #9b72cb, #ea4335, #fbbc04, #34a853, #4285f4);
+    -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+    -webkit-mask-composite: xor;
+    mask: linear-gradient(#000 0 0) content-box exclude, linear-gradient(#000 0 0);
+    animation: nf-angle 4s linear infinite;
+  }
+
+  .nf-skeleton {
+    background: linear-gradient(90deg, var(--nf-surface-2) 25%, var(--nf-surface-3) 50%, var(--nf-surface-2) 75%);
+    background-size: 200% 100%;
+    animation: var(--animate-shimmer);
+    border-radius: var(--radius-sm);
+  }
+
+  /* Reading typography for novel text */
+  .nf-prose {
+    font-family: var(--font-serif);
+    font-size: 17px;
+    line-height: 2;
+    color: var(--nf-ink);
+    letter-spacing: .02em;
+  }
+  .nf-prose p { margin: 0 0 1em; text-indent: 2em; }
+}
+
+@property --nf-angle {
+  syntax: "<angle>";
+  initial-value: 0deg;
+  inherits: false;
+}
+@keyframes nf-angle { to { --nf-angle: 360deg; } }
+
+/* Ambient background blobs (Gemini-like aura) */
+.nf-aura {
+  pointer-events: none;
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  overflow: hidden;
+}
+.nf-aura span {
+  position: absolute;
+  width: 46vmax;
+  height: 46vmax;
+  border-radius: 50%;
+  filter: blur(90px);
+  opacity: .16;
+  animation: nf-drift 28s ease-in-out infinite alternate;
+}
+[data-theme="dark"] .nf-aura span { opacity: .12; }
+.nf-aura span:nth-child(1) { background: #4285f4; top: -18vmax; right: -12vmax; }
+.nf-aura span:nth-child(2) { background: #9b72cb; bottom: -22vmax; right: 18vmax; animation-delay: -8s; opacity: .10; }
+.nf-aura span:nth-child(3) { background: #fbbc04; top: 30vh; left: -20vmax; animation-delay: -16s; opacity: .08; }
+@keyframes nf-drift {
+  0% { transform: translate3d(0, 0, 0) scale(1); }
+  100% { transform: translate3d(-6vmax, 5vmax, 0) scale(1.12); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: .001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: .001ms !important;
+  }
+}
