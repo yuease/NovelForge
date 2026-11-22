@@ -2,7 +2,7 @@
   "test_clip_quantiles_and_entry_priority": [
     {
       "system": "规则",
-      "prompt": "{\"ending\":\"过时旧事。\\n保留这个完整句子。\\n完整结尾🙂。\",\"summary\":\"开头摘要保留。后续不一定。\"}"
+      "prompt": "{\"ending\":\"过时旧事。\\n保留这个完整句子。\\n完整结尾🙂。\",\"summary\":\"开头摘要保留。\"}"
     },
     {
       "system": "规则",
@@ -10,7 +10,7 @@
     },
     {
       "system": "规则",
-      "prompt": "{\"continuity\":[{\"setting\":\"月港的硬约束\"}],\"cast\":[{\"lead\":\"林默\"},{\"role\":\"舵手\"}],\"ending\":\"旧情节。旧情节。旧情节。旧情节。旧情节。旧情节。留在原地。\",\"samples\":[\"下一条\"]}"
+      "prompt": "{\"continuity\":[{\"setting\":\"月港的硬约束\"}],\"cast\":[{\"lead\":\"林默\"},{\"role\":\"舵手\"}],\"ending\":\"留在原地。\",\"samples\":[]}"
     }
   ],
   "test_grounded_quotes_and_degradation": {
@@ -542,11 +542,11 @@
     },
     {
       "system": "3e8adf2b8b6a05b5b9fee3c0dc7be731d1ec164793673f3a85fea20da8e5dad6",
-      "prompt": "3695e93754f5afd4deee8fa19ffb77c10f2bcc168990f2d585d0a7864cad61f2"
+      "prompt": "5634e97f8f3f1aa7bb0d59b9f876dbceeb909c955e6f671e647cde033e6506b0"
     },
     {
       "system": "82c468287f1d4a8dc7899fd9063b6719f7f4d79a40c991528988672a4831a474",
-      "prompt": "282023526ab364169f42da86dde780b88498c96090afe2b5ff937c092013152d"
+      "prompt": "594cca909718775a8c222ca5fcf6206a71090fc195f091d0a1b3d5b6cfdf6412"
     },
     {
       "system": "55e3f2b60cca7a1a4f0b484ded2f78d06529f187e88edfa4c8487a73dc95d591",
@@ -586,7 +586,7 @@
     },
     {
       "system": "6e5e51a0f7364f64a7e70aa82324c86c99ee11e8994390c9c1d486f0825eecae",
-      "prompt": "9af9ccae224852a1b3289782228e1f6f5d19bacd666137abc713b47cb87c3612"
+      "prompt": "3beeec59e2637f852a8a9d28256aac1f7929964fea1201850a9dfe27a725d7c5"
     }
   ],
   "test_fact_selection_prioritizes_matches_before_recency": {

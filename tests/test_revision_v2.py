@@ -1357,6 +1357,22 @@ class V2ValidationTest(unittest.TestCase):
             edit_patches({"patches": [patch], "coverage": []}, source, {1}, [])
         with self.assertRaisesRegex(RevisionContentError, "漏报裁决"):
             edit_patches({"patches": [], "coverage": []}, source, {1}, ["R001"])
+        # Batch feedback repair IDs (RF-*), ledger rule IDs (L-*), and unambiguous bare decisionIds
+        # are normalized/accepted, while genuinely foreign issue IDs still fail with an actionable message.
+        repair_patch = {"chapter": 1, "field": "content", "mode": "exact", "before": "独一无二的大段落。",
+                        "after": "修正后的大段落。", "reason": "按台账口径修正", "issueIds": ["RF-1", "L-rule1", "A11-2"]}
+        accepted = edit_patches(
+            {"patches": [repair_patch],
+             "coverage": [{"id": "RF-1", "outcome": "patched", "reason": "已落实"},
+                          {"id": "A11-2", "outcome": "patched", "reason": "已按第1章口径修订"}]},
+            source, {1}, ["A11-2@1"], known_aux_ids={"RF-1", "L-rule1"},
+        )
+        self.assertEqual(accepted["changed"][0]["content"], "开头。修正后的大段落。尾句。再过一会。尾句。")
+        self.assertIn("A11-2@1", accepted["coverage"])
+        self.assertNotIn("RF-1", accepted["coverage"])
+        foreign_patch = {**repair_patch, "issueIds": ["R999"]}
+        with self.assertRaisesRegex(RevisionContentError, "R999"):
+            edit_patches({"patches": [foreign_patch], "coverage": []}, source, {1}, [], known_aux_ids={"RF-1"})
         with TemporaryDirectory(ignore_cleanup_errors=True) as temp:
             store = RevisionStore(Path(temp) / "revision.sqlite3")
             store.create("run", "job", {}, {"ledgerVersion": 1})

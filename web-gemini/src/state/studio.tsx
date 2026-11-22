@@ -52,8 +52,8 @@ export interface StudioValue {
   loadJobDetails: (jobId: string) => Promise<void>
   clearLogs: () => void
 
-  /** Called after POST /jobs succeeds; selects the job and jumps to the monitor. */
-  onJobCreated: (job: JobRecord) => void
+  /** Registers a new job and selects it for its first action. */
+  onJobCreated: (job: JobRecord, destination?: 'monitor' | 'evaluation') => void
   updateJobConfig: (jobId: string, llmConfig: Partial<LLMConfig>) => Promise<void>
   resumeJob: (jobId: string, llmConfig?: Partial<LLMConfig>) => Promise<void>
   pauseJob: (jobId: string) => Promise<void>
@@ -144,6 +144,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
   const [jobs, setJobs] = useState<JobRecord[]>([])
   const [activeJobId, setActiveJobId] = useState<string | null>(() => localStorage.getItem(ACTIVE_JOB_STORAGE_KEY))
   const selectedId = useRef(activeJobId)
+  const jobsSeq = useRef(0)
   const detailsSeq = useRef(0)
   const [jobDetail, setJobDetail] = useState<JobRecord | null>(null)
   const [chapters, setChapters] = useState<ChapterRecord[]>([])
@@ -170,8 +171,10 @@ export function StudioProvider({ children }: { children: ReactNode }) {
   }, [])
 
   const refreshJobs = useCallback(async () => {
+    const seq = ++jobsSeq.current
     try {
       const res = await api.listJobs()
+      if (seq !== jobsSeq.current) return
       const list = Array.isArray(res.jobs) ? res.jobs : []
       setJobs(list)
       setService('online')
@@ -183,7 +186,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
         selectJob(preferred?.id ?? null)
       }
     } catch {
-      setService('offline')
+      if (seq === jobsSeq.current) setService('offline')
     }
   }, [selectJob])
 
@@ -273,12 +276,13 @@ export function StudioProvider({ children }: { children: ReactNode }) {
     return () => { es.close(); setSseConnected(false) }
   }, [activeJobId, loadJobDetails])
 
-  const onJobCreated = useCallback((job: JobRecord) => {
+  const onJobCreated = useCallback((job: JobRecord, destination: 'monitor' | 'evaluation' = 'monitor') => {
+    jobsSeq.current += 1
     setJobs((prev) => [job, ...prev.filter((j) => j.id !== job.id)])
     selectJob(job.id)
     setJobDetail(job)
     setPrefill(null)
-    navigate('monitor')
+    navigate(destination)
   }, [selectJob])
 
   const updateJobConfig = useCallback(async (jobId: string, llmConfig: Partial<LLMConfig>) => {

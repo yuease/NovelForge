@@ -89,7 +89,11 @@ class FastApiBackendTests(unittest.TestCase):
 
     def test_react_api_and_chapter_repair(self):
         self.start_server()
-        self.assertIn("<html", self.request("GET", "/").text)
+        if (Path(__file__).resolve().parent.parent / "web-gemini" / "dist" / "index.html").exists():
+            self.assertIn("<html", self.request("GET", "/").text)
+        else:
+            missing = self.request("GET", "/", status=404).json()
+            self.assertIn("React build missing", missing.get("error", ""))
         self.assertTrue(self.request("GET", "/api/hotspots").json()["tropes"])
         self.request("GET", "/api/memes")
         self.request("GET", "/api/config/providers?provider=mock")
@@ -264,3 +268,38 @@ class FastApiBackendTests(unittest.TestCase):
         self.assertEqual(detail["job"]["title"], "旧项目")
         self.assertEqual(detail["chapters"][0]["content"], "旧小说")
         self.assertEqual(old_job.read_text(encoding="utf-8"), source)
+
+    def test_rejects_cross_origin_and_allows_loopback_cors(self):
+        self.start_server()
+        evil = {"Origin": "https://evil.example"}
+        preflight = self.client.options(
+            self.base + "/api/config/providers",
+            headers={**evil, "Access-Control-Request-Method": "PUT"},
+        )
+        self.assertEqual(preflight.status_code, 403)
+        self.assertNotIn("access-control-allow-origin", preflight.headers)
+
+        blocked_get = self.client.get(self.base + "/api/jobs", headers=evil)
+        self.assertEqual(blocked_get.status_code, 403)
+        self.assertNotIn("access-control-allow-origin", blocked_get.headers)
+
+        blocked_null = self.client.post(self.base + "/api/jobs", headers={"Origin": "null"}, json={})
+        self.assertEqual(blocked_null.status_code, 403)
+
+        blocked_fetch = self.client.post(
+            self.base + "/api/jobs",
+            headers={"Sec-Fetch-Site": "cross-site"},
+            json={},
+        )
+        self.assertEqual(blocked_fetch.status_code, 403)
+
+        allowed = self.client.get(self.base + "/api/jobs", headers={"Origin": "http://127.0.0.1:3457"})
+        self.assertEqual(allowed.status_code, 200)
+        self.assertEqual(allowed.headers.get("access-control-allow-origin"), "http://127.0.0.1:3457")
+
+        vite = self.client.options(
+            self.base + "/api/jobs",
+            headers={"Origin": "http://localhost:5173", "Access-Control-Request-Method": "POST"},
+        )
+        self.assertEqual(vite.status_code, 200)
+        self.assertEqual(vite.headers.get("access-control-allow-origin"), "http://localhost:5173")

@@ -111,6 +111,7 @@ PATCH = """
 "startAnchor":"唯一开头","endAnchor":"唯一结尾","after":"替换稿","issueIds":["R001"],"reason":"改法"}],
 "coverage":[{"id":"R001","outcome":"patched|already_met|needs_review","reason":"依据","chapter":1,"quote":"连续原文"}]}。
 每条 requiredIssues 都给出 coverage。patched 需要有对应补丁；already_met 需要可核验原文。
+patches[].issueIds 与 coverage[].id 仅填写本批 requiredIssues 中的编号；仅对应 feedback/repair（如 RF-xxx）或 ledger.rules（如 L-xxx）的补丁，issueIds 留空数组 []。
 判断无需改正文但无法引用具体原句时，使用 needs_review 并说明原因，交给独立终审核对。
 ledger.issues 中带章号的编号仅用于该章。全书统一项命中时先读该章语境，合规用法可以保留并解释。
 需要压缩节奏时，优先合并重复的动作、场面或解释。保留读者理解人物选择、后果与风险所需的精确信息。
@@ -618,12 +619,24 @@ class RevisionWorkflowV2(RevisionRuntime):
                 issue["id"] for issue in value["ledger"]["issues"]
                 if issue["decisionId"] in record.get("authorAnswers", {}) or financial_text(issue)
             }
+            aux_ids = {
+                row["id"] for row in (*value["ledger"]["rules"], *value["ledger"]["checks"])
+                if isinstance(row, dict) and isinstance(row.get("id"), str)
+            }
+            for fb in value["feedback"]:
+                repair = fb.get("repair") if isinstance(fb, dict) else None
+                if isinstance(repair, dict):
+                    if isinstance(repair.get("id"), str):
+                        aux_ids.add(repair["id"])
+                    for basis in repair.get("basis") or ():
+                        if isinstance(basis, dict) and isinstance(basis.get("ruleId"), str):
+                            aux_ids.add(basis["ruleId"])
 
             def validate(result, *, allow_deferred=False):
                 accepted = edit_patches(
                     {"patches": [], "coverage": []} if record["isMock"] else result, base, allowed,
                     value["requiredIssues"], allow_deferred=allow_deferred,
-                    protected_chapters=protected, protected_ids=protected_ids,
+                    protected_chapters=protected, protected_ids=protected_ids, known_aux_ids=aux_ids,
                 )
                 if accepted.get("deferred"):
                     issue_keys = {item["id"]: issue_fingerprint(item) for item in value["ledger"]["issues"]}

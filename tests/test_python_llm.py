@@ -710,6 +710,9 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
         ]
         reference = json.loads(FIXTURE.read_text(encoding="utf-8"))["test_mock_outputs_and_token_estimates_are_deterministic"]
         self.assertEqual([llm.estimate_tokens(text) for text in samples], reference["tokens"])
+        compact_hash = json.dumps({"clue": sha256(b"novelforge").hexdigest()}, separators=(",", ":"))
+        self.assertGreaterEqual(llm.estimate_tokens(compact_hash), 39)
+        self.assertGreaterEqual(llm.estimate_tokens("https://api.openai.com/v1/responses?foo=bar&baz=1234567890"), 25)
         self.assertEqual(len(cases), len(reference["replies"]))
         for case, expected in zip(cases, reference["replies"]):
             with self.subTest(task=case["system"]):

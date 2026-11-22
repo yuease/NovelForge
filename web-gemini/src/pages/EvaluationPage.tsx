@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useState } from 'react'
 import type { ReactNode } from 'react'
 import { AnimatePresence, motion } from 'motion/react'
-import { CheckCircle2, Eye, FileSearch, ListChecks, Play, Quote, Sparkles, Star, ThumbsDown, ThumbsUp, Wand2 } from 'lucide-react'
+import { CheckCircle2, Eye, FileSearch, FileUp, ListChecks, Play, Quote, Sparkles, Star, ThumbsDown, ThumbsUp, Wand2 } from 'lucide-react'
 import { api, REVISION_DISPATCHED } from '../lib/api'
+import type { ManuscriptImportResult } from '../lib/api'
 import { cn } from '../lib/cn'
 import { navigate } from '../lib/router'
 import { formatDateTime, formatNumber, messageOf } from '../lib/format'
@@ -14,6 +15,7 @@ import {
   Segmented, Select, Stagger, StaggerItem, Tag, Thinking, useToast,
 } from '../components/ui'
 import { isModelChoiceReady, ModelPicker, resolveSelectedModel, useModelCatalog } from '../components/model/ModelPicker'
+import ImportManuscriptDrawer from '../components/ImportManuscriptDrawer'
 import RevisionPanel from './RevisionPanel'
 
 type SixKey = keyof NonNullable<BookEvaluationReport['sixDimensions']>
@@ -49,8 +51,10 @@ type Mode = 'full' | 'flash_only' | 'pro_only'
 const failedBatch = (batch: { timelineSummary?: string }) => /^JSON\s*解析失败/.test(batch.timelineSummary || '')
 
 export default function EvaluationPage() {
-  const { jobs, activeJob, selectJob, loadJobDetails } = useStudio()
+  const { jobs, activeJob, selectJob, loadJobDetails, onJobCreated } = useStudio()
   const toast = useToast()
+  const [importOpen, setImportOpen] = useState(false)
+  const [importResult, setImportResult] = useState<ManuscriptImportResult | null>(null)
   const [mode, setMode] = useState<Mode>('full')
   const [revisionRefresh, setRevisionRefresh] = useState(0)
   useEffect(() => {
@@ -178,10 +182,35 @@ export default function EvaluationPage() {
     }
   }
 
+  const heading = (
+    <>
+      <PageHeader
+        title="作品评估"
+        description="初审分批查找全书问题，精读给出六维评分和开篇反馈。"
+        actions={(
+          <>
+            <Button variant="tonal" icon={<FileUp className="size-4" />} onClick={() => setImportOpen(true)}>导入 TXT</Button>
+            {activeJob && <Select aria-label="选择待评估的作品" value={activeJob.id} onChange={(e) => selectJob(e.target.value)} className="h-10 max-w-xs rounded-full">
+              {jobs.map((j) => (
+                <option key={j.id} value={j.id}>{j.title || j.id}（{j.completedChapters ?? 0}/{j.totalChapters} 章 · {formatNumber(j.totalWords)} 字）</option>
+              ))}
+            </Select>}
+          </>
+        )}
+      />
+      <ImportManuscriptDrawer open={importOpen} onClose={() => setImportOpen(false)} onImported={(result) => {
+        onJobCreated(result.job, 'evaluation')
+        setError(null)
+        setImportOpen(false)
+        setImportResult(result)
+      }} />
+    </>
+  )
+
   if (!activeJob) {
     return (
       <>
-        <PageHeader title="作品评估" description="初审分批查找问题，精读给出六维评分与开篇反馈。" />
+        {heading}
         <EmptyState icon={<Sparkles />} title="还没有可评估的作品" action={<Button variant="primary" onClick={() => navigate(jobs.length ? 'monitor' : 'create')}>{jobs.length ? '选择作品' : '新建作品'}</Button>} />
       </>
     )
@@ -191,17 +220,24 @@ export default function EvaluationPage() {
 
   return (
     <>
-      <PageHeader
-        title="作品评估"
-        description="初审分批查找全书问题，精读给出六维评分和开篇反馈。"
-        actions={
-            <Select aria-label="选择待评估的作品" value={activeJob.id} onChange={(e) => selectJob(e.target.value)} className="h-10 max-w-xs rounded-full">
-              {jobs.map((j) => (
-                <option key={j.id} value={j.id}>{j.title || j.id}（{j.completedChapters ?? 0}/{j.totalChapters} 章 · {formatNumber(j.totalWords)} 字）</option>
-              ))}
-            </Select>
-        }
-      />
+      {heading}
+      {importResult?.job.id === activeJob.id && (
+        <div className="mb-6 grid gap-2">
+          <Alert tone="success" title={`已导入《${activeJob.title || '导入作品'}》`} onClose={() => setImportResult(null)}>
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+              <span>{importResult.totalChapters} 章 · {formatNumber(importResult.totalWords)} 字</span>
+              <Button variant="ghost" size="sm" onClick={() => navigate('reader')}>打开成稿与导出</Button>
+            </div>
+          </Alert>
+          {importResult.warnings.length > 0 && (
+            <Alert tone="warning" title="导入提示">
+              <ul className="ml-4 list-disc space-y-1">
+                {importResult.warnings.map((warning, index) => <li key={index}>{warning}</li>)}
+              </ul>
+            </Alert>
+          )}
+        </div>
+      )}
 
       {/* Run panel */}
       <Card variant={running ? 'glow' : 'default'} padding="lg" className="mb-6">

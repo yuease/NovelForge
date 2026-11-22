@@ -612,18 +612,39 @@ def unique_at(text, anchor):
                                check="edit_anchor", anchor=anchor[:160], matches=len(hits), nearby=hint)
 
 
-def edit_patches(value, original, allowed, required, *, allow_deferred=False, protected_chapters=(), protected_ids=()):
+def edit_patches(value, original, allowed, required, *, allow_deferred=False,
+                 protected_chapters=(), protected_ids=(), known_aux_ids=()):
     expected = set(required)
+    aux_ids = {key for key in known_aux_ids if isinstance(key, str) and key} - expected
     patches, failures, edits = [], {}, {}
     for index, patch in enumerate(required_list(value, "patches"), 1):
         n, field, mode = patch.get("chapter"), patch.get("field"), patch.get("mode")
         if type(n) is not int or n not in allowed or field not in ("title", "content") or mode not in ("exact", "range"):
             raise RevisionContentError(f"第 {index} 条补丁的章节、字段或锚定方式无效。")
-        after, reason, ids = patch.get("after"), string(patch.get("reason"), 450), patch.get("issueIds", [])
+        after, reason, raw_ids = patch.get("after"), string(patch.get("reason"), 450), patch.get("issueIds", [])
         if not isinstance(after, str) or not reason or "\\ufffd" in after:
             raise RevisionContentError(f"第 {n} 章替换内容或说明无效。")
-        if not isinstance(ids, list) or any(not isinstance(key, str) or key not in expected for key in ids):
-            raise RevisionContentError("补丁引用了批次以外的裁决项。")
+        if not isinstance(raw_ids, list) or any(not isinstance(key, str) for key in raw_ids):
+            raise RevisionContentError("补丁的 issueIds 必须是字符串列表。")
+        ids, bad = [], []
+        for key in raw_ids:
+            if key in expected:
+                if key not in ids:
+                    ids.append(key)
+            elif f"{key}@{n}" in expected:
+                scoped_key = f"{key}@{n}"
+                if scoped_key not in ids:
+                    ids.append(scoped_key)
+            elif key in aux_ids:
+                continue
+            else:
+                bad.append(key)
+        if bad:
+            valid_hint = "、".join(sorted(expected)) or "空数组 []"
+            raise RevisionContentError(
+                f"补丁引用了批次以外的裁决项（{'、'.join(bad)}）；issueIds 仅填本批 requiredIssues（{valid_hint}），"
+                f"仅对应 feedback/repair 或台账规则的补丁留空 []。"
+            )
         if mode == "range" and field != "content":
             raise RevisionContentError("起止锚点只适用于本章正文。")
         anchors = [patch.get("before")] if mode == "exact" else [patch.get("startAnchor"), patch.get("endAnchor")]
@@ -633,9 +654,20 @@ def edit_patches(value, original, allowed, required, *, allow_deferred=False, pr
 
     disposition = {}
     for item in required_list(value, "coverage"):
+        key = item.get("id")
+        if isinstance(key, str) and key in aux_ids:
+            continue
         validate_reference_chapter(item, original)
-        key, outcome = item.get("id"), item.get("outcome")
+        outcome = item.get("outcome")
         reason = string(item.get("reason"), 500)
+        if isinstance(key, str) and key not in expected:
+            ref_chapter = chapter_number(item.get("chapter"))
+            if ref_chapter is not None and f"{key}@{ref_chapter}" in expected:
+                key = f"{key}@{ref_chapter}"
+            else:
+                matches = [candidate for candidate in expected if candidate.startswith(f"{key}@")]
+                if len(matches) == 1:
+                    key = matches[0]
         if (not isinstance(key, str) or key not in expected or key in disposition
                 or outcome not in ("patched", "already_met", "needs_review") or not reason):
             raise RevisionContentError("批次裁决覆盖记录无效。")
@@ -643,7 +675,7 @@ def edit_patches(value, original, allowed, required, *, allow_deferred=False, pr
             disposition[key] = {"id": key, "outcome": "needs_review", "reason": reason,
                                 "reviewNote": "编辑认为无需修改，缺少可核验引文，请独立复核。"}
         else:
-            disposition[key] = {**item, "reason": reason}
+            disposition[key] = {**item, "id": key, "reason": reason}
     if expected != set(disposition):
         raise RevisionContentError("批次漏报裁决覆盖：" + "、".join(sorted(expected - set(disposition))))
     proposed_ids = {key for *_, ids in patches for key in ids}

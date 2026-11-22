@@ -159,7 +159,7 @@ class HotspotTests(unittest.IsolatedAsyncioTestCase):
             text = json.dumps({"title": "实测题目", "premise": "实测梗概"}, ensure_ascii=False)
             return httpx.Response(200, json={"choices": [{"message": {"content": text}}]})
 
-        selected = hotspots.HOTSPOT_TROPES[1]
+        selected = next(item for item in hotspots.HOTSPOT_TROPES if item.get("pacingTemplate"))
         result = await hotspots.generate_concept(trope_id=selected["id"], keywords="新的题材词",
                                                  llm_config={"provider": "openai"}, store=store,
                                                  client=await self.client(handle))

@@ -282,6 +282,34 @@ class EvaluationTests(unittest.IsolatedAsyncioTestCase):
         findings = self.store.get_job_record(job_id)["evaluationReport"]["aiFlavorIssues"]
         self.assertEqual([finding.get("resolved", False) for finding in findings], [True, False])
 
+    async def test_clean_manuscript_allows_empty_issues_and_ready_to_submit(self):
+        job_id = self.book(3)
+        seen_systems = []
+
+        def handle(request):
+            _, _, span, system, _ = _request(request)
+            seen_systems.append((span, system))
+            if span == "pro":
+                return reply({
+                    "overallSummary": "成稿节奏紧凑，无硬伤，可直接投稿。",
+                    "readiness": "ready_to_submit",
+                    "blindReaderFirst3Chapters": {"whyKeepReading": [{"chapterNumber": 1, "quote": "钟楼", "reason": "开篇抓人"}], "whereToSkip": []},
+                    "sixDimensions": {entry["id"]: {"score": 4.5, "fixAdvice": ""} for entry in evaluator.SIX_DIMENSION_DEFS},
+                    "aiFlavorIssues": [],
+                    "rewritePlan": [],
+                })
+            return reply(_batch(span, []))
+
+        result = await evaluator.evaluate_book(self.store, job_id, batch_size=3, flash_model="a", pro_model="b",
+                                               client=await self.client(handle))
+        report = result["evaluationReport"]
+        self.assertEqual(report["readiness"], "ready_to_submit")
+        self.assertEqual(report["aiFlavorIssues"], [])
+        self.assertEqual(report["rewritePlan"], [])
+        self.assertEqual(report["blindReaderFirst3Chapters"]["whereToSkip"], [])
+        self.assertTrue(any("严禁凑条数" in system and "不跨章漏修" in system for span, system in seen_systems if span != "pro"))
+        self.assertTrue(any("ready_to_submit" in system and "不跨章合并" in system for span, system in seen_systems if span == "pro"))
+
 
 class EvaluationCompatibilityTests(unittest.TestCase):
     def test_json_fingerprint_and_signals_match_legacy_reports(self):

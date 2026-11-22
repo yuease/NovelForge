@@ -694,7 +694,7 @@ class PromptTests(unittest.TestCase):
         wide = prompts.build_chapter_write_prompt(**write, rolling_arc_outlines=True)["prompt"]
         self.assertIn("单元7剧情", wide)
         self.assertIn("机制6甲", wide)
-        tight = prompts.build_chapter_write_prompt(**write, rolling_arc_outlines=True, input_budget=2150)
+        tight = prompts.build_chapter_write_prompt(**write, rolling_arc_outlines=True, input_budget=2250)
         self.assertIn("满级100", tight["prompt"])
         self.assertNotIn("单元7剧情", tight["prompt"])
         self.assertNotIn("不可泄漏的原文引句", wide)

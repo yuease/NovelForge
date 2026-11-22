@@ -18,6 +18,7 @@
 | 8 | 高频轮询淹没控制台日志，故障无法排查 | 应用级结构化阶段日志 + `uvicorn.access` 只读轮询 200/304 过滤器 | `__main__.py` / `revision.py` / `revision_v2.py` |
 | 9 | 长篇批跑中途崩掉导致丢章、重写或脏事实 | LangGraph 双层断点 + SQLite `BEGIN IMMEDIATE` 单事务原子提交 | `workflow.py` / `storage.py` / `pipeline.py` |
 | 10 | 初稿依赖事后修订救火（审校失明、桥段撞车、数值/人设漂移、热梗复读与终局压瘪） | 数据驱动四阶段前移治理：修盲 + 329 章校准风格门禁 + 弹性单元滚动章纲 + 随章台账/人物锁与零额外调用单元快检 | `arc_planning.py` / `chapter_style.py` / `long_memory.py` / `verifier.py` / `pipeline.py` |
+| 11 | 评估“强行挑刺”误报 + 修订返修 `RF-*`/`L-*` 跨编号误杀中断 | 评估去凑数分级铁律与同章不跨章合并口径 + 返修校验器兼容本批辅助编号/裸裁决号对齐并输出精准诊断 | `evaluator.py` / `revision_v2.py` / `revision_v2_checks.py` |
 
 ---
 
@@ -281,6 +282,37 @@
 - `novel_forge/long_memory.py`：`story_ledger_view()`、`story_ledger_events()`、`normalize_arc_summary()`
 - `novel_forge/verifier.py`：`_confirmed_name_collisions()`、`_story_conflict()`、`ledger_arithmetic_conflicts()`
 - `novel_forge/pipeline.py`：`_plan_arc()`、`_archive_arc()`、`compute_dynamic_chapter_target()`
+
+---
+
+## 十一、评估“去挑刺化”校准与修订返修跨编号误杀复盘
+
+### 现象
+1. **成书评估“职业病式挑刺”与合并路由隐患**：对已经多轮精修干净的成稿做二次评估时，模型仍倾向于强行凑满 `aiFlavorIssues` / `whereToSkip` / `rewritePlan`，甚至将主观文风偏好标成 `P0`；若为了降噪把跨多章的同类问题粗暴合并成 1 条，又会导致下游评估后修订与单点精修按 `chapterNumber` 路由时漏修其他章节。
+2. **修订 v2 定点返修（`repair`）频繁卡死在“补丁引用了批次以外的裁决项”**：在 100 章实机修订进入 `repair` 阶段（4 批待返修）时，其中 3 批在模型输出完全合法的文本替换补丁后连续触发「补丁引用了批次以外的裁决项」，最后 1 批用尽 3 次重试直接中断。
+
+### 根因
+1. **评估缺少“零问题合法”显式许可与合并边界**：原评估提示词未明确允许干净稿返回空数组 `[]`，也未把 `P0` 严格锁定为客观硬事实冲突；而下游修订管线依赖每条问题的 `chapterNumber` 做逐章路由，合并粒度只能控制在“同章同类”。
+2. **返修批次存在三套合法 ID，但校验器只认其一且报错不指明错因**：
+   - `repair` 批次的输入同时包含 `requiredIssues`（带章号，如 `A11-2@74`）、`ledger.issues[].decisionId`（裸号 `A11-2`）、`feedback[].repair.id`（`RF-...`）与 `repair.basis[].ruleId`（`L-...`）；
+   - 编辑模型在落实返修反馈时，自然会把本批的 `RF-...` / `L-...` 或裸号 `A11-2` 填进 `patches[].issueIds`（或 `coverage[].id`）；
+   - 原 `edit_patches()` 仅做 `key in set(requiredIssues)` 硬比对，一刀切报模糊错误，既不放行本批已知辅助编号，也不在报错中列出被拒编号与合法范围，导致模型 3 次重试都无法定位问题。
+
+### 解决方案
+1. **评估去挑刺与不漏修口径校准**（`novel_forge/evaluator.py`）：
+   - 在初审（`_BATCH_SYSTEM` / `_BATCH_PROMPT`）与精读（`_PRO_SYSTEM` / `_PRO_PROMPT`）中写入克制铁律：干净章节/全书可直接返回 `aiFlavorIssues: []`、`whereToSkip: []`、`rewritePlan: []`，达标维度 `fixAdvice` 留空 `""`，无真实 `P0` 且六维达标时如实评 `ready_to_submit`；
+   - 明确分层规则：`P0` 仅限客观硬事实冲突且逐处独立绝不合并；`P1/P2` 仅合并**同一章内**的同类文风问题，跨章显著问题保持按章独立，保证后续精修与 Revision v2 路由零漏章。
+2. **返修校验第 1 层无损自愈 + 第 2 层精准诊断**（`novel_forge/revision_v2.py`、`novel_forge/revision_v2_checks.py`）：
+   - 在 `PATCH` 提示词中明示 `issueIds` / `coverage[].id` 仅填 `requiredIssues`，纯对应 `feedback/repair`（`RF-*`）或 `ledger.rules`（`L-*`）的补丁留空 `[]`；
+   - `edit_v2()` 收集当前批次的 `ledger.rules`、`ledger.checks`、`feedback[].repair.id` 与 `basis[].ruleId` 构成 `known_aux_ids` 传入 `edit_patches()`；
+   - `edit_patches()` 对 `patches[].issueIds` 与 `coverage` 实施确定性自愈：① 本批合法的 `known_aux_ids` 自动识别放行并从 `issueIds`/`coverage` 剥离；② 无歧义的裸裁决号（如第 74 章补丁写 `A11-2`）自动对齐为 `A11-2@74`；③ 真正越界的未知编号（如 `R999`）仍严格拦截，并在报错中明文列出被拒编号与本批合法 `requiredIssues` 供重试自纠；
+   - 因 `units()` 的缓存指纹 `inputHash` 仅哈希批次输入数据、不绑定提示词，修复上线后断点续跑直接命中此前已保存的 3/4 批缓存，仅补跑失败批次即可无缝进入独立复审。
+
+### 核心代码
+- `novel_forge/evaluator.py`：`_BATCH_SYSTEM`、`_BATCH_PROMPT`、`_PRO_SYSTEM`、`_PRO_PROMPT`
+- `novel_forge/revision_v2.py`：`PATCH`、`edit_v2()`
+- `novel_forge/revision_v2_checks.py`：`edit_patches()`
+- `tests/test_python_evaluator.py`、`tests/test_revision_v2.py`：空数组干净稿评估验收与 `known_aux_ids` / 裸号对齐 / 越界编号拦截回归测试
 
 ---
 

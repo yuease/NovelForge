@@ -23,6 +23,7 @@ from .llm import LLMError, test_connection
 from .pipeline import PipelineError, PipelineRuntime, _write
 from .providers import ProviderCatalogError, list_model_catalog, sync_provider_models, update_model_settings
 from .storage import StorageError, Store, claim_data_dir, public_job
+from .txt_import import parse_txt_manuscript
 from .verifier import recheck_downstream_chapters, verify_chapter
 from .revision_v2 import RevisionWorkflowV2
 from .workflow import Worker, WorkerError, build_graph
@@ -30,6 +31,8 @@ from .workflow import Worker, WorkerError, build_graph
 ROOT = Path(__file__).resolve().parent.parent
 WEB = ROOT / "web-gemini" / "dist"
 log = logging.getLogger(__name__)
+_LOCAL_ORIGIN = re.compile(r"^https?://(?:127\.0\.0\.1|localhost|\[::1\])(?::\d+)?$", re.I)
+_MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 EVALUATION_OPTIONS = (
     "mode batchSize forceRescan restartEvaluation resumeEvaluation repairFailedBatches provider flashProvider "
     "flashModel proProvider proModel useSavedConnection useSavedFlashConnection useSavedProConnection "
@@ -133,7 +136,24 @@ def create_app(data_dir: Path | None = None, *, client=None):
                     await worker.close()
 
     app = FastAPI(title="Novel Forge", lifespan=lifespan)
-    app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origin_regex=_LOCAL_ORIGIN.pattern,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    @app.middleware("http")
+    async def enforce_local_origin(request: Request, call_next):
+        path = request.url.path
+        if path == "/api" or path.startswith("/api/"):
+            origin = (request.headers.get("origin") or "").strip()
+            if origin and not _LOCAL_ORIGIN.fullmatch(origin):
+                return error_response("Cross-origin API requests are not allowed.", 403)
+            if (not origin and request.method in _MUTATING_METHODS
+                    and (request.headers.get("sec-fetch-site") or "").strip().lower() == "cross-site"):
+                return error_response("Cross-site API requests are not allowed.", 403)
+        return await call_next(request)
 
     def track(task):
         app.state.background.add(task)
@@ -259,6 +279,28 @@ def create_app(data_dir: Path | None = None, *, client=None):
         if payload.get("autoStart") is not False:
             await app.state.pipeline.start_job(job["id"])
         return {"job": await asyncio.to_thread(store.get_job, job["id"])}
+
+    @app.post("/api/jobs/import-txt", status_code=201)
+    async def import_txt(request: Request):
+        payload = await job_payload(request)
+        text = payload.get("text")
+        title = payload.get("title", "")
+        mode = payload.get("splitMode", "auto")
+        chunk_words = payload.get("chunkWords", 2500)
+        if not isinstance(text, str):
+            return error_response("请上传 TXT 文件或粘贴小说正文。", 400)
+        if not isinstance(title, str) or any(mark in title.strip() for mark in ("\r", "\n")):
+            return error_response("书名须为单行文字。", 400)
+        if re.search(r"[\x00\ud800-\udfff]", text) or re.search(r"[\x00\ud800-\udfff]", title):
+            return error_response("正文或书名包含无效字符，请检查 TXT 文件的编码。", 400)
+        try:
+            parsed = await asyncio.to_thread(
+                parse_txt_manuscript, text, fallback_title=title, split_mode=mode, chunk_words=chunk_words,
+            )
+        except ValueError as exc:
+            return error_response(str(exc), 400)
+        job = await _write(app.state.store.create_imported_manuscript, parsed, title=title.strip())
+        return {"job": public_job(job), **{key: value for key, value in parsed.items() if key != "chapters"}}
 
     async def apply_job_action(request: Request, job_id: str, action: str):
         if not await asyncio.to_thread(app.state.store.get_job, job_id):

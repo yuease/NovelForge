@@ -45,7 +45,7 @@ _REACTION_CLICHE_PATTERNS = [
 ]
 
 _BATCH_SYSTEM = """[TASK:EVAL_FLASH_BATCH]
-你是资深长篇网文初审编辑，正在按“每10章一组”进行精细化 AI 味排查与跨章设定台账提取。
+你是资深、客观公允的长篇网文初审编辑，正在按“每10章一组”进行精细化 AI 味排查与跨章设定台账提取。
 不要给模糊的总分（禁止输出“AI味80分”这种空话），必须逐条定位具体章节和原文原句。
 
 请重点检查以下 6 类 AI 味问题：
@@ -56,6 +56,12 @@ _BATCH_SYSTEM = """[TASK:EVAL_FLASH_BATCH]
 5. repetitive_hooks（每章同一种方式吊胃口）：临收尾反复靠对讲机突然响、系统面板警告、门外脚步声或“还有一件事”强行断章。
 6. inconsistent_details（细节很多却前后打架）：金额、日期、门牌号、容积、伤势、物品位置或系统规则在本组内或与总纲前后冲突。
 
+克制与分级铁律（宁缺毋滥，严禁凑条数）：
+- 如果本 10 章已经打磨干净、没有明显硬伤或高频套话，**必须直接输出 `"aiFlavorIssues": []`**。严禁为了显得专业或填满格式而吹毛求疵，不要把正常的心理描写、必要铺垫或仅偶发 1～2 次的常规表达强标为 AI 味。
+- **P0 仅限客观硬事实冲突或严重逻辑断裂**（跨章数值/金额/时间线/地点/生死/知情权/核心规则明确打架，或核心桥段原地失忆复演），绝不把主观文风偏好标成 P0。
+- **P1 仅限明显影响追读的成片/高频问题**（套话或同类钩子连续多章机械复用、整段复述式水旁白、多章处境停滞）；偶发轻微措辞不报 P1。
+- **只合「同章同类」、不跨章漏修**：P0 硬冲突每处各占 1 条，绝不合并；P1/P2 仅将**同一章内**的同类文风问题合并为该章最具代表性的 1 条（避免单章刷屏），若多个章节各自确实存在必须修改的显著问题，仍按章号各自独立成条并附该章真实原句，以免后续精修按章路由时漏修其它章节。
+
 必须严格输出合法 JSON。"""
 
 _BATCH_PROMPT = Template("""书名：《${book_title}》 | 题材：${genre} | 视角：${pov}
@@ -65,7 +71,7 @@ _BATCH_PROMPT = Template("""书名：《${book_title}》 | 题材：${genre} | �
 请审读第 ${start_chapter}~${end_chapter} 章全文：
 ${chapter_texts}
 
-请严格输出以下 JSON 结构（只输出 JSON）：
+请严格输出以下 JSON 结构（只输出 JSON；若本组无明显问题，aiFlavorIssues 请直接返回空数组 []，切勿硬凑）：
 {
   "batchRange": "${start_chapter}-${end_chapter}",
   "timelineSummary": "本10章的时间跨度与关键日期节点（简明准确）",
@@ -81,7 +87,7 @@ ${chapter_texts}
       "chapterNumber": ${start_chapter},
       "category": "over_explaining|formulaic_reaction|shared_voice|static_situation|repetitive_hooks|inconsistent_details",
       "quote": "文中真实存在的原文原句（15~60字）",
-      "impact": "为什么这一处影响阅读或暴露AI味",
+      "impact": "为什么这一处明显影响阅读或构成硬冲突",
       "priority": "P0|P1|P2",
       "suggestion": "具体删改建议（若可直接删掉解释句请明说删哪句）"
     }
@@ -89,12 +95,13 @@ ${chapter_texts}
 }""")
 
 _PRO_SYSTEM = """[TASK:EVAL_PRO_REVIEW]
-你是挑剔、犀利且懂番茄/红果商业网文与长篇结构的主编，正在执行投稿前精读复审。
+你是标准严格但客观公允、懂番茄/红果商业网文与长篇结构的主编，正在执行投稿前精读复审。
+既要毫不留情抓住真正的硬伤与掉留存痛点，也要尊重已经打磨干净的成稿，绝不为显得专业而吹毛求疵或硬凑改稿意见。
 请务必先回答读者最关心的三个问题：
 1) 开头想不想追；2) 中段读不读得下去；3) 结尾值不值得。
 
 随后请完成两项深度评审：
-A. 「盲测读者读前三章」：假设你完全没看过全书大纲，作为挑剔读者一口气读完前 3 章，诚实回答两句话：「你为什么想继续读？」和「你在哪一段开始想跳读？」（附章号与原文原句）。
+A. 「盲测读者读前三章」：假设你完全没看过全书大纲，作为真实商业网文读者一口气读完前 3 章，诚实回答：「你为什么想继续读？」和「你在哪一段开始想跳读？」（附章号与原文原句）。若前 3 章节奏紧凑、没有明显劝退段落，whereToSkip 请直接返回空数组 []，不要硬凑跳读理由。
 B. 「六个维度 1～5 分评估」：
    - sellingPointAndOpening（卖点与开篇）
    - worldSettingAndCausality（设定与因果）
@@ -102,8 +109,11 @@ B. 「六个维度 1～5 分评估」：
    - plotAndPacing（主线与节奏）
    - foreshadowingAndEnding（伏笔与结局）
    - styleAndReadability（文风与阅读体验）
-   每项必须给出 1～5 分（可保留 0.5 分如 3.5）、一个具体章号 chapterNumber 和一条原文/情节证据 evidence，不得空泛套话。
-C. 「跨章终检 + AI味 P0/P1/P2 优先改稿清单」：结合全书每 10 章初审台账与跨章规则，指出跨章设定冲突与最影响阅读的 AI 味条目（带章号、原句、原因、优先级、修改建议）。
+   每项必须给出 1～5 分（可保留 0.5 分如 3.5）、一个具体章号 chapterNumber 和一条原文/情节证据 evidence，不得空泛套话；已达直接投稿水准的维度，fixAdvice 可留空字符串 ""。
+C. 「跨章终检 + 优先改稿清单」：结合全书每 10 章初审台账与跨章规则，只汇总真正值得动刀的跨章硬伤与显著 AI 味条目（带章号、原句、原因、优先级、修改建议）。
+   - P0 仅限客观硬事实冲突/重大结构穿帮，每处独立成条绝不合并，严禁将主观文风偏好升格为 P0；P1/P2 仅合并同一章内的同类文风问题，不跨章合并，避免后续精修按章路由时漏修。
+   - 若稿件已经足够干净，aiFlavorIssues 与 rewritePlan 均可返回空数组 []。
+   - 当全书无真实 P0、六维整体达标且无明显掉留存缺陷时，readiness 应如实给出 ready_to_submit。
 
 必须严格输出合法 JSON。"""
 
@@ -115,7 +125,7 @@ _PRO_PROMPT = Template("""书名：《${book_title}》 | 题材：${genre} | 视
 【精读原文样本（前10章 + 中段转折 + 结尾）】
 ${sample_text}
 
-请严格输出以下 JSON（只输出 JSON）：
+请严格输出以下 JSON（只输出 JSON；若成稿已干净达标，whereToSkip / aiFlavorIssues / rewritePlan 均可返回空数组 []，fixAdvice 可留空 ""，切勿硬凑问题）：
 {
   "overallSummary": "主编一句话总评（直指是否可投番茄及最核心优缺点）",
   "readiness": "ready_to_submit|revise_recommended|major_rework",
@@ -129,15 +139,15 @@ ${sample_text}
       { "chapterNumber": 2, "quote": "让你想继续追的那一句或情节", "reason": "为什么抓人" }
     ],
     "whereToSkip": [
-      { "chapterNumber": 1, "quote": "让你开始想跳读的那一段或句子", "reason": "为什么想跳读（啰嗦/重复/缺冲突）" }
+      { "chapterNumber": 1, "quote": "让你开始想跳读的那一段或句子（无明显劝退点时返回空数组 []）", "reason": "为什么想跳读（啰嗦/重复/缺冲突）" }
     ]
   },
   "sixDimensions": {
-    "sellingPointAndOpening": { "score": 4, "chapterNumber": 2, "evidence": "原文或具体情节点证据", "comment": "诊断评语", "fixAdvice": "可执行改法" },
-    "worldSettingAndCausality": { "score": 4, "chapterNumber": 1, "evidence": "...", "comment": "...", "fixAdvice": "..." },
-    "characterAndChoices": { "score": 4, "chapterNumber": 98, "evidence": "...", "comment": "...", "fixAdvice": "..." },
+    "sellingPointAndOpening": { "score": 4, "chapterNumber": 2, "evidence": "原文或具体情节点证据", "comment": "诊断评语", "fixAdvice": "可执行改法（已达标可留空）" },
+    "worldSettingAndCausality": { "score": 4, "chapterNumber": 1, "evidence": "...", "comment": "...", "fixAdvice": "" },
+    "characterAndChoices": { "score": 4, "chapterNumber": 98, "evidence": "...", "comment": "...", "fixAdvice": "" },
     "plotAndPacing": { "score": 3.5, "chapterNumber": 22, "evidence": "...", "comment": "...", "fixAdvice": "..." },
-    "foreshadowingAndEnding": { "score": 4, "chapterNumber": 95, "evidence": "...", "comment": "...", "fixAdvice": "..." },
+    "foreshadowingAndEnding": { "score": 4, "chapterNumber": 95, "evidence": "...", "comment": "...", "fixAdvice": "" },
     "styleAndReadability": { "score": 3.5, "chapterNumber": 3, "evidence": "...", "comment": "...", "fixAdvice": "..." }
   },
   "aiFlavorIssues": [
@@ -145,13 +155,13 @@ ${sample_text}
       "chapterNumber": 1,
       "category": "over_explaining|formulaic_reaction|shared_voice|static_situation|repetitive_hooks|inconsistent_details",
       "quote": "原文原句",
-      "impact": "为什么影响阅读",
+      "impact": "为什么明显影响阅读或构成硬冲突",
       "priority": "P0|P1|P2",
       "suggestion": "修改/删减建议"
     }
   ],
   "rewritePlan": [
-    "按优先级排序的具体改稿动作清单"
+    "按优先级排序的具体改稿动作清单（若已可直接投稿可返回空数组 []）"
   ]
 }""")
 

@@ -56,6 +56,21 @@ export type EditorSession = EditorSettings & {
   replying: boolean
   failureWaitingForModel: boolean
 }
+export type ManuscriptSplitMode = 'auto' | 'single' | 'chunk'
+export type ManuscriptImportInput = {
+  text: string
+  title?: string
+  splitMode: ManuscriptSplitMode
+  chunkWords?: number
+}
+export type ManuscriptImportResult = {
+  job: JobRecord
+  warnings: string[]
+  detectedBy: string
+  totalChapters: number
+  totalWords: number
+  inferredTitle: string | null
+}
 export const REVISION_DISPATCHED = 'novelforge:revision-dispatched'
 const editorPath = (jobId: string) => '/jobs/' + encodeURIComponent(jobId) + '/editor-desk'
 
@@ -193,6 +208,13 @@ export const api = {
 
   async createJob(input: CreateJobInput): Promise<{ job: JobRecord }> {
     return request('/jobs', {
+      method: 'POST',
+      body: JSON.stringify(input),
+    })
+  },
+
+  async importManuscript(input: ManuscriptImportInput): Promise<ManuscriptImportResult> {
+    return request('/jobs/import-txt', {
       method: 'POST',
       body: JSON.stringify(input),
     })

@@ -58,7 +58,16 @@ def estimate_tokens(text=""):
         return 0
     text = str(text)
     cjk = len(_CJK.findall(text))
-    words = sum(bool(word) for word in _JS_SPACE.split(_CJK.sub(" ", text)))
+    words = 0
+    for chunk in _JS_SPACE.split(_CJK.sub(" ", text)):
+        if not chunk:
+            continue
+        if len(chunk) <= 12:
+            words += 1
+        elif chunk.isascii() and chunk.isalpha():
+            words += max(1, math.ceil(len(chunk) / 4))
+        else:
+            words += max(1, math.ceil(len(chunk) / 2.2))
     return max(1, math.ceil(cjk * 1.5 + words * 1.3))
 
 

@@ -197,13 +197,16 @@ def strip_leading_chapter_heading(content="", chapter_title="", chapter_number=N
 def _export(job, chapters, output_format):
     title = job.get("title") or "未命名小说"
     kind = str(output_format or "txt").lower()
+    imported_count = _number(job.get("importedChapterCount"))
     if kind in ("docx", "fanqie", "fanqie-docx"):
         entries = []
         for index, chapter in enumerate(sorted(chapters, key=_chapter_number), 1):
             number = max(1, math.floor(_chapter_number(chapter) or index))
             heading = format_fanqie_chapter_title(chapter.get("title"), number)
-            body = strip_leading_chapter_heading(chapter.get("content"), chapter.get("title") or heading, number)
-            body = strip_leading_chapter_heading(body, heading, number)
+            body = chapter.get("content") or ""
+            if number > imported_count:
+                body = strip_leading_chapter_heading(body, chapter.get("title") or heading, number)
+                body = strip_leading_chapter_heading(body, heading, number)
             entries.append({"heading": heading, "paragraphs": split_fanqie_paragraphs(body)})
         content = build_fanqie_docx(entries)
         return {"filename": f"{title}-番茄投稿.docx", "contentType": DOCX_CONTENT_TYPE, "content": content,
@@ -218,7 +221,9 @@ def _export(job, chapters, output_format):
         lines = [f"《{title}》", f"题材：{genre} | 视角：{pov} | 总字数：{words}", f"简介：{logline}", "=" * 40, ""]
     for chapter in chapters:
         heading = _display_title(chapter)
-        body = strip_leading_chapter_heading(chapter.get("content"), heading, chapter["chapterNumber"])
+        body = (chapter.get("content") or "").strip("\n")
+        if chapter["chapterNumber"] > imported_count:
+            body = strip_leading_chapter_heading(body, heading, chapter["chapterNumber"])
         lines.extend([f"## {heading}" if kind == "md" else heading, "", body, ""])
         if kind != "md":
             lines.extend(["-" * 30, ""])

@@ -261,6 +261,24 @@ def _job_record(data, config, now):
     return job
 
 
+def _chapter_record(number, data, now):
+    content = _first_non_null(data.get("content"), data.get("text"), "")
+    return {
+        "chapterNumber": number, "title": data.get("title") or f"第{number}章", "content": content,
+        "summary": data.get("summary") or "",
+        "wordCount": data["wordCount"] if data.get("wordCount") is not None else count_chinese_words(content),
+        "status": data.get("status") or "completed", "verification": data.get("verification"),
+        "repairCount": _first_non_null(data.get("repairCount"), 0),
+        "updatedAt": now, "createdAt": data.get("createdAt") or now,
+    }
+
+
+def _chapter_index_entry(chapter):
+    return {key: chapter[key] for key in (
+        "chapterNumber", "title", "wordCount", "status", "repairCount", "updatedAt",
+    )}
+
+
 @contextmanager
 def claim_data_dir(directory: Path):
     """Allow a single process to schedule runs and update a data directory."""
@@ -445,6 +463,30 @@ class Store:
             self._write_job(db, job)
         return job
 
+    def create_imported_manuscript(self, parsed, *, title=""):
+        """Save a parsed manuscript and all of its chapters as one finished work."""
+        now = _now()
+        chapters = [_chapter_record(row["chapterNumber"], row, now) for row in parsed["chapters"]]
+        count = len(chapters)
+        total_words = parsed["totalWords"]
+        job = _job_record({
+            "title": title or parsed["inferredTitle"],
+            "genre": "未指定", "pov": "沿用原稿", "styleGuide": "保持原稿文风与人物口吻。",
+            "targetWords": total_words, "wordsPerChapter": max(1, (total_words + count // 2) // count),
+            "totalChapters": count, "status": "completed", "stage": "completed",
+            "llmConfig": {"useSavedConnection": True},
+        }, self.get_provider_config(), now)
+        job.update({
+            "progress": 100, "completedChapters": count, "totalWords": total_words,
+            "importedChapterCount": count,
+            "chapterIndex": {str(row["chapterNumber"]): _chapter_index_entry(row) for row in chapters},
+        })
+        with self._write() as db:
+            self._write_job(db, job)
+            for row in chapters:
+                self._write_chapter(db, job["id"], row)
+        return job
+
     def update_job(self, job_id, patch):
         with self._write() as db:
             job = self._get_job(db, job_id, required=True)
@@ -501,19 +543,9 @@ class Store:
         with self._write() as db:
             job = self._get_job(db, job_id, required=True)
             now = _now()
-            content = _first_non_null(data.get("content"), data.get("text"), "")
-            chapter = {
-                "chapterNumber": number, "title": data.get("title") or f"第{number}章", "content": content,
-                "summary": data.get("summary") or "",
-                "wordCount": data["wordCount"] if data.get("wordCount") is not None else count_chinese_words(content),
-                "status": data.get("status") or "completed", "verification": data.get("verification"),
-                "repairCount": _first_non_null(data.get("repairCount"), 0),
-                "updatedAt": now, "createdAt": data.get("createdAt") or now,
-            }
+            chapter = _chapter_record(number, data, now)
             index = dict(_dict(job.get("chapterIndex")))
-            index[str(number)] = {key: chapter[key] for key in (
-                "chapterNumber", "title", "wordCount", "status", "repairCount", "updatedAt",
-            )}
+            index[str(number)] = _chapter_index_entry(chapter)
             updated = {**job, "chapterIndex": index, "updatedAt": now,
                        "completedChapters": sum(_is_committed(item) for item in index.values()),
                        "totalWords": sum(_number(item.get("wordCount")) for item in index.values())}
@@ -521,7 +553,7 @@ class Store:
                 updated["usedMemeTitles"] = _unique_strings([*_list(job.get("usedMemeTitles")), meme_title])
             if facts_delta is not None and chapter["status"] != "needs_review":
                 updated["canonicalFacts"] = _merge_chapter_facts(job.get("canonicalFacts"), number, facts_delta,
-                                                               long_memory, content, now, story_ledger=story_ledger,
+                                                               long_memory, chapter["content"], now, story_ledger=story_ledger,
                                                                book_plan=job.get("bookPlan"))
             current = _dict(job.get("canonicalFacts"))
             archives = [*_list(current.get("volumeSummaries")), *_list(current.get("arcSummaries"))]
