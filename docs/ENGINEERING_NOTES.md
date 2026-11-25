@@ -19,6 +19,9 @@
 | 9 | 长篇批跑中途崩掉导致丢章、重写或脏事实 | LangGraph 双层断点 + SQLite `BEGIN IMMEDIATE` 单事务原子提交 | `workflow.py` / `storage.py` / `pipeline.py` |
 | 10 | 初稿依赖事后修订救火（审校失明、桥段撞车、数值/人设漂移、热梗复读与终局压瘪） | 数据驱动四阶段前移治理：修盲 + 329 章校准风格门禁 + 弹性单元滚动章纲 + 随章台账/人物锁与零额外调用单元快检 | `arc_planning.py` / `chapter_style.py` / `long_memory.py` / `verifier.py` / `pipeline.py` |
 | 11 | 评估“强行挑刺”误报 + 修订返修 `RF-*`/`L-*` 跨编号误杀中断 | 评估去凑数分级铁律与同章不跨章合并口径 + 返修校验器兼容本批辅助编号/裸裁决号对齐并输出精准诊断 | `evaluator.py` / `revision_v2.py` / `revision_v2_checks.py` |
+| 12 | 总编室深查百章爆窗 + 故障自动抢跑篡改现场 | 原生 Tool Loop 与模拟 JSON 平滑降级 + 75k 回合内/跨回合双层压缩 + 显式人工诊断与令牌恢复 | `editor_desk.py` / `manuscript_tools.py` / `app.py` |
+| 13 | 本地 ChatGPT 免 Key 接入的凭证安全与流式稳定性 | 回环限定 OAuth/PKCE + Windows DPAPI / POSIX `0600` 原子保险库 + 字节缓冲 Responses 流式与 `providerState` 保真 | `openai_siwc.py` / `siwc_vault.py` / `openai_responses.py` |
+| 14 | 多面板动效割裂、折叠容器裁切下拉与拖拽挤叠 | 统一动效令牌 + 视口感知 `PortalPopover` 解耦裁切 + `340–640px` 1:1 拖拽与 `@container` 容器查询 | `motion.ts` / `Overlay.tsx` / `ModelPicker.tsx` / `EditorDesk.tsx` |
 
 ---
 
@@ -313,6 +316,79 @@
 - `novel_forge/revision_v2.py`：`PATCH`、`edit_v2()`
 - `novel_forge/revision_v2_checks.py`：`edit_patches()`
 - `tests/test_python_evaluator.py`、`tests/test_revision_v2.py`：空数组干净稿评估验收与 `known_aux_ids` / 裸号对齐 / 越界编号拦截回归测试
+
+---
+
+## 十二、总编室原生 Tool Loop、回合内自动压缩与人工可控断点恢复
+
+### 现象
+1. **深查 100 章长篇触发上下文爆窗**：在总编室跨数十章检索线索、连续读章核对人物与时间线时，单回合内多轮工具调用的返回文本迅速累积，容易突破模型窗口或挤占最终输出额度；切换总编模型后，早期对话结论也容易丢失。
+2. **后台故障自动抢跑与限流重试放大**：早期 `revisions.on_failure` 会在修订失败后自动触发总编诊断，在遇到上游限流或临时错误时可能静默重试、干扰人工排查，甚至带来擅自变动当前候选版本的风险。
+
+### 解决方案与设计权衡
+- **原生 Tool Loop + 异构渠道无缝降级**：
+  - 将只读检索与章段读取抽象至 `manuscript_tools.py`（支持关键词单查、最多 40 词批量/正则检索与分页片段返回）；
+  - `EditorDesk` 在支持原生 tool calling 的渠道上启用原生多轮工具循环（上限 `MAX_TOOL_ROUNDS = 40`、每轮最多 `MAX_TOOLS_PER_ROUND = 12`），当上游渠道不支持原生工具时自动无缝回退至模拟 JSON 工具循环，保持提案生成、证据引用与落库语义完全一致。
+- **双层上下文压缩（跨回合 + 回合内）**：
+  - **跨回合压缩**：早期对话通过 `save_conversation_summary`（或 `compactedContext`）按 `throughId` 增量持久化摘要，保留关键章号、作者决定与未完事项，切换模型后完整承接上下文；
+  - **回合内自动压缩**：单次问答中估算消息 Token 超过 `INTRA_TURN_COMPACT_TOKENS = 75_000`（支持 `NOVEL_FORGE_EDITOR_COMPACT_TOKENS` 覆写，最多触发 `MAX_INTRA_TURN_COMPACTIONS = 3` 次）时，`_compact_native_messages()` 自动将早期工具往返压缩成结构化摘要，并以确定性 `_fallback_round_digest()` 兜底，长程深查百章不爆窗。
+- **人工主导故障诊断与显式令牌恢复**：
+  - 移除 `revisions.on_failure` 后台自动抢跑，限流等运行时异常严格保留现场并等待人工诊断，绝不擅自变更候选版本；
+  - 新增 `POST /api/jobs/{job_id}/editor-desk/recover`，仅在总编完成排查并经作者显式确认恢复令牌后才触发断点恢复。
+
+### 核心代码
+- `novel_forge/editor_desk.py`：`EditorDesk`、`_native_tools()`、`_compact_native_messages()`、`_fallback_round_digest()`、`dispatch_recovery()`
+- `novel_forge/manuscript_tools.py`：`search_chapters()`、`_single_search()`、`_batch_search()`
+- `novel_forge/app.py`：`editor_recover()`
+- `tests/test_editor_desk.py`：原生工具循环自纠与回合内压缩、不支持原生工具无缝回退、跨模型切换记忆保留、人工断点恢复回归测试
+
+---
+
+## 十三、OpenAI Sign in with ChatGPT（SIWC）本地 OAuth、凭证保险库与 Responses 流式适配
+
+### 现象
+为了让纯本地工作台无需手工申请和管理 API Key 即可安全使用个人 ChatGPT 计划调用 OpenAI Responses 流式接口，需要同时解决三个本地安全与协议难题：
+1. **本地凭证落盘安全**：明文写入 OAuth `access_token` / `refresh_token` / `id_token` 或允许符号链接路径存在泄露与提权风险；
+2. **回环 OAuth 防劫持**：本地桌面工作台若对非回环地址开放 OAuth 回调或缺少状态绑定，容易遭遇跨站或局域网劫持；
+3. **Responses SSE 协议细节**：多字节 UTF-8 字符可能跨 HTTP chunk 截断，且多轮 tool-calling 需要保真回传上游 `providerState`。
+
+### 解决方案与设计权衡
+- **严格回环隔离的本地 OAuth 2.0 + PKCE 流程**（`openai_siwc.py`、`siwc_routes.py`）：
+  - 默认仅在 `NOVEL_FORGE_HOST=127.0.0.1` 回环监听时启用（`is_loopback` 严格校验），通过一次性随机 `state`、PKCE 与流程 Cookie 绑定单次授权会话；
+  - 精细区分错误类型：终态刷新错误（`invalid_grant`、`refresh_token_reused` 等）立刻提示重新登录不盲目重试，瞬时账户不可用允许重试，配额与限流给出清晰中文引导。
+- **系统级凭证加密保险库**（`siwc_vault.py`）：
+  - 读写前拒绝任何符号链接路径；Windows 平台直接调用原生 `CryptProtectData` / `CryptUnprotectData`（DPAPI）对三类 token 字段加密存储（解密后立即 `ctypes.memset` 清零非托管内存缓冲）；POSIX 平台强制 `0o700` 目录与 `0o600` 文件权限，全部写入通过同目录临时文件 `flush + fsync + os.replace()` 原子替换。
+- **字节缓冲流式解析与多轮状态保真**（`openai_responses.py`）：
+  - 按原始字节流缓冲至换行符后再解析 JSON，彻底杜绝多字节中文字符跨 chunk 截断乱码，并设 `16MB` 流体积硬上限（`_STREAM_LIMIT`）；
+  - 多轮工具调用中保留 `openai-responses-siwc` 原生 `output` 结构（`providerState`），确保推理链与工具结果在多轮对话中无损衔接。
+
+### 核心代码
+- `novel_forge/openai_siwc.py`：`OpenAISiwc`、`SiwcError`、`is_loopback()`
+- `novel_forge/siwc_vault.py`：`SiwcVault`、`_dpapi()`
+- `novel_forge/siwc_routes.py`：`siwc_router()`
+- `novel_forge/openai_responses.py`：`_events()`、`_build_responses_input()`
+- `web-gemini/src/pages/ChatGPTConnection.tsx`、`tests/test_openai_siwc.py`
+
+---
+
+## 十四、`web-gemini` 前端动效系统、视口级 Portal 浮层与高性能交互收口
+
+### 现象
+随着工作台扩展出监控流图、评估多轮对比、总编室与设置面板，前端逐步暴露四类体验瑕疵：
+1. 各页面过渡时长与缓动散落各处，动效语言割裂且缺少统一的 `prefers-reduced-motion` 无障碍退避；
+2. 评估页中嵌套在 `<Disclosure title="模型设置">`（`overflow-hidden`）里的 `ModelPicker` 下拉菜单被父容器裁切，无法正常滚动与选择；
+3. 拖拽加宽总编室时，右侧主区 KPI 卡片因仅按视口断点而非容器宽度排版发生挤叠；移动端抽屉缺少 `Escape` 关闭且 `<Select>` 出现双箭头。
+
+### 解决方案与实机验收
+- **统一动效令牌与无障碍收口**：抽离 `web-gemini/src/lib/motion.ts` 与 `styles/index.css` / `range.css` 统一缓动和时长令牌，覆盖 8 个基础 UI 原语与全站业务页，并接入全站 `prefers-reduced-motion` 静态直切；
+- **视口感知 `PortalPopover` 解耦嵌套裁切**：在 `Overlay.tsx` 实现通过 `createPortal(..., document.body)` 挂载的视口感知浮层 `PortalPopover`（`z-[95]`，自动检测视口上下剩余空间翻转定位），接入 `ModelPicker`，并让 `Collapsible` / `Disclosure` 在展开动画完成后切换为 `overflow-visible`，彻底解决任意嵌套容器裁切浮层问题；
+- **1:1 跟手拖拽与 CSS 容器查询自适应**：为总编室补齐 `340–640px` 1:1 指针拖拽分栏手柄（偏好持久化至 `prefs.ts`），主区与 Hero 切换为 CSS 容器查询（`@container/main`、`@container/hero`），确保分栏宽度动态变化时卡片布局永不挤叠；同步补齐移动端抽屉 `Escape` 退出与全文 `.txt` 导出工具（`download.ts`）；
+- **量化验收**：Chrome CDP 真实采样下各交互维持 **107–142 FPS**、切页 **CLS = 0**、12/12 视口组合 **0 横向溢出**，`tsc -b && vite build` 零错误，全仓库 Python 单元测试 **232 / 232 全部通过**。
+
+### 核心代码
+- `web-gemini/src/lib/motion.ts`、`web-gemini/src/styles/index.css`、`web-gemini/src/styles/range.css`
+- `web-gemini/src/components/ui/Overlay.tsx`（`PortalPopover`）、`web-gemini/src/components/ui/Collapsible.tsx`、`web-gemini/src/components/model/ModelPicker.tsx`
+- `web-gemini/src/layout/Shell.tsx`、`web-gemini/src/pages/EditorDesk.tsx`、`web-gemini/src/pages/EvaluationPage.tsx`、`web-gemini/src/lib/download.ts`
 
 ---
 
