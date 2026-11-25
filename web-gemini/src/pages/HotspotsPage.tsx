@@ -8,13 +8,14 @@ import { api } from '../lib/api'
 import { cn } from '../lib/cn'
 import { formatDateTime, messageOf } from '../lib/format'
 import type { Tone } from '../lib/format'
+import { COLLAPSE_MOTION, TAB_MOTION } from '../lib/motion'
 import type { GeneratedConcept, HotspotFeedMeta, HotspotTrope, LiveHotspotItem, LLMProvider, MemeCounts, MemeEntry, MemeSyncMeta } from '../lib/types'
 import { useStudio } from '../state/studio'
 import { useSessionState } from '../state/prefs'
 import {
   Alert, Badge, Button, Card, EmptyState, Input, PageHeader, Segmented, Skeleton, Stagger, StaggerItem, Tag, Thinking, useToast,
 } from '../components/ui'
-import { ModelPicker, useModelCatalog } from '../components/model/ModelPicker'
+import { findProvider, ModelPicker, resolveDefaultRealModel, resolveSelectedModel, useModelCatalog } from '../components/model/ModelPicker'
 
 const PLATFORMS = [
   { value: 'all', label: '全部平台' },
@@ -33,7 +34,7 @@ const PLATFORM_META: Record<string, { label: string; tone: Tone }> = {
 const MEME_STATUS: Record<string, { label: string; tone: Tone }> = {
   active: { label: '可用新梗', tone: 'success' },
   pending_verification: { label: '待核验', tone: 'warning' },
-  rejected_old: { label: '老梗拦截', tone: 'danger' },
+  rejected_old: { label: '已过时', tone: 'danger' },
   expired: { label: '已过期', tone: 'neutral' },
 }
 
@@ -45,8 +46,13 @@ export default function HotspotsPage() {
   const { sendConceptToCreate } = useStudio()
   const toast = useToast()
   const { catalog } = useModelCatalog()
-  const [conceptProvider, setConceptProvider] = useSessionState<LLMProvider>('nf_hot_provider', 'mock')
-  const [conceptModel, setConceptModel] = useSessionState('nf_hot_model', 'mock-novel-v1')
+  const [manualModel, setManualModel] = useSessionState<{ provider: LLMProvider; model: string } | null>('nf_hot_model_choice', null)
+  const fallbackChoice = resolveDefaultRealModel(catalog)
+  const manualValid = Boolean(manualModel && findProvider(catalog, manualModel.provider)?.configured)
+  const conceptProvider: LLMProvider = manualValid && manualModel ? manualModel.provider : fallbackChoice.provider
+  const conceptModel = manualValid && manualModel
+    ? resolveSelectedModel(catalog, manualModel.provider, manualModel.model)
+    : fallbackChoice.model
 
   const [platform, setPlatform] = useSessionState<Platform>('nf_hot_platform', 'all')
   const [source, setSource] = useSessionState<Source>('nf_hot_source', 'tropes')
@@ -167,7 +173,6 @@ export default function HotspotsPage() {
       <PageHeader
         title="热点灵感"
         description="聚合番茄、红果、抖音的爆款套路与黄金三章钩子，一键孵化选题。"
-        actions={<Segmented value={platform} onChange={setPlatform} options={PLATFORMS} ariaLabel="平台" />}
       />
 
       {/* Prompt bar */}
@@ -189,9 +194,15 @@ export default function HotspotsPage() {
         </div>
       </Card>
 
-      {error && <Alert tone="danger" className="mb-6" onClose={() => setError(null)}>{error}</Alert>}
+      <AnimatePresence initial={false}>
+        {error && (
+          <motion.div {...COLLAPSE_MOTION} className="overflow-hidden">
+            <Alert tone="danger" className="mb-6" onClose={() => setError(null)}>{error}</Alert>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
-      <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_400px]">
+      <div className="grid gap-6 @[920px]/main:grid-cols-[minmax(0,1fr)_380px]">
         {/* Left: sources */}
         <section className="min-w-0">
           <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
@@ -221,16 +232,21 @@ export default function HotspotsPage() {
             </div>
           </div>
 
-          <AnimatePresence mode="wait">
-            <motion.div key={source} initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -8 }} transition={{ duration: 0.2 }}>
+          <AnimatePresence mode="wait" initial={false}>
+            <motion.div key={source} {...TAB_MOTION}>
               {source === 'tropes' && (
-                <TropeGrid
-                  tropes={tropes}
-                  loading={loading}
-                  selectedId={selectedTrope?.id}
-                  onSelect={setSelectedTrope}
-                  onApply={(t) => void handleGenerate({ trope: t })}
-                />
+                <>
+                  <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
+                    <Segmented size="sm" value={platform} onChange={setPlatform} options={PLATFORMS} ariaLabel="按平台筛选模板" />
+                  </div>
+                  <TropeGrid
+                    tropes={tropes}
+                    loading={loading}
+                    selectedId={selectedTrope?.id}
+                    onSelect={setSelectedTrope}
+                    onApply={(t) => void handleGenerate({ trope: t })}
+                  />
+                </>
               )}
               {source === 'live' && (
                 <>
@@ -256,7 +272,7 @@ export default function HotspotsPage() {
         </section>
 
         {/* Right: concept */}
-        <aside ref={resultRef} className="min-w-0 lg:sticky lg:top-20 lg:self-start">
+        <aside ref={resultRef} className="min-w-0 @[920px]/main:sticky @[920px]/main:top-20 @[920px]/main:self-start">
           <Card variant={generating ? 'glow' : 'default'} padding="lg">
             <div className="mb-4 flex items-center justify-between gap-2">
               <h3 className="flex items-center gap-2 text-title font-medium text-ink"><BookOpen className="size-[18px] text-primary" />选题预览</h3>
@@ -268,12 +284,12 @@ export default function HotspotsPage() {
               model={conceptModel}
               catalog={catalog}
               disabled={generating}
-              onChange={(p, m) => { setConceptProvider(p); setConceptModel(m) }}
+              onChange={(p, m) => setManualModel({ provider: p, model: m })}
             />
             <div className="mt-5 border-t border-line pt-5">
-              <AnimatePresence mode="wait">
+              <AnimatePresence mode="wait" initial={false}>
                 {generating ? (
-                  <motion.div key="gen" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="grid gap-3">
+                  <motion.div key="gen" {...TAB_MOTION} className="grid gap-3">
                     <Thinking label="正在孵化选题" />
                     <Skeleton className="mt-2 h-7 w-2/3" />
                     <Skeleton className="h-4" /><Skeleton className="h-4 w-11/12" /><Skeleton className="h-4 w-4/5" />
@@ -290,7 +306,7 @@ export default function HotspotsPage() {
                     })}
                   />
                 ) : (
-                  <motion.div key="empty" initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="py-10 text-center">
+                  <motion.div key="empty" {...TAB_MOTION} className="py-10 text-center">
                     <Sparkles className="mx-auto size-8 text-primary" />
                     <p className="mt-3 text-body text-muted">选择模板或热点，生成书名、梗概和黄金三章。</p>
                   </motion.div>
@@ -372,16 +388,16 @@ function TropeGrid({ tropes, loading, selectedId, onSelect, onApply }: { tropes:
   }
   if (tropes.length === 0) return <EmptyState icon={<LayoutTemplate />} title="暂无匹配的模板" description="切换平台或清空搜索词后重试。" />
   return (
-    <Stagger className="grid gap-4 sm:grid-cols-2">
-      {tropes.map((t) => {
+    <div className="grid gap-4 sm:grid-cols-2">
+      {tropes.map((t, idx) => {
         const selected = t.id === selectedId
         const pm = PLATFORM_META[t.platform?.toLowerCase()] ?? { label: t.platform, tone: 'neutral' as Tone }
         return (
-          <StaggerItem key={t.id}>
+          <StaggerItem key={t.id} index={idx}>
             <div
               className={cn(
-                'group flex h-full flex-col rounded-lg border bg-surface p-5 transition-all duration-200',
-                selected ? 'border-primary shadow-[0_0_0_1px_var(--nf-primary)]' : 'border-line hover:-translate-y-0.5 hover:border-line-strong hover:shadow-raised',
+                'group flex h-full flex-col rounded-lg border bg-surface p-5 transition-[border-color,box-shadow,transform] duration-200 active:scale-[.994]',
+                selected ? 'border-primary shadow-[0_0_0_1px_var(--nf-primary)]' : 'nf-card-lift border-line hover:border-line-strong',
               )}
             >
               <button type="button" onClick={() => onSelect(t)} aria-pressed={selected} className="flex-1 text-left">
@@ -403,7 +419,7 @@ function TropeGrid({ tropes, loading, selectedId, onSelect, onApply }: { tropes:
           </StaggerItem>
         )
       })}
-    </Stagger>
+    </div>
   )
 }
 
@@ -424,11 +440,11 @@ function LiveList({ items, onUse }: { items: LiveHotspotItem[]; onUse: (it: Live
   if (items.length === 0) return <EmptyState icon={<Flame />} title="暂无实时榜单" description="点击「刷新榜单」采集最新热点。" />
   return (
     <Card padding="none">
-      <Stagger>
+      <div>
         {items.map((it, idx) => {
           const rank = it.rank ?? idx + 1
           return (
-            <StaggerItem key={it.id || idx} className="group flex gap-4 border-b border-line px-5 py-4 last:border-0 hover:bg-surface-2/50">
+            <StaggerItem key={it.id || idx} index={idx} className="group flex gap-4 border-b border-line px-5 py-4 transition-colors duration-150 last:border-0 hover:bg-surface-2/50">
               <span className={cn('grid size-8 shrink-0 place-items-center rounded-full font-display text-body font-medium tabular-nums', rank <= 3 ? 'nf-gradient-bg text-white' : 'bg-surface-2 text-muted')}>{rank}</span>
               <div className="min-w-0 flex-1">
                 <div className="flex items-start justify-between gap-3">
@@ -451,7 +467,7 @@ function LiveList({ items, onUse }: { items: LiveHotspotItem[]; onUse: (it: Live
             </StaggerItem>
           )
         })}
-      </Stagger>
+      </div>
     </Card>
   )
 }
@@ -478,7 +494,7 @@ function MemeList({
           ]}
         />
         <div className="flex flex-wrap items-center gap-2 text-caption text-muted">
-          <span>CNMeme Wiki · 近 7 天双条件准入</span>
+          <span>近 7 天新热梗</span>
           {meta?.lastSuccessAt && <span>· 同步于 {formatDateTime(meta.lastSuccessAt)}</span>}
           {meta?.usingCache && <Badge tone="warning">缓存兜底</Badge>}
         </div>
@@ -488,11 +504,11 @@ function MemeList({
       {memes.length === 0 ? (
         <EmptyState icon={<Zap />} title="暂无词条" description="切换状态，或点击「同步」拉取最新的梗。" />
       ) : (
-        <Stagger className="grid gap-3">
-          {memes.map((m) => {
+        <div className="grid gap-3">
+          {memes.map((m, idx) => {
             const st = MEME_STATUS[m.status] ?? { label: m.status, tone: 'neutral' as Tone }
             return (
-              <StaggerItem key={m.slug}>
+              <StaggerItem key={m.slug} index={idx}>
                 <Card padding="md" className="hover:border-line-strong">
                   <div className="flex flex-wrap items-start justify-between gap-2">
                     <div className="flex items-center gap-2">
@@ -502,7 +518,7 @@ function MemeList({
                     {m.sourceUrl && <a href={m.sourceUrl} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-caption text-primary hover:underline">出处<ExternalLink className="size-3" /></a>}
                   </div>
                   {m.summary && <p className="mt-1.5 text-body text-body">{m.summary}</p>}
-                  {m.statusReason && <p className="mt-1 text-caption text-muted">准入判定：{m.statusReason}</p>}
+                  {m.statusReason && <p className="mt-1 text-caption text-muted">入选说明：{m.statusReason}</p>}
                   <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1 text-caption text-muted">
                     <Meta label="最早传播">{m.earliestSpreadAt ? new Date(m.earliestSpreadAt).toLocaleDateString('zh-CN') : '未核实'}</Meta>
                     <Meta label="独立创作者">{m.independentCreatorsCount ?? 0} 位</Meta>
@@ -515,7 +531,7 @@ function MemeList({
               </StaggerItem>
             )
           })}
-        </Stagger>
+        </div>
       )}
 
       {total > 0 && (

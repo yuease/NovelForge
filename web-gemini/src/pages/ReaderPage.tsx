@@ -7,12 +7,14 @@ import {
 } from 'lucide-react'
 import { api } from '../lib/api'
 import { cn } from '../lib/cn'
+import { downloadFile } from '../lib/download'
+import { COLLAPSE_MOTION, EASE_EXIT, EASE_OUT, SPRING_INDICATOR, TAB_MOTION } from '../lib/motion'
 import { navigate } from '../lib/router'
 import { formatNumber, messageOf } from '../lib/format'
 import type { ChapterRecord } from '../lib/types'
 import { useStudio } from '../state/studio'
 import {
-  Alert, Badge, Button, Card, Checkbox, EmptyState, IconButton, Input, PageHeader, Segmented, useToast,
+  Alert, Badge, Button, Card, Checkbox, EmptyState, IconButton, Input, PageHeader, Segmented, Select, useToast,
 } from '../components/ui'
 
 type FontSize = 'sm' | 'md' | 'lg'
@@ -47,6 +49,7 @@ export default function ReaderPage() {
   const position = sorted.findIndex((c) => c.chapterNumber === selectedNum)
 
   useEffect(() => { setEditing(false); setError(null) }, [job?.id, selectedNum])
+  useEffect(() => { setFocus(false) }, [job?.id])
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase()
@@ -61,18 +64,28 @@ export default function ReaderPage() {
   const prev = position > 0 ? sorted[position - 1] : null
   const next = position >= 0 && position < sorted.length - 1 ? sorted[position + 1] : null
 
-  // ← / → to turn pages
+  // ← / → to turn pages (ignore form inputs, contentEditable, and browser modifier shortcuts)
   useEffect(() => {
     if (editing) return
     const onKey = (e: KeyboardEvent) => {
-      const tag = (e.target as HTMLElement)?.tagName
-      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return
-      if (e.key === 'ArrowLeft' && prev) select(prev.chapterNumber)
-      if (e.key === 'ArrowRight' && next) select(next.chapterNumber)
+      if (e.metaKey || e.ctrlKey || e.altKey) return
+      const target = e.target as HTMLElement | null
+      if (target && (target.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName))) return
+      if (e.key === 'ArrowLeft' && prev) {
+        e.preventDefault()
+        setDirection(-1)
+        setSelectedNum(prev.chapterNumber)
+        if (!focus) document.getElementById('reader-chapter')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+      } else if (e.key === 'ArrowRight' && next) {
+        e.preventDefault()
+        setDirection(1)
+        setSelectedNum(next.chapterNumber)
+        if (!focus) document.getElementById('reader-chapter')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+      }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  })
+  }, [editing, focus, prev, next])
 
   const startEditing = () => {
     if (!active) return
@@ -121,17 +134,17 @@ export default function ReaderPage() {
         eyebrow={job.genre}
         title={`《${title}》`}
         description={`已生成 ${sorted.length} / ${job.totalChapters} 章 · 共 ${formatNumber(job.totalWords)} 字`}
-        actions={<ExportMenu jobId={job.id} />}
+        actions={<ExportMenu jobId={job.id} bookTitle={title} completedChapters={sorted.length} totalChapters={job.totalChapters} />}
       />
 
-      <div className="grid items-start gap-6 xl:grid-cols-[300px_minmax(0,1fr)]">
+      <div className="grid items-start gap-6 @[920px]/main:grid-cols-[300px_minmax(0,1fr)]">
         {/* TOC */}
-        <Card padding="none" as="aside" className="xl:sticky xl:top-20">
+        <Card padding="none" as="aside" className="@[920px]/main:sticky @[920px]/main:top-20">
           <div className="border-b border-line p-4">
             <Input leading={<Search />} type="search" value={query} onChange={(e) => setQuery(e.target.value)} placeholder="章号或标题" aria-label="搜索章节" className="rounded-full" />
           </div>
           {volumes.length > 0 && <Volumes volumes={volumes} />}
-          <nav aria-label="章节目录" className="max-h-[300px] overflow-y-auto p-2 xl:max-h-[calc(100vh-280px)]">
+          <nav aria-label="章节目录" className="max-h-[300px] overflow-y-auto p-2 @[920px]/main:max-h-[calc(100vh-280px)]">
             {filtered.map((c) => {
               const sel = c.chapterNumber === selectedNum
               return (
@@ -141,11 +154,11 @@ export default function ReaderPage() {
                   onClick={() => select(c.chapterNumber)}
                   aria-current={sel ? 'true' : undefined}
                   className={cn(
-                    'relative flex w-full items-center gap-3 rounded-md px-3 py-2.5 text-left transition-colors',
+                    'relative flex w-full items-center gap-3 rounded-md px-3 py-2.5 text-left transition-[color,background-color,transform] duration-150 active:scale-[.985]',
                     sel ? 'text-primary' : 'text-body hover:bg-surface-2',
                   )}
                 >
-                  {sel && <motion.span layoutId="toc-active" className="absolute inset-0 rounded-md bg-primary-soft" transition={{ type: 'spring', stiffness: 500, damping: 40 }} />}
+                  {sel && <motion.span layoutId="toc-active" className="absolute inset-0 rounded-md bg-primary-soft" transition={SPRING_INDICATOR} />}
                   <span className="relative min-w-0 flex-1">
                     <span className={cn('block truncate text-body', sel && 'font-medium')}>{chapterHeading(c)}</span>
                     <span className="block text-caption text-muted">
@@ -197,45 +210,54 @@ export default function ReaderPage() {
               </div>
 
               <div className="px-5 py-8 sm:px-10 md:py-12">
-                {error && <Alert tone="danger" className="mb-6" onClose={() => setError(null)}>{error}</Alert>}
-                {editing ? (
-                  <div className="mx-auto grid max-w-[46rem] gap-4">
-                    <input
-                      value={draftTitle}
-                      onChange={(e) => setDraftTitle(e.target.value)}
-                      placeholder="章节标题"
-                      className="w-full border-0 border-b border-line bg-transparent pb-2 font-display text-headline text-ink focus:border-primary focus:outline-none"
-                    />
-                    <textarea
-                      rows={24}
-                      value={draftContent}
-                      onChange={(e) => setDraftContent(e.target.value)}
-                      className={cn('w-full resize-y rounded-md bg-surface-2 p-5 font-serif text-ink focus:outline-none focus:ring-2 focus:ring-primary/30', FONT[fontSize])}
-                    />
-                    <div className="flex flex-wrap items-center justify-between gap-4">
-                      <div className="flex flex-wrap gap-5">
-                        <Checkbox checked={reverify} onChange={setReverify} label="保存后重新审校" />
-                        <Checkbox checked={recheckDownstream} onChange={setRecheckDownstream} label="检查后续章节一致性" />
-                      </div>
-                      <span className="text-caption tabular-nums text-muted">{draftContent.length.toLocaleString()} 字</span>
-                    </div>
-                  </div>
-                ) : (
-                  <AnimatePresence mode="wait" custom={direction}>
-                    <motion.div
-                      key={active.chapterNumber}
-                      custom={direction}
-                      initial={{ opacity: 0, x: direction * 24 }}
-                      animate={{ opacity: 1, x: 0 }}
-                      exit={{ opacity: 0, x: direction * -24 }}
-                      transition={{ duration: 0.25, ease: [0.2, 0, 0, 1] }}
-                      className="mx-auto max-w-[42rem]"
-                    >
-                      <h2 className="mb-8 text-center font-serif text-headline font-normal text-ink">{chapterHeading(active)}</h2>
-                      <Prose content={active.content} size={fontSize} />
+                <AnimatePresence initial={false}>
+                  {error && (
+                    <motion.div {...COLLAPSE_MOTION} className="overflow-hidden">
+                      <Alert tone="danger" className="mb-6" onClose={() => setError(null)}>{error}</Alert>
                     </motion.div>
-                  </AnimatePresence>
-                )}
+                  )}
+                </AnimatePresence>
+                <AnimatePresence mode="wait" initial={false}>
+                  {editing ? (
+                    <motion.div key="editor-mode" {...TAB_MOTION} className="mx-auto grid max-w-[46rem] gap-4">
+                      <input
+                        value={draftTitle}
+                        onChange={(e) => setDraftTitle(e.target.value)}
+                        placeholder="章节标题"
+                        className="w-full border-0 border-b border-line bg-transparent pb-2 font-display text-headline text-ink transition-colors focus:border-primary focus:outline-none"
+                      />
+                      <textarea
+                        rows={24}
+                        value={draftContent}
+                        onChange={(e) => setDraftContent(e.target.value)}
+                        className={cn('w-full resize-y rounded-md bg-surface-2 p-5 font-serif text-ink transition-shadow focus:outline-none focus:ring-2 focus:ring-primary/30', FONT[fontSize])}
+                      />
+                      <div className="flex flex-wrap items-center justify-between gap-4">
+                        <div className="flex flex-wrap gap-5">
+                          <Checkbox checked={reverify} onChange={setReverify} label="保存后重新审校" />
+                          <Checkbox checked={recheckDownstream} onChange={setRecheckDownstream} label="检查后续章节一致性" />
+                        </div>
+                        <span className="text-caption tabular-nums text-muted">{draftContent.length.toLocaleString()} 字</span>
+                      </div>
+                    </motion.div>
+                  ) : (
+                    <motion.div key="read-mode" {...TAB_MOTION}>
+                      <AnimatePresence mode="wait" initial={false} custom={direction}>
+                        <motion.div
+                          key={active.chapterNumber}
+                          custom={direction}
+                          initial={{ opacity: 0, x: direction * 18 }}
+                          animate={{ opacity: 1, x: 0, transition: { duration: 0.22, ease: EASE_OUT } }}
+                          exit={{ opacity: 0, x: direction * -18, transition: { duration: 0.12, ease: EASE_EXIT } }}
+                          className="mx-auto max-w-[42rem]"
+                        >
+                          <h2 className="mb-8 text-center font-serif text-headline font-normal text-ink">{chapterHeading(active)}</h2>
+                          <Prose content={active.content} size={fontSize} />
+                        </motion.div>
+                      </AnimatePresence>
+                    </motion.div>
+                  )}
+                </AnimatePresence>
               </div>
 
               {!editing && <PageTurner prev={prev} next={next} onSelect={select} />}
@@ -250,8 +272,11 @@ export default function ReaderPage() {
         open={focus && !!active}
         onClose={() => setFocus(false)}
         chapter={active}
+        chapters={sorted}
         size={fontSize}
+        onSizeChange={setFontSize}
         bookTitle={title}
+        direction={direction}
         prev={prev}
         next={next}
         onSelect={select}
@@ -272,13 +297,13 @@ function Prose({ content, size }: { content: string; size: FontSize }) {
 function PageTurner({ prev, next, onSelect }: { prev: ChapterRecord | null; next: ChapterRecord | null; onSelect: (n: number) => void }) {
   return (
     <nav aria-label="章节翻页" className="grid grid-cols-2 border-t border-line">
-      <button type="button" disabled={!prev} onClick={() => prev && onSelect(prev.chapterNumber)} className="group flex items-center gap-3 px-6 py-4 text-left transition-colors hover:bg-surface-2 disabled:pointer-events-none disabled:opacity-40">
-        <ArrowLeft className="size-4 text-muted transition-transform group-hover:-translate-x-1" />
+      <button type="button" disabled={!prev} onClick={() => prev && onSelect(prev.chapterNumber)} className="group flex items-center gap-3 px-6 py-4 text-left transition-[background-color,transform] duration-150 hover:bg-surface-2 active:scale-[.99] disabled:pointer-events-none disabled:opacity-40">
+        <ArrowLeft className="size-4 text-muted transition-transform duration-200 ease-[var(--ease-emphasized)] group-hover:-translate-x-1" />
         <span className="min-w-0"><span className="block text-caption text-muted">上一章</span><span className="block truncate text-body text-ink">{prev ? chapterHeading(prev) : '没有了'}</span></span>
       </button>
-      <button type="button" disabled={!next} onClick={() => next && onSelect(next.chapterNumber)} className="group flex items-center justify-end gap-3 border-l border-line px-6 py-4 text-right transition-colors hover:bg-surface-2 disabled:pointer-events-none disabled:opacity-40">
+      <button type="button" disabled={!next} onClick={() => next && onSelect(next.chapterNumber)} className="group flex items-center justify-end gap-3 border-l border-line px-6 py-4 text-right transition-[background-color,transform] duration-150 hover:bg-surface-2 active:scale-[.99] disabled:pointer-events-none disabled:opacity-40">
         <span className="min-w-0"><span className="block text-caption text-muted">下一章</span><span className="block truncate text-body text-ink">{next ? chapterHeading(next) : '没有了'}</span></span>
-        <ArrowRight className="size-4 text-muted transition-transform group-hover:translate-x-1" />
+        <ArrowRight className="size-4 text-muted transition-transform duration-200 ease-[var(--ease-emphasized)] group-hover:translate-x-1" />
       </button>
     </nav>
   )
@@ -288,13 +313,13 @@ function Volumes({ volumes }: { volumes: NonNullable<NonNullable<import('../lib/
   const [open, setOpen] = useState(false)
   return (
     <div className="border-b border-line">
-      <button type="button" onClick={() => setOpen(!open)} className="flex w-full items-center justify-between px-4 py-3 text-caption font-medium text-body hover:bg-surface-2">
+      <button type="button" onClick={() => setOpen(!open)} className="flex w-full items-center justify-between px-4 py-3 text-caption font-medium text-body transition-colors duration-150 hover:bg-surface-2">
         分卷 · {volumes.length} 卷
-        <ChevronDown className={cn('size-4 transition-transform', open && 'rotate-180')} />
+        <ChevronDown className={cn('size-4 transition-transform duration-200 ease-[var(--ease-emphasized)]', open && 'rotate-180')} />
       </button>
       <AnimatePresence initial={false}>
         {open && (
-          <motion.ul initial={{ height: 0 }} animate={{ height: 'auto' }} exit={{ height: 0 }} className="overflow-hidden px-4">
+          <motion.ul {...COLLAPSE_MOTION} className="overflow-hidden px-4">
             {volumes.map((v, i) => (
               <li key={i} className="pb-3 text-caption">
                 <span className="font-medium text-primary">第{v.volumeNumber ?? i + 1}卷 {v.title}</span>
@@ -309,40 +334,92 @@ function Volumes({ volumes }: { volumes: NonNullable<NonNullable<import('../lib/
   )
 }
 
-function ExportMenu({ jobId }: { jobId: string }) {
+function ExportMenu({ jobId, bookTitle, completedChapters, totalChapters }: { jobId: string; bookTitle: string; completedChapters: number; totalChapters: number }) {
+  const toast = useToast()
+  const [downloading, setDownloading] = useState<'txt' | 'md' | 'docx' | null>(null)
+
+  const handleExport = async (fmt: 'txt' | 'md' | 'docx', label: string) => {
+    if (downloading) return
+    setDownloading(fmt)
+    try {
+      await downloadFile(api.getExportUrl(jobId, fmt), `${bookTitle}.${fmt}`)
+      const partial = totalChapters > 0 && completedChapters < totalChapters
+        ? `（当前已完成的 ${completedChapters}/${totalChapters} 章）`
+        : ''
+      toast(`已导出 ${label}${partial}`, 'success')
+    } catch (err) {
+      toast(messageOf(err, `导出 ${label} 失败，请稍后重试`), 'danger')
+    } finally {
+      setDownloading(null)
+    }
+  }
+
   return (
     <div className="flex flex-wrap items-center gap-2">
-      <a href={api.getExportUrl(jobId, 'txt')} download className="inline-flex h-10 items-center gap-2 rounded-full border border-line-strong bg-surface px-4 text-body font-medium text-primary transition-colors hover:bg-primary-soft">
-        <Download className="size-4" />TXT
-      </a>
-      <a href={api.getExportUrl(jobId, 'md')} download className="inline-flex h-10 items-center gap-2 rounded-full border border-line-strong bg-surface px-4 text-body font-medium text-primary transition-colors hover:bg-primary-soft">
-        <FileText className="size-4" />Markdown
-      </a>
-      <a
-        href={api.getExportUrl(jobId, 'docx')}
-        download
-        title="番茄完本批量上传格式：标题1拆章、第1章 标题、无简介分隔线、单文件≤5MB"
-        className="nf-gradient-bg inline-flex h-10 items-center gap-2 rounded-full px-5 text-body font-medium text-white shadow-[0_6px_20px_-6px_rgb(66_133_244/.55)] transition-[background-position,box-shadow] duration-500 hover:[background-position:100%_0]"
+      <Button
+        variant="secondary"
+        size="sm"
+        loading={downloading === 'txt'}
+        disabled={downloading !== null && downloading !== 'txt'}
+        icon={<Download className="size-4" />}
+        onClick={() => void handleExport('txt', 'TXT 正文')}
       >
-        <Download className="size-4" />番茄投稿 DOCX
-      </a>
+        TXT
+      </Button>
+      <Button
+        variant="secondary"
+        size="sm"
+        loading={downloading === 'md'}
+        disabled={downloading !== null && downloading !== 'md'}
+        icon={<FileText className="size-4" />}
+        onClick={() => void handleExport('md', 'Markdown 文稿')}
+      >
+        Markdown
+      </Button>
+      <Button
+        variant="gradient"
+        size="sm"
+        loading={downloading === 'docx'}
+        disabled={downloading !== null && downloading !== 'docx'}
+        icon={<Download className="size-4" />}
+        title="番茄完本批量上传格式：标题1拆章、第1章 标题、无简介分隔线、单文件≤5MB"
+        onClick={() => void handleExport('docx', '番茄投稿 DOCX')}
+      >
+        番茄投稿 DOCX
+      </Button>
     </div>
   )
 }
 
 function FocusReader({
-  open, onClose, chapter, size, bookTitle, prev, next, onSelect,
-}: { open: boolean; onClose: () => void; chapter: ChapterRecord | null; size: FontSize; bookTitle: string; prev: ChapterRecord | null; next: ChapterRecord | null; onSelect: (n: number) => void }) {
+  open, onClose, chapter, chapters, size, onSizeChange, bookTitle, direction, prev, next, onSelect,
+}: {
+  open: boolean
+  onClose: () => void
+  chapter: ChapterRecord | null
+  chapters: ChapterRecord[]
+  size: FontSize
+  onSizeChange: (s: FontSize) => void
+  bookTitle: string
+  direction: number
+  prev: ChapterRecord | null
+  next: ChapterRecord | null
+  onSelect: (n: number) => void
+}) {
   const ref = useRef<HTMLDivElement>(null)
   const { scrollYProgress } = useScroll({ container: ref })
-  const progress = useSpring(scrollYProgress, { stiffness: 200, damping: 30 })
+  const progress = useSpring(scrollYProgress, { stiffness: 320, damping: 36, restDelta: 0.001 })
 
   useEffect(() => {
     if (!open) return
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
     window.addEventListener('keydown', onKey)
+    const previousOverflow = document.body.style.overflow
     document.body.style.overflow = 'hidden'
-    return () => { window.removeEventListener('keydown', onKey); document.body.style.overflow = '' }
+    return () => {
+      window.removeEventListener('keydown', onKey)
+      document.body.style.overflow = previousOverflow
+    }
   }, [open, onClose])
   useEffect(() => { ref.current?.scrollTo({ top: 0 }) }, [chapter?.chapterNumber])
 
@@ -350,24 +427,61 @@ function FocusReader({
     <AnimatePresence>
       {open && chapter && (
         <motion.div
-          initial={{ opacity: 0 }}
-          animate={{ opacity: 1 }}
-          exit={{ opacity: 0 }}
-          transition={{ duration: 0.25 }}
+          role="dialog"
+          aria-modal="true"
+          aria-label="专注全屏阅读"
+          initial={{ opacity: 0, scale: 0.985 }}
+          animate={{ opacity: 1, scale: 1, transition: { duration: 0.24, ease: EASE_OUT } }}
+          exit={{ opacity: 0, scale: 0.99, transition: { duration: 0.14, ease: EASE_EXIT } }}
           className="fixed inset-0 z-[80] bg-surface"
         >
           <motion.div className="nf-gradient-bg absolute inset-x-0 top-0 z-10 h-0.5 origin-left" style={{ scaleX: progress }} />
-          <div className="absolute inset-x-0 top-0 z-10 flex items-center justify-between bg-surface/80 px-6 py-3 backdrop-blur">
-            <span className="truncate text-caption text-muted">《{bookTitle}》· {chapterHeading(chapter)}</span>
-            <IconButton label="退出专注阅读 (Esc)" onClick={onClose}><Minimize2 className="size-5" /></IconButton>
+          <div className="absolute inset-x-0 top-0 z-10 flex flex-wrap items-center justify-between gap-3 border-b border-line/70 bg-surface/85 px-4 py-2.5 backdrop-blur sm:px-6">
+            <div className="flex min-w-0 items-center gap-2">
+              <span className="truncate text-body font-medium text-ink">《{bookTitle}》</span>
+              <span className="hidden text-caption text-muted md:inline">· {chapterHeading(chapter)}</span>
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <Select
+                aria-label="快速选章"
+                value={chapter.chapterNumber}
+                onChange={(e) => onSelect(Number(e.target.value))}
+                className="h-8 max-w-[200px] rounded-full text-caption"
+              >
+                {chapters.map((c) => (
+                  <option key={c.chapterNumber} value={c.chapterNumber}>{chapterHeading(c)}</option>
+                ))}
+              </Select>
+              <Segmented
+                size="sm"
+                value={size}
+                onChange={onSizeChange}
+                ariaLabel="正文字号"
+                options={[
+                  { value: 'sm', label: 'A-' },
+                  { value: 'md', label: 'A' },
+                  { value: 'lg', label: 'A+' },
+                ]}
+              />
+              <span className="hidden text-caption text-muted lg:inline">← → 翻章 · Esc 退出</span>
+              <Button size="sm" variant="ghost" icon={<Minimize2 className="size-4" />} onClick={onClose}>退出</Button>
+            </div>
           </div>
           <div ref={ref} className="h-full overflow-y-auto px-6 pb-24 pt-24">
-            <AnimatePresence mode="wait">
-              <motion.div key={chapter.chapterNumber} initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }} transition={{ duration: 0.3 }} className="mx-auto max-w-[40rem]">
+            <AnimatePresence mode="wait" initial={false} custom={direction}>
+              <motion.div
+                key={chapter.chapterNumber}
+                custom={direction}
+                initial={{ opacity: 0, x: direction * 18 }}
+                animate={{ opacity: 1, x: 0, transition: { duration: 0.22, ease: EASE_OUT } }}
+                exit={{ opacity: 0, x: direction * -18, transition: { duration: 0.12, ease: EASE_EXIT } }}
+                className="mx-auto max-w-[42rem]"
+              >
                 <h2 className="mb-10 text-center font-serif text-[26px] font-normal text-ink">{chapterHeading(chapter)}</h2>
                 <Prose content={chapter.content} size={size} />
-                <div className="mt-16 flex justify-between gap-4">
+                <div className="mt-16 flex items-center justify-between gap-4 border-t border-line pt-6">
                   <Button variant="ghost" disabled={!prev} icon={<ArrowLeft className="size-4" />} onClick={() => prev && onSelect(prev.chapterNumber)}>上一章</Button>
+                  <span className="text-caption tabular-nums text-muted">{formatNumber(chapter.wordCount ?? chapter.content.length)} 字</span>
                   <Button variant="tonal" disabled={!next} iconRight={<ArrowRight className="size-4" />} onClick={() => next && onSelect(next.chapterNumber)}>下一章</Button>
                 </div>
               </motion.div>

@@ -21,12 +21,12 @@ export const Card = forwardRef<HTMLDivElement, CardProps>(function Card(
     <Tag
       ref={ref}
       className={cn(
-        'relative rounded-lg transition-[border-color,box-shadow,background-color,transform] duration-200',
+        'relative min-w-0 rounded-lg transition-[border-color,box-shadow,background-color,transform] duration-[180ms] ease-[var(--ease-standard)]',
         variant === 'default' && 'border border-line bg-surface shadow-card',
         variant === 'flat' && 'bg-surface-2',
         variant === 'tinted' && 'border border-primary/15 bg-[image:var(--nf-gradient-soft)] bg-surface',
         variant === 'glow' && 'nf-glow-border border border-line bg-surface',
-        interactive && 'cursor-pointer hover:-translate-y-0.5 hover:border-line-strong hover:shadow-raised',
+        interactive && 'nf-card-lift cursor-pointer hover:border-line-strong hover:shadow-raised active:scale-[.994]',
         selected && 'border-primary! bg-primary-soft/60 ring-1 ring-primary',
         pad[padding],
         className,

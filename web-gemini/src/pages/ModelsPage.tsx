@@ -1,15 +1,18 @@
 import { useState } from 'react'
 import type { FormEvent } from 'react'
 import { AnimatePresence, motion } from 'motion/react'
-import { Check, ChevronRight, CircleOff, Cpu, KeyRound, Link2, RefreshCw, Search, Settings2, Zap } from 'lucide-react'
+import { Check, ChevronRight, CircleOff, Cpu, FlaskConical, KeyRound, Link2, RefreshCw, Search, Settings2, Star, Zap } from 'lucide-react'
 import { api } from '../lib/api'
 import { cn } from '../lib/cn'
 import { messageOf } from '../lib/format'
+import { COLLAPSE_MOTION, SPRING_INDICATOR, SPRING_TACTILE, TAB_MOTION } from '../lib/motion'
+import { navigate } from '../lib/router'
 import type { LLMProvider, ProviderCatalogEntry } from '../lib/types'
 import {
-  Alert, Badge, Button, Card, Disclosure, Divider, EmptyState, Field, Input, PageHeader, Select, Skeleton, Stagger, StaggerItem, Textarea,
+  Alert, Badge, Button, Card, Disclosure, Divider, EmptyState, Field, Input, PageHeader, Select, Skeleton, StaggerItem, Textarea, useToast,
 } from '../components/ui'
 import { notifyCatalogChanged, useModelCatalog } from '../components/model/ModelPicker'
+import ChatGPTConnection from './ChatGPTConnection'
 
 const MARKS: Partial<Record<string, string>> = {
   openai: 'O', anthropic: 'A', gemini: 'G', deepseek: 'D', qwen: 'Q', moonshot: 'K', zhipu: 'Z',
@@ -43,7 +46,11 @@ function ProviderMark({ entry, size = 'md' }: { entry: ProviderCatalogEntry; siz
 
 export default function ModelsPage() {
   const { catalog, loading, error, refresh } = useModelCatalog()
-  const [current, setCurrent] = useState<LLMProvider | null>(null)
+  const params = new URLSearchParams(window.location.hash.split('?')[1])
+  const [siwcResult] = useState(() => params.get('siwc'))
+  const [current, setCurrent] = useState<LLMProvider | null>(
+    siwcResult || params.get('provider') === 'openai-siwc' ? 'openai-siwc' : null,
+  )
   const [query, setQuery] = useState('')
   const [updates, setUpdates] = useState<Partial<Record<LLMProvider, ProviderCatalogEntry>>>({})
 
@@ -60,7 +67,17 @@ export default function ModelsPage() {
     notifyCatalogChanged()
   }
 
-  const header = <PageHeader title="模型管理" description="连接模型供应商，同步模型目录并设置默认模型。" />
+  const header = (
+    <PageHeader
+      title="模型管理"
+      description="连接模型供应商，同步模型目录并设置默认模型。"
+      actions={
+        <Button size="sm" variant="ghost" icon={<FlaskConical className="size-4" />} onClick={() => navigate('acceptance')}>
+          系统自检
+        </Button>
+      }
+    />
+  )
 
   if (loading && !catalog) {
     return (
@@ -82,10 +99,10 @@ export default function ModelsPage() {
     )
   }
 
-  const renderItem = (e: ProviderCatalogEntry) => {
+  const renderItem = (e: ProviderCatalogEntry, idx: number) => {
     const sel = selected?.providerId === e.providerId
     return (
-      <StaggerItem key={e.providerId}>
+      <StaggerItem key={e.providerId} index={idx}>
         <button
           type="button"
           aria-current={sel ? 'true' : undefined}
@@ -93,16 +110,16 @@ export default function ModelsPage() {
             setCurrent(e.providerId)
             if (window.innerWidth < 1024) document.getElementById('provider-detail')?.scrollIntoView({ behavior: 'smooth' })
           }}
-          className={cn('relative flex w-full items-center gap-3 rounded-md px-3 py-2.5 text-left transition-colors', sel ? '' : 'hover:bg-surface-2')}
+          className={cn('relative flex w-full items-center gap-3 rounded-md px-3 py-2.5 text-left transition-[color,background-color,transform] duration-150 active:scale-[.985]', sel ? '' : 'hover:bg-surface-2')}
         >
-          {sel && <motion.span layoutId="provider-active" className="absolute inset-0 rounded-md bg-primary-soft" transition={{ type: 'spring', stiffness: 500, damping: 40 }} />}
+          {sel && <motion.span layoutId="provider-active" className="absolute inset-0 rounded-md bg-primary-soft" transition={SPRING_INDICATOR} />}
           <span className="relative"><ProviderMark entry={e} /></span>
           <span className="relative min-w-0 flex-1">
             <span className={cn('block truncate text-body', sel ? 'font-medium text-primary' : 'text-ink')}>{e.label}</span>
             <span className="block text-caption text-muted">{e.providerId === 'mock' ? '本机可用' : e.configured ? `${e.models.length} 个模型` : '待配置'}</span>
           </span>
           {e.providerId === catalog?.activeProvider && e.configured && <Badge tone="primary" className="relative">默认</Badge>}
-          <ChevronRight className={cn('relative size-4 text-muted transition-transform', sel && 'translate-x-0.5 text-primary')} />
+          <ChevronRight className={cn('relative size-4 text-muted transition-transform duration-200 ease-[var(--ease-emphasized)]', sel && 'translate-x-0.5 text-primary')} />
         </button>
       </StaggerItem>
     )
@@ -111,25 +128,27 @@ export default function ModelsPage() {
   return (
     <>
       {header}
-      <div className="grid items-start gap-6 lg:grid-cols-[320px_minmax(0,1fr)]">
-        <Card padding="none" as="aside" className="lg:sticky lg:top-20">
+      <div className="grid items-start gap-6 @[820px]/main:grid-cols-[300px_minmax(0,1fr)]">
+        <Card padding="none" as="aside" className="@[820px]/main:sticky @[820px]/main:top-20">
           <div className="border-b border-line p-4">
             <Input leading={<Search />} aria-label="搜索供应商" value={query} placeholder="搜索供应商" onChange={(e) => setQuery(e.target.value)} className="rounded-full" />
           </div>
-          <nav aria-label="模型供应商" className="max-h-[360px] overflow-y-auto p-2 lg:max-h-[calc(100vh-240px)]">
+          <nav aria-label="模型供应商" className="max-h-[360px] overflow-y-auto p-2 @[820px]/main:max-h-[calc(100vh-240px)]">
             {configured.length > 0 && <div className="px-3 pb-1 pt-2 text-caption font-medium text-muted">已连接</div>}
-            <Stagger>{configured.map(renderItem)}</Stagger>
+            <div>{configured.map(renderItem)}</div>
             {pending.length > 0 && <div className="px-3 pb-1 pt-4 text-caption font-medium text-muted">可添加</div>}
-            <Stagger>{pending.map(renderItem)}</Stagger>
+            <div>{pending.map(renderItem)}</div>
             {!visible.length && <p className="py-8 text-center text-caption text-muted">没有匹配的供应商</p>}
           </nav>
         </Card>
 
         <div id="provider-detail" className="min-w-0 scroll-mt-20">
-          <AnimatePresence mode="wait">
+          <AnimatePresence mode="wait" initial={false}>
             {selected ? (
-              <motion.div key={selected.providerId} initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -6 }} transition={{ duration: 0.22 }}>
-                <ProviderDetail entry={selected} onUpdate={replace} />
+              <motion.div key={selected.providerId} {...TAB_MOTION}>
+                {selected.authKind === 'oauth'
+                  ? <ChatGPTConnection entry={selected} result={siwcResult} onUpdate={replace} />
+                  : <ProviderDetail entry={selected} isActiveProvider={selected.providerId === catalog?.activeProvider} onUpdate={replace} />}
               </motion.div>
             ) : (
               <EmptyState title="模型目录暂不可用" />
@@ -141,20 +160,19 @@ export default function ModelsPage() {
   )
 }
 
-function ProviderDetail({ entry, onUpdate }: { entry: ProviderCatalogEntry; onUpdate: (e: ProviderCatalogEntry) => void }) {
+function ProviderDetail({ entry, isActiveProvider, onUpdate }: { entry: ProviderCatalogEntry; isActiveProvider: boolean; onUpdate: (e: ProviderCatalogEntry) => void }) {
+  const toast = useToast()
   const [editing, setEditing] = useState(false)
   const [endpoint, setEndpoint] = useState('')
   const [key, setKey] = useState('')
   const [manualIds, setManualIds] = useState('')
-  const [busy, setBusy] = useState<'save' | 'discover' | 'model' | 'test' | null>(null)
+  const [busy, setBusy] = useState<'save' | 'discover' | 'model' | 'default' | 'test' | null>(null)
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
-  const [modelDraft, setModelDraft] = useState<string | null>(null)
   const isMock = entry.providerId === 'mock'
   const vertexKeyOnly = entry.discoveryBlock === 'vertex-oauth'
   const showForm = !isMock && (!entry.configured || editing)
   const allowsManual = !isMock && (!entry.discoverySupported || entry.providerId === 'openai-compatible' || entry.providerId === 'ollama')
   const currentModel = entry.selectedModel || entry.models[0] || ''
-  const selected = modelDraft ?? currentModel
 
   const beginEdit = () => {
     setEndpoint(entry.baseUrl || '')
@@ -167,8 +185,9 @@ function ProviderDetail({ entry, onUpdate }: { entry: ProviderCatalogEntry; onUp
   const discover = async (okText?: string) => {
     const { provider } = await api.discoverProviderModels(entry.providerId)
     onUpdate(provider)
-    setModelDraft(null)
-    setMessage({ type: 'success', text: okText || `已同步 ${provider.models.length} 个模型。` })
+    const msg = okText || `已同步 ${provider.models.length} 个模型`
+    setMessage({ type: 'success', text: msg })
+    toast(msg, 'success')
   }
 
   const saveConnection = async (e: FormEvent) => {
@@ -185,10 +204,10 @@ function ProviderDetail({ entry, onUpdate }: { entry: ProviderCatalogEntry; onUp
       onUpdate(provider)
       setKey('')
       setEditing(false)
-      setModelDraft(null)
       setMessage({ type: 'success', text: '连接设置已保存。' })
+      toast('连接设置已保存', 'success')
       if (provider.discoverySupported && provider.configured && models.length === 0) {
-        try { await discover('连接设置已保存，模型列表已同步。') } catch (err) {
+        try { await discover('连接设置已保存，模型列表已同步') } catch (err) {
           setMessage({ type: 'error', text: `连接已保存，暂时无法同步模型：${messageOf(err, '请检查连接设置。')}` })
         }
       }
@@ -202,21 +221,46 @@ function ProviderDetail({ entry, onUpdate }: { entry: ProviderCatalogEntry; onUp
   const wrap = (kind: NonNullable<typeof busy>, fn: () => Promise<void>, fallback: string) => async () => {
     setBusy(kind)
     setMessage(null)
-    try { await fn() } catch (err) { setMessage({ type: 'error', text: messageOf(err, fallback) }) } finally { setBusy(null) }
+    try { await fn() } catch (err) {
+      const msg = messageOf(err, fallback)
+      setMessage({ type: 'error', text: msg })
+      toast(msg, 'danger')
+    } finally { setBusy(null) }
   }
 
   const refreshModels = wrap('discover', () => discover(), '无法同步模型列表。')
-  const saveDefault = wrap('model', async () => {
-    const { provider } = await api.saveModelProvider(entry.providerId, { selectedModel: selected })
-    onUpdate(provider)
-    setModelDraft(null)
-    setMessage({ type: 'success', text: '默认模型已更新。' })
-  }, '无法保存默认模型。')
+  const selectDefaultModel = async (nextModel: string) => {
+    if (!nextModel || nextModel === entry.selectedModel || busy !== null || !entry.configured || isMock) return
+    setBusy('model')
+    setMessage(null)
+    try {
+      const { provider } = await api.saveModelProvider(entry.providerId, { selectedModel: nextModel })
+      onUpdate(provider)
+      toast(`已将 ${nextModel} 设为默认模型`, 'success')
+    } catch (err) {
+      const msg = messageOf(err, '无法保存默认模型。')
+      setMessage({ type: 'error', text: msg })
+      toast(msg, 'danger')
+    } finally {
+      setBusy(null)
+    }
+  }
+  const setAsActiveProvider = wrap('default', async () => {
+    await api.saveProviderConfig({ provider: entry.providerId, model: currentModel || undefined })
+    notifyCatalogChanged()
+    toast(`已将 ${entry.label} 设为全站默认供应商`, 'success')
+  }, '无法切换默认供应商。')
   const testConnection = wrap('test', async () => {
-    const r = await api.testProviderConnection({ provider: entry.providerId, model: selected })
-    setMessage(r.ok
-      ? { type: 'success', text: `模型连接正常${r.latencyMs ? ` · ${r.latencyMs} 毫秒` : ''}${r.replyPreview ? ` · “${r.replyPreview.slice(0, 40)}”` : ''}` }
-      : { type: 'error', text: r.error || '模型连接测试失败。' })
+    const r = await api.testProviderConnection({ provider: entry.providerId, model: currentModel })
+    if (r.ok) {
+      const msg = `模型连接正常${r.latencyMs ? ` · ${r.latencyMs} 毫秒` : ''}${r.replyPreview ? ` · “${r.replyPreview.slice(0, 40)}”` : ''}`
+      setMessage({ type: 'success', text: msg })
+      toast(`连接测试通过${r.latencyMs ? `（${r.latencyMs}ms）` : ''}`, 'success')
+    } else {
+      const msg = r.error || '模型连接测试失败。'
+      setMessage({ type: 'error', text: msg })
+      toast(msg, 'danger')
+    }
   }, '模型连接测试失败。')
 
   return (
@@ -227,7 +271,14 @@ function ProviderDetail({ entry, onUpdate }: { entry: ProviderCatalogEntry; onUp
           <h2 className="font-display text-headline font-normal text-ink">{entry.label}</h2>
           <p className="mt-0.5 text-body text-muted">{entry.description}</p>
         </div>
-        <Badge tone={isMock || entry.configured ? 'success' : 'neutral'} dot>{isMock ? '本机可用' : entry.configured ? '已连接' : '待配置'}</Badge>
+        <div className="flex flex-wrap items-center gap-2">
+          {entry.configured && !isMock && !isActiveProvider && (
+            <Button size="sm" variant="tonal" loading={busy === 'default'} disabled={busy !== null && busy !== 'default'} icon={<Star className="size-3.5" />} onClick={() => void setAsActiveProvider()}>
+              设为默认供应商
+            </Button>
+          )}
+          <Badge tone={isMock || entry.configured ? 'success' : 'neutral'} dot>{isMock ? '本机可用' : isActiveProvider ? '当前默认' : entry.configured ? '已连接' : '待配置'}</Badge>
+        </div>
       </div>
 
       <Divider />
@@ -256,9 +307,7 @@ function ProviderDetail({ entry, onUpdate }: { entry: ProviderCatalogEntry; onUp
         <AnimatePresence initial={false}>
           {showForm && (
             <motion.form
-              initial={{ opacity: 0, height: 0 }}
-              animate={{ opacity: 1, height: 'auto' }}
-              exit={{ opacity: 0, height: 0 }}
+              {...COLLAPSE_MOTION}
               className="grid gap-4 overflow-hidden"
               onSubmit={(e) => void saveConnection(e)}
             >
@@ -309,42 +358,49 @@ function ProviderDetail({ entry, onUpdate }: { entry: ProviderCatalogEntry; onUp
         {vertexKeyOnly && <Alert tone="primary" className="mb-4">官方 Vertex 的模型目录需要 OAuth 2.0。API Key 连接可使用已保存和预设的模型，也可以在连接设置中登记模型 ID。</Alert>}
         {entry.models.length ? (
           <div className="grid gap-4">
-            <p className="text-caption text-muted">{entry.models.length} 个可选模型 · {SOURCE_LABEL[entry.modelSource]}{!entry.configured ? ' · 保存连接后可用于任务' : ''}</p>
+            <p className="text-caption text-muted">
+              {entry.models.length} 个可选模型 · {SOURCE_LABEL[entry.modelSource]}
+              {!entry.configured ? ' · 保存连接后可用于任务' : !isMock ? ' · 点击任意模型即时设为默认' : ''}
+            </p>
             <div className="flex flex-wrap items-end gap-3">
               <Field label="默认模型" className="min-w-[240px] flex-1">
                 {(id) => (
-                  <Select id={id} value={selected} onChange={(e) => setModelDraft(e.target.value)} disabled={busy !== null || !entry.configured || isMock}>
-                    {selected && !entry.models.includes(selected) && <option value={selected}>{selected}</option>}
+                  <Select id={id} value={currentModel} onChange={(e) => void selectDefaultModel(e.target.value)} disabled={busy !== null || !entry.configured || isMock}>
+                    {currentModel && !entry.models.includes(currentModel) && <option value={currentModel}>{currentModel}</option>}
                     {entry.models.map((m) => <option key={m} value={m}>{m}</option>)}
                   </Select>
                 )}
               </Field>
               {entry.configured && !isMock && (
-                <>
-                  <Button variant="secondary" loading={busy === 'test'} disabled={(busy !== null && busy !== 'test') || !selected} icon={<Zap className="size-4" />} onClick={() => void testConnection()} title="向所选模型发送一条简短请求">
-                    验证连接
-                  </Button>
-                  <Button variant="primary" loading={busy === 'model'} disabled={(busy !== null && busy !== 'model') || !selected || selected === entry.selectedModel} icon={<Check className="size-4" />} onClick={() => void saveDefault()}>
-                    设为默认
-                  </Button>
-                </>
+                <Button variant="secondary" loading={busy === 'test'} disabled={(busy !== null && busy !== 'test') || !currentModel} icon={<Zap className="size-4" />} onClick={() => void testConnection()} title="向当前默认模型发送一条简短请求">
+                  测试连接
+                </Button>
               )}
             </div>
             <div className="flex max-h-48 flex-wrap gap-1.5 overflow-y-auto">
-              {entry.models.map((m) => (
-                <button
-                  key={m}
-                  type="button"
-                  disabled={!entry.configured || isMock || busy !== null}
-                  onClick={() => setModelDraft(m)}
-                  className={cn(
-                    'rounded-full px-3 py-1 font-mono text-caption transition-colors disabled:cursor-default',
-                    m === selected ? 'bg-primary text-on-primary' : 'bg-surface-2 text-body hover:bg-surface-3 disabled:hover:bg-surface-2',
-                  )}
-                >
-                  {m}{m === entry.selectedModel && m !== selected ? ' · 默认' : ''}
-                </button>
-              ))}
+              {entry.models.map((m) => {
+                const active = m === currentModel
+                return (
+                  <button
+                    key={m}
+                    type="button"
+                    disabled={!entry.configured || isMock || busy !== null}
+                    aria-pressed={active}
+                    onClick={() => void selectDefaultModel(m)}
+                    className={cn(
+                      'inline-flex items-center gap-1 rounded-full px-3 py-1 font-mono text-caption transition-[color,background-color,transform] duration-150 active:scale-[.95] disabled:cursor-default disabled:active:scale-100',
+                      active ? 'bg-primary text-on-primary shadow-card' : 'bg-surface-2 text-body hover:bg-surface-3 disabled:hover:bg-surface-2',
+                    )}
+                  >
+                    {active && (
+                      <motion.span initial={{ scale: 0.5, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} transition={SPRING_TACTILE}>
+                        <Check className="size-3" aria-hidden />
+                      </motion.span>
+                    )}
+                    {m}
+                  </button>
+                )
+              })}
             </div>
           </div>
         ) : (
@@ -352,9 +408,9 @@ function ProviderDetail({ entry, onUpdate }: { entry: ProviderCatalogEntry; onUp
         )}
       </section>
 
-      <AnimatePresence>
+      <AnimatePresence initial={false}>
         {message && (
-          <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: 'auto' }} exit={{ opacity: 0, height: 0 }} className="overflow-hidden">
+          <motion.div {...COLLAPSE_MOTION} className="overflow-hidden">
             <Alert tone={message.type === 'error' ? 'danger' : 'success'} className="mt-6" onClose={() => setMessage(null)}>{message.text}</Alert>
           </motion.div>
         )}

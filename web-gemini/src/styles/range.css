@@ -1,4 +1,7 @@
-/* Range input thumb */
+/* Tactile Apple-style range slider thumb (1:1 follow during drag, subtle scale on hover/press) */
+.nf-range {
+  touch-action: none;
+}
 .nf-range::-webkit-slider-thumb {
   -webkit-appearance: none;
   width: 18px;
@@ -6,14 +9,26 @@
   border-radius: 50%;
   background: var(--nf-surface);
   border: 2px solid var(--nf-primary);
-  box-shadow: var(--shadow-card);
-  transition: transform .15s, box-shadow .15s;
+  box-shadow: 0 1px 4px rgb(0 0 0 / .16);
+  transition: transform 140ms var(--ease-standard), box-shadow 180ms var(--ease-standard);
 }
-.nf-range::-webkit-slider-thumb:hover { transform: scale(1.12); box-shadow: 0 0 0 6px rgb(66 133 244 / .14); }
+.nf-range::-webkit-slider-thumb:hover {
+  transform: scale(1.1);
+  box-shadow: 0 0 0 6px rgb(66 133 244 / .14), 0 1px 4px rgb(0 0 0 / .18);
+}
+.nf-range:active::-webkit-slider-thumb {
+  transform: scale(1.16);
+  box-shadow: 0 0 0 8px rgb(66 133 244 / .18), 0 2px 6px rgb(0 0 0 / .22);
+}
 .nf-range::-moz-range-thumb {
-  width: 14px;
-  height: 14px;
+  width: 16px;
+  height: 16px;
   border-radius: 50%;
   background: var(--nf-surface);
   border: 2px solid var(--nf-primary);
+  box-shadow: 0 1px 4px rgb(0 0 0 / .16);
+  transition: transform 140ms var(--ease-standard), box-shadow 180ms var(--ease-standard);
+}
+.nf-range:active::-moz-range-thumb {
+  transform: scale(1.14);
 }

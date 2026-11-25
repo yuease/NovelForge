@@ -12,10 +12,14 @@ from langgraph.graph import END, START, StateGraph
 
 from .candidate_rounds import ROUND_KIND
 from .llm import DEFAULT_MAX_TOKENS
+from .manuscript_tools import readonly_tool_specs, run_readonly_tool
+from .openai_siwc import PROVIDER as SIWC, all_stages as siwc_all_stages
+from .providers import PROVIDERS
 from .revision import (
     AUDIT, LEDGER, VERIFIER, RevisionRuntime, reviewed_findings, revision_fallback_enabled,
     scoped_issues, surroundings, text_sections,
 )
+from .revision_store import timestamp
 from .revision_checks import (
     COMMON_PHRASES, RevisionContentError, audited_evidence, broken_ranges, chapter_number, compact_json, fingerprint, partition,
     phrase_counts, required_list, risk, string, validate_audit, windows,
@@ -150,6 +154,12 @@ SEAM = """
 返回 {"findings":[{"chapter":1,"quote":"候选稿中的连续原文","priority":"P0|P1|P2","problem":"具体问题"}]}。
 已明确的正常回顾及无问题的接缝返回空列表。
 """ + REPAIR_REVIEW
+
+VERIFIER_TOOL_GUIDE = (
+    "\n【跨章只读查证工具】若需确认本批之外其他章节（如前文伏笔、联动章、人物年龄/金额/器物口径）在改后候选稿（candidate）"
+    "或改前原稿（original）中的真实内容，可先调用 search_manuscript、read_chapter 或 read_chapters_batch 查证，"
+    "切勿凭空猜测或仅因未看到别章而误报问题。查证完毕后仍须严格按原 JSON 格式输出。"
+)
 
 
 def validated_semantic_outcomes(result, known, *, allow_missing=False):
@@ -379,6 +389,9 @@ class RevisionWorkflowV2(RevisionRuntime):
 
     async def audit_v2(self, state):
         run = state["run_id"]
+        record = self.store.get(run)
+        if record.get("targeted") and self.load(run, "v2-audit-summary") is not None:
+            return {}
         snapshot, original = self.source(run)
         mapping = self.load(run, "v2-map")
         defects = preflight(list(original.values()), mapping["volumes"])["defects"]
@@ -463,12 +476,12 @@ class RevisionWorkflowV2(RevisionRuntime):
         for index, batch in enumerate(batches, 1):
             ids = [item["id"] for item in batch]
             entries.append((f"decisions:{index}", {
-                "ledgerRequest": {"schema": LEDGER_PLANNING_SCHEMA, "phase": "decisions", "batch": index},
-                "contextHash": context_hash, "book": plan_input["book"], "coreLedger": core,
-                "issues": batch, "issueEvidence": {key: source_evidence[key] for key in ids if key in source_evidence},
+                "book": plan_input["book"], "contextHash": context_hash,
                 "allChapters": plan_input["allChapters"], "style": plan_input["style"],
                 "authorAnswers": answers, "requestedChange": plan_input["requestedChange"],
-                "authorAmendments": old.get("authorAmendments", []),
+                "authorAmendments": old.get("authorAmendments", []), "coreLedger": core,
+                "ledgerRequest": {"schema": LEDGER_PLANNING_SCHEMA, "phase": "decisions", "batch": index},
+                "issues": batch, "issueEvidence": {key: source_evidence[key] for key in ids if key in source_evidence},
                 "oldDecisions": [old_decisions[key] for key in ids if key in old_decisions],
             }))
 
@@ -596,9 +609,9 @@ class RevisionWorkflowV2(RevisionRuntime):
             if delta_version := work.get("ledgerDeltaVersion"):
                 slot = f"{slot}:ledger-{delta_version}"
             entries.append((slot, {
-                "book": snapshot["title"], "style": snapshot.get("styleGuide"),
+                "book": snapshot["title"], "style": snapshot.get("styleGuide"), "ledger": selected,
                 "editableChapters": allowed, "chapters": text_sections(allowed, base),
-                "boundaries": surroundings(unit["chapters"], base), "ledger": selected,
+                "boundaries": surroundings(unit["chapters"], base),
                 "requiredIssues": [item["id"] for item in selected["issues"]],
                 "feedback": [item for item in work["feedback"] if item.get("chapter") is None or item["chapter"] in allowed],
             }))
@@ -721,9 +734,19 @@ class RevisionWorkflowV2(RevisionRuntime):
             ]
             return selected
 
+        targeted_mode = bool(record.get("targeted"))
+        targeted_directive = self.load(run, "v2-hotfix", work["turn"]) if targeted_mode else None
+        review_scope_set = (
+            set(state.get("affected_chapters") or work.get("targets") or [])
+            | set(work.get("reviewChapters") or [])
+            | {item["chapter"] for item in prior_repairs}
+        ) if targeted_mode else None
+
         entries = []
         for unit in mapping["edit"]:
             numbers = unit["chapters"]
+            if review_scope_set is not None and not review_scope_set.intersection(numbers):
+                continue
             selected = review_ledger(numbers)
             issues = chapter_checks(selected["issues"], numbers)
             deferred = []
@@ -736,7 +759,10 @@ class RevisionWorkflowV2(RevisionRuntime):
             scoped_repairs = [item for item in prior_repairs if item["chapter"] in numbers]
             linked = sorted({n for item in scoped_repairs for n in item["repair"]["affectedChapters"]} - set(numbers))
             entries.append((f"batch:{unit['id']}", {
-                "book": snapshot["title"], "numbers": numbers, "candidate": text_sections(numbers, candidate),
+                "book": snapshot["title"], "style": snapshot.get("styleGuide"),
+                **({"targetedDirective": targeted_directive} if targeted_directive else {}),
+                "ledger": selected,
+                "numbers": numbers, "candidate": text_sections(numbers, candidate),
                 "before": text_sections(numbers, original), "boundaries": surroundings(numbers, candidate),
                 "lengthChanges": [{"chapter": n, "beforeChars": len(original[n]["content"]),
                                    "afterChars": len(candidate[n]["content"])} for n in numbers
@@ -750,18 +776,20 @@ class RevisionWorkflowV2(RevisionRuntime):
                     "title": candidate[n]["title"], "opening": candidate[n]["content"][:1200],
                     "ending": candidate[n]["content"][-1200:], "version": candidate_hashes[n],
                 } for n in linked},
-                "issues": issues, "ledger": selected, "style": snapshot.get("styleGuide"),
+                "issues": issues,
                 **({"editorCoverage": deferred} if deferred else {}),
                 "hints": [item for item in hard if item["chapter"] in numbers],
             }))
         for volume in mapping["volumes"][:-1]:
             n = volume["chapters"][-1]
+            if review_scope_set is not None and not review_scope_set.intersection((n, n + 1)):
+                continue
             entries.append((f"join:{n}", {
-                "numbers": [n, n + 1], "book": snapshot["title"],
+                "book": snapshot["title"], "ledger": review_ledger([n, n + 1]),
+                "repairLinks": review_links([n, n + 1]),
+                "numbers": [n, n + 1],
                 "titles": [candidate[number]["title"] for number in (n, n + 1)],
                 "ending": candidate[n]["content"][-1500:], "opening": candidate[n + 1]["content"][:1500],
-                "ledger": review_ledger([n, n + 1]),
-                "repairLinks": review_links([n, n + 1]),
             }))
 
         # A changed chapter, neighbor excerpt or rule changes the corresponding
@@ -826,9 +854,29 @@ class RevisionWorkflowV2(RevisionRuntime):
                 return {"findings": [*findings, *unresolved], "outcomes": outcomes, "concerns": concerns, "reviews": reviews,
                         **({"deferred": deferred} if deferred else {})}
 
-            return await self.model_json(run, "final" if join else "verifier", SEAM if join else SEMANTIC,
-                                         value, validate, DEFAULT_MAX_TOKENS,
-                                         fallback_on_final=None if join else lambda result, _: validate(result, allow_missing=True))
+            use_tools = bool(
+                not record["isMock"]
+                and os.getenv("NOVEL_FORGE_VERIFIER_TOOLS", "1") != "0"
+                and getattr(self.worker, "supports_native_tools", False)
+                and len(candidate) > len(allowed)
+            )
+            books = {"candidate": candidate, "original": original}
+
+            async def run_verifier_tool(name, args):
+                payload, touched = await asyncio.to_thread(run_readonly_tool, books, "candidate", name, args)
+                if payload.get("version") == "candidate":
+                    visible.update(touched)
+                return payload
+
+            base_instructions = SEAM if join else SEMANTIC
+            return await self.model_json(
+                run, "final" if join else "verifier",
+                base_instructions + (VERIFIER_TOOL_GUIDE if use_tools else ""),
+                value, validate, DEFAULT_MAX_TOKENS,
+                fallback_on_final=None if join else lambda result, _: validate(result, allow_missing=True),
+                tools=readonly_tool_specs(("candidate", "original")) if use_tools else None,
+                tool_runner=run_verifier_tool if use_tools else None,
+            )
 
         hotfix = work["turn"] and work.get("roundType") != "evaluation"
         stage = "hotcheck" if hotfix else "recheck" if work["attempt"] else "review"
@@ -985,6 +1033,116 @@ class RevisionWorkflowV2(RevisionRuntime):
                     candidateHistory=sorted({*record.get("candidateHistory", []), work["turn"]}),
                     changedCount=sum(candidate[n] != original[n] for n in original), candidateTurn=work["turn"])
 
+    def _resolve_targeted_models(self, previous, job, preferred_model):
+        def usable(raw):
+            if not isinstance(raw, dict):
+                return None
+            provider = string(raw.get("provider"), 64).strip()
+            model = string(raw.get("model"), 256).strip()
+            if not provider or not model or provider == "mock":
+                return None
+            if provider == SIWC and not siwc_all_stages():
+                return None
+            result = {"provider": provider, "model": model, "useSavedConnection": True}
+            if provider == SIWC and isinstance(raw.get("siwcProfileId"), str) and raw["siwcProfileId"]:
+                result["siwcProfileId"] = raw["siwcProfileId"]
+            return result
+
+        if previous and previous.get("workflowVersion") == 2 and not previous.get("isMock"):
+            ed, ver = usable(previous.get("editor")), usable(previous.get("verifier"))
+            if ed and ver:
+                return ed, ver
+        if found := usable(job.get("llmConfig")):
+            return found, found
+        if found := usable(preferred_model):
+            return found, found
+        catalog_fn = getattr(self.manuscripts, "get_model_catalog_configs", None)
+        if callable(catalog_fn):
+            snap = catalog_fn()
+            configs = snap.get("configs") or {}
+            ordered = [snap.get("activeProvider"), *(k for k in configs if k != snap.get("activeProvider"))]
+            for key in ordered:
+                cfg = configs.get(key)
+                defn = PROVIDERS.get(key or "")
+                if not isinstance(cfg, dict) or not defn or key in ("mock", SIWC):
+                    continue
+                needs_key = defn.get("requiresKey") is not False
+                has_conn = bool(cfg.get("apiKey")) if needs_key else bool(cfg.get("baseUrl"))
+                model = cfg.get("model") or (cfg.get("discoveredModels") or cfg.get("manualModels") or defn.get("models") or [""])[0]
+                if has_conn and model:
+                    pick = {"provider": key, "model": model, "useSavedConnection": True}
+                    return pick, pick
+        raise WorkerError("请先在模型管理配置一个可用于修订的模型（ChatGPT 订阅模型默认仅对总编开放）。", 400, "REVISION_SETTINGS")
+
+    async def start_targeted(self, job_id, payload, *, expected_source_version=None, preferred_model=None):
+        async with self.lock:
+            previous = self.store.latest(job_id)
+            if previous and previous.get("workflowVersion") == 2 and (
+                previous["id"] in self.tasks
+                or previous["status"] in ("running", "paused", "error", "waiting_author", "waiting_source")
+            ):
+                raise WorkerError("此作品已有进行中的修订任务，请先处理当前修订。", 409, "REVISION_IN_PROGRESS")
+            current = await asyncio.to_thread(self.manuscripts.job_detail, job_id)
+            if not current:
+                raise WorkerError("找不到作品。", 404, "JOB_NOT_FOUND")
+            job, rows = current["job"], current["chapters"]
+            if not rows or [row.get("chapterNumber") for row in rows] != list(range(1, len(rows) + 1)):
+                raise WorkerError("章节编号需要完整连续。", 409, "REVISION_CHAPTERS")
+            chapters = [{key: row[key] for key in ("chapterNumber", "title", "content")} for row in rows]
+            version = fingerprint(chapters)
+            source = await self.worker.request("revision-source", jobId=job_id)
+            self.require_revision_source_ready(source)
+            if source["version"] != version or (expected_source_version and expected_source_version != version):
+                raise WorkerError("正文已更新，请总编重新确认后再发起定向修改。", 409, "EDITOR_PLAN")
+            note = string(payload.get("note"), 2400).strip()
+            targets = payload.get("chapters")
+            review_chapters = payload.get("reviewChapters", [])
+            if (not note or not isinstance(targets, list) or not 1 <= len(targets) <= len(chapters)
+                    or not isinstance(review_chapters, list)
+                    or any(type(n) is not int or not 1 <= n <= len(chapters) for n in [*targets, *review_chapters])):
+                raise WorkerError("请填写要定向修改的章节和修改说明。", 400, "REVISION_SETTINGS")
+            targets = sorted(set(targets))
+            review_chapters = sorted(set(review_chapters) - set(targets))
+            intent = None
+            if amendment := payload.get("amendment"):
+                if not isinstance(amendment, dict) or any(not string(amendment.get(key), 1200)
+                                                         for key in ("before", "after", "evidence")):
+                    raise WorkerError("同步全书口径需填写旧口径、新口径和依据。", 400, "REVISION_SETTINGS")
+                intent = {key: string(amendment[key], 1200) for key in ("before", "after", "evidence")}
+                intent["chapters"] = targets
+            editor, verifier = self._resolve_targeted_models(previous, job, preferred_model)
+            report = job.get("evaluationReport") or {}
+            run = uuid4().hex
+            ledger = {
+                "rules": [], "checks": [], "financialFlows": [], "blueprint": [],
+                "decisions": [], "pending": [],
+                "authorAmendments": [intent] if intent else [],
+            }
+            self.store.create(run, job_id, {
+                "title": job["title"], "genre": job.get("genre"), "pov": job.get("pov"),
+                "styleGuide": job.get("styleGuide"), "chapters": chapters, "report": report,
+            }, {
+                "stage": "prepare", "total": 1, "done": 0, "sourceVersion": version,
+                "workflowVersion": 2, "targeted": True, "sourceDefects": [],
+                "evaluationAt": report.get("evaluatedAt") or "", "volumeSize": 20, "concurrency": 3,
+                "chapterCount": len(chapters), "volumes": [], "changedCount": 0, "blockingCount": 0,
+                "editor": editor, "verifier": verifier, "createdAt": timestamp(), "isMock": False,
+                "hasLedger": True, "ledgerVersion": 1, "ledgerIntent": None,
+                "work": {
+                    "turn": 1, "attempt": 0, "roundType": "hotfix",
+                    "targets": targets, "reviewChapters": review_chapters,
+                    "feedback": [{"chapter": n, "problem": note} for n in targets],
+                },
+                "reviewScope": "incremental", "affectedChapters": sorted(set(targets + review_chapters)),
+            })
+            self.commit(run, products=[
+                ("v2-audit-summary", "all", {"issues": [], "facts": [], "defects": [], "unsupported": 0}),
+                ("v2-ledger", 1, ledger),
+                ("v2-hotfix", 1, {"note": note, "amendment": intent}),
+            ])
+            self.schedule(run)
+            return self.store.get(run)
+
     async def special_action(self, job_id, run, action, payload, record):
         status = record["status"]
         if action == "archive" and status in ("waiting_author", "waiting_source") and run not in self.tasks:
@@ -1024,7 +1182,7 @@ class RevisionWorkflowV2(RevisionRuntime):
         elif action == "repair" and status in ("ready", "needs_review") and not record["isMock"]:
             note, chapters = string(payload.get("note"), 2400), payload.get("chapters")
             review_chapters = payload.get("reviewChapters", [])
-            if (not note or not isinstance(chapters, list) or not 1 <= len(chapters) <= 20
+            if (not note or not isinstance(chapters, list) or not 1 <= len(chapters) <= record["chapterCount"]
                     or not isinstance(review_chapters, list)
                     or any(type(n) is not int or not 1 <= n <= record["chapterCount"] for n in [*chapters, *review_chapters])):
                 raise WorkerError("请填写返修章节和反馈。", 400, "REVISION_SETTINGS")
@@ -1065,12 +1223,16 @@ class RevisionWorkflowV2(RevisionRuntime):
             raise WorkerError("当前状态无法执行此操作。", 409, "REVISION_STATE")
         return True
 
-    async def apply(self, job_id, run, record):
+    async def apply(self, job_id, run, record, *, force=False):
         if record["status"] == "applied":
             return
-        result = self.load(run, "v2-result", record["candidateTurn"])
+        turn = record.get("candidateTurn")
+        result = self.load(run, "v2-result", turn) if turn is not None else None
+        if not result:
+            raise WorkerError("候选稿不存在，无法写回正文。", 409, "REVISION_UNVERIFIED")
         candidate = result["candidate"]
-        if (result["blocking"] or result.get("validationPending") or record["isMock"] or not record["changedCount"]
+        blocked_unforced = (not force) and bool(result["blocking"] or result.get("validationPending"))
+        if (blocked_unforced or record["isMock"] or not record["changedCount"]
                 or result["sourceVersion"] != record["sourceVersion"]
                 or result["ledgerVersion"] != record["ledgerVersion"]
                 or result["candidateHash"] != fingerprint(candidate)

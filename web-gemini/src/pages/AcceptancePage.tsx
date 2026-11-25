@@ -4,11 +4,12 @@ import { AnimatePresence, motion } from 'motion/react'
 import { CheckCircle2, ChevronDown, ExternalLink, KeyRound, Play, ShieldAlert, ShieldCheck, Sparkles, TimerReset, XCircle, Zap } from 'lucide-react'
 import { api } from '../lib/api'
 import { cn } from '../lib/cn'
+import { COLLAPSE_MOTION, SPRING_TACTILE } from '../lib/motion'
 import { navigate } from '../lib/router'
 import { messageOf } from '../lib/format'
 import type { AcceptanceTestResult } from '../lib/types'
 import { useStudio } from '../state/studio'
-import { Badge, Button, Card, PageHeader, Progress, Stagger, StaggerItem, Thinking } from '../components/ui'
+import { AnimatedNumber, Badge, Button, Card, PageHeader, Progress, Stagger, StaggerItem, Thinking } from '../components/ui'
 
 type SuiteId = 'foreshadowing' | 'fault-injection' | 'timeout-resume' | 'empty-premise-auto-topic' | 'audit-gate' | 'memes-admission'
 
@@ -116,7 +117,7 @@ export default function AcceptancePage() {
           <div>
             <div className="text-caption text-muted">验收结果</div>
             <div className="mt-1 font-display text-display font-normal text-ink tabular-nums">
-              {passed}<span className="text-headline text-muted"> / {TESTS.length}</span>
+              <AnimatedNumber value={passed} /><span className="text-headline text-muted"> / {TESTS.length}</span>
             </div>
           </div>
           <div className="flex gap-1.5">
@@ -182,7 +183,7 @@ function SuiteCard({
         </div>
         <AnimatePresence mode="wait">
           {result && (
-            <motion.span key={String(result.passed)} initial={{ scale: 0.6, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} transition={{ type: 'spring', stiffness: 500, damping: 22 }}>
+            <motion.span key={String(result.passed)} initial={{ scale: 0.65, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} transition={SPRING_TACTILE}>
               {result.passed ? <CheckCircle2 className="size-6 text-success" /> : <XCircle className="size-6 text-danger" />}
             </motion.span>
           )}
@@ -192,15 +193,15 @@ function SuiteCard({
       <ul className="mt-4 grid gap-1.5">
         {test.assertions.map((a, i) => (
           <li key={i} className="flex gap-2.5 text-body text-body">
-            <span className={cn('mt-[9px] size-1.5 shrink-0 rounded-full', result?.passed ? 'bg-g-green' : 'bg-line-strong')} />
+            <span className={cn('mt-[9px] size-1.5 shrink-0 rounded-full transition-colors duration-200', result?.passed ? 'bg-g-green' : 'bg-line-strong')} />
             <span>{a}</span>
           </li>
         ))}
       </ul>
 
-      <AnimatePresence>
+      <AnimatePresence initial={false}>
         {result && (
-          <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: 'auto' }} exit={{ opacity: 0, height: 0 }} className="overflow-hidden">
+          <motion.div {...COLLAPSE_MOTION} className="overflow-hidden">
             <div className={cn('mt-4 rounded-md px-4 py-3', result.passed ? 'bg-success-soft' : 'bg-danger-soft')}>
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <span className={cn('text-body font-medium', result.passed ? 'text-success' : 'text-danger')}>
@@ -213,9 +214,15 @@ function SuiteCard({
               {result.details !== undefined && (
                 <>
                   <button type="button" onClick={() => setShowDetails(!showDetails)} className="mt-2 inline-flex items-center gap-1 text-caption font-medium text-primary hover:underline">
-                    <ChevronDown className={cn('size-3.5 transition-transform', showDetails && 'rotate-180')} />详细数据
+                    <ChevronDown className={cn('size-3.5 transition-transform duration-200 ease-[var(--ease-emphasized)]', showDetails && 'rotate-180')} />详细数据
                   </button>
-                  {showDetails && <pre className="mt-2 max-h-56 overflow-auto rounded-sm bg-surface p-3 font-mono text-caption text-body">{JSON.stringify(result.details, null, 2)}</pre>}
+                  <AnimatePresence initial={false}>
+                    {showDetails && (
+                      <motion.div {...COLLAPSE_MOTION} className="overflow-hidden">
+                        <pre className="mt-2 max-h-56 overflow-auto rounded-sm bg-surface p-3 font-mono text-caption text-body">{JSON.stringify(result.details, null, 2)}</pre>
+                      </motion.div>
+                    )}
+                  </AnimatePresence>
                 </>
               )}
             </div>

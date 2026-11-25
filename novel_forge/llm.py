@@ -19,6 +19,8 @@ from urllib.parse import quote
 import httpx
 
 from .arc_planning import CANON_LOCKS_MARKER
+from .openai_responses import call_responses
+from .openai_siwc import PROVIDER as SIWC, RESOURCE as SIWC_RESOURCE, SiwcError, all_stages as siwc_all_stages
 from .providers import get_provider_definition, is_masked_api_key, provider_requires_key, same_endpoint_origin
 
 
@@ -110,6 +112,8 @@ class _Credentials:
     api_key: str
     model: str
     thinking_mode: str
+    siwc: object = field(default=None, repr=False)
+    siwc_epoch: int = 0
 
 
 async def _resolve_credentials(provider, base_url, api_key, model, thinking_mode, use_saved_connection, store):
@@ -264,7 +268,7 @@ def _settle_circuit(claim, error=None, *, cancelled=False):
         if cancelled:
             _wake_probe_waiters(state)
             return
-        if error is None or error.code in {"EMPTY_RESPONSE", "INVALID_RESPONSE"}:
+        if error is None or error.code in {"EMPTY_RESPONSE", "INVALID_RESPONSE", "UNEXPECTED_TOOL_CALL", "TOOLS_UNSUPPORTED", "CONTENT_BLOCKED"}:
             state.failures = 0
             state.open_until = 0
             _wake_probe_waiters(state)
@@ -336,21 +340,51 @@ async def _rate_slot(creds, transport, allow_parallel):
             lock.release()
 
 
+_CONTENT_BLOCK_RE = re.compile(
+    r"blocked by gemini'?s filters|"
+    r"因内容策略结束生成|"
+    r"\bPROHIBITED_CONTENT\b|"
+    r"\bcontent_filter\b|"
+    r"content[ _-]?management[ _-]?policy|"
+    r"safety[ _-]?filters?|"
+    r"内容安全策略|敏感内容拦截|内容违规",
+    re.I,
+)
+
+
 def _http_error(label, response, api_key, retry_rate_limit):
-    snippet = response.text
+    raw_text = response.text
     if api_key:
-        snippet = snippet.replace(api_key, "[已隐藏密钥]")
-    snippet = snippet[:300]
+        raw_text = raw_text.replace(api_key, "[已隐藏密钥]")
+    snippet = raw_text[:300]
     status = response.status_code
+    if status in (400, 403, 422, 451, 500, 502, 503) and _CONTENT_BLOCK_RE.search(raw_text[:2000]):
+        return LLMError(
+            f"{label} 触发上游内容安全拦截，已停止重试（不触发熔断）。建议微调当前章节章纲敏感词或切换模型后从断点继续：{snippet}",
+            code="CONTENT_BLOCKED", status=status, retryable=False,
+        )
     if status != 429:
         return LLMError(f"{label} API error {status}: {snippet}", code=f"HTTP_{status}",
                         status=status, retryable=status >= 500)
 
-    hard_quota = re.search(
-        r"insufficient_quota|exceeded your current quota|reached your usage limit|"
-        r"resets in \d+\s*hour|余额不足|quota.*exhausted|daily.*limit|到达?限额|额度.*用完",
-        snippet, re.I,
-    ) and not re.search(r"per\s*minute|rpm|tpm|try again in \d+\s*s", snippet, re.I)
+    quota_text = raw_text[:1000]
+    wait_match = re.search(r"try again in (\d+(?:\.\d+)?)\s*s\b", quota_text, re.I)
+    wait_seconds = float(wait_match.group(1)) if wait_match else None
+    short_retry_hint = bool(
+        re.search(r"per\s*minute|\brpm\b|\btpm\b", quota_text, re.I)
+        or (wait_seconds is not None and wait_seconds <= 300)
+    )
+    long_reset = bool(
+        re.search(r"resets in \d+\s*(?:hour|day)", quota_text, re.I)
+        or (wait_seconds is not None and wait_seconds > 300)
+    )
+    hard_quota = bool(
+        re.search(
+            r"insufficient_quota|exceeded your current quota|reached your usage limit|"
+            r"resets in \d+\s*(?:hour|day)|余额不足|quota.*exhausted|daily.*limit|到达?限额|额度.*用完",
+            quota_text, re.I,
+        )
+    ) and (long_reset or not short_retry_hint)
     try:
         seconds = float(response.headers.get("retry-after", "nan"))
         retry_after = min(60_000, seconds * 1000) if math.isfinite(seconds) and seconds >= 0 else None
@@ -412,6 +446,9 @@ def build_vertex_endpoint(base_url, model=""):
 
 @asynccontextmanager
 async def _http_client(client, creds, transport):
+    if creds.provider == SIWC:
+        yield None
+        return
     if client is not None:
         yield client
         return
@@ -465,8 +502,205 @@ def _stat(usage, name, fallback=0):
     return value if type(value) in (int, float) and math.isfinite(value) else fallback
 
 
+def _unexpected_tool_call(finish_reason):
+    return str(finish_reason or "").strip().lower() in ("unexpected_tool_call", "malformed_function_call")
+
+
+def _rejects_tools(status, text):
+    return status in (400, 404, 422, 501) and bool(
+        re.search(r"\b(?:tools?|tool_choice|toolConfig|functionDeclarations?|function_call(?:ing)?)\b", text or "", re.I)
+    )
+
+
+def _parse_tool_args(raw):
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return parsed
+        except (ValueError, UnicodeError, RecursionError):
+            pass
+    return {}
+
+
+def _strip_gemini_schema(schema):
+    if isinstance(schema, list):
+        return [_strip_gemini_schema(item) for item in schema]
+    if not isinstance(schema, dict):
+        return schema
+    cleaned = {}
+    for key, value in schema.items():
+        if key == "additionalProperties":
+            continue
+        cleaned[key] = _strip_gemini_schema(value)
+    return cleaned
+
+
+def _messages_estimate_text(messages, prompt):
+    if not messages:
+        return prompt
+    parts = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if isinstance(content, str) and content:
+            parts.append(content)
+        for call in msg.get("toolCalls") or []:
+            if isinstance(call, dict):
+                parts.append(str(call.get("name") or ""))
+                raw = call.get("rawArguments")
+                parts.append(raw if isinstance(raw, str) else json.dumps(call.get("arguments") or {}, ensure_ascii=False))
+    return "\n".join(parts) if parts else prompt
+
+
+def _build_openai_messages(system, prompt, messages, transport):
+    out = [{"role": "system", "content": system}] if system else []
+    if not messages:
+        out.append({"role": "user", "content": prompt})
+        return out
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        if role == "user":
+            out.append({"role": "user", "content": str(msg.get("content") or "")})
+        elif role == "assistant":
+            state = msg.get("providerState")
+            if (isinstance(state, dict) and state.get("transport") == transport
+                    and isinstance(state.get("message"), dict)):
+                raw = state["message"]
+                replayed = {k: raw[k] for k in ("content", "tool_calls", "reasoning_content", "extra_content") if k in raw}
+                replayed["role"] = "assistant"
+                out.append(replayed)
+                continue
+            entry = {"role": "assistant", "content": msg.get("content") or ("" if not msg.get("toolCalls") else None)}
+            calls = []
+            for call in msg.get("toolCalls") or []:
+                if not isinstance(call, dict) or not call.get("id") or not call.get("name"):
+                    continue
+                raw_args = call.get("rawArguments")
+                if not isinstance(raw_args, str):
+                    raw_args = json.dumps(call.get("arguments") or {}, ensure_ascii=False)
+                calls.append({
+                    "id": str(call["id"]),
+                    "type": "function",
+                    "function": {"name": str(call["name"]), "arguments": raw_args},
+                })
+            if calls:
+                entry["tool_calls"] = calls
+            out.append(entry)
+        elif role == "tool":
+            out.append({
+                "role": "tool",
+                "tool_call_id": str(msg.get("toolCallId") or ""),
+                "content": str(msg.get("content") or ""),
+            })
+    return out
+
+
+def _build_anthropic_messages(prompt, messages):
+    if not messages:
+        return [{"role": "user", "content": prompt}]
+    out = []
+    pending_tools = []
+
+    def flush_tools():
+        if pending_tools:
+            out.append({"role": "user", "content": list(pending_tools)})
+            pending_tools.clear()
+
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        if role == "tool":
+            pending_tools.append({
+                "type": "tool_result",
+                "tool_use_id": str(msg.get("toolCallId") or ""),
+                "content": str(msg.get("content") or ""),
+            })
+            continue
+        flush_tools()
+        if role == "user":
+            out.append({"role": "user", "content": str(msg.get("content") or "")})
+        elif role == "assistant":
+            state = msg.get("providerState")
+            if (isinstance(state, dict) and state.get("transport") == "anthropic"
+                    and isinstance(state.get("content"), list) and state["content"]):
+                out.append({"role": "assistant", "content": state["content"]})
+                continue
+            blocks = []
+            if msg.get("content"):
+                blocks.append({"type": "text", "text": str(msg["content"])})
+            for call in msg.get("toolCalls") or []:
+                if isinstance(call, dict) and call.get("id") and call.get("name"):
+                    blocks.append({
+                        "type": "tool_use",
+                        "id": str(call["id"]),
+                        "name": str(call["name"]),
+                        "input": _parse_tool_args(call.get("arguments")),
+                    })
+            if blocks:
+                out.append({"role": "assistant", "content": blocks})
+    flush_tools()
+    return out or [{"role": "user", "content": prompt}]
+
+
+def _build_gemini_contents(prompt, messages, transport):
+    if not messages:
+        return [{"role": "user", "parts": [{"text": prompt}]}]
+    out = []
+    pending_tools = []
+
+    def flush_tools():
+        if pending_tools:
+            out.append({"role": "user", "parts": list(pending_tools)})
+            pending_tools.clear()
+
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        if role == "tool":
+            pending_tools.append({
+                "functionResponse": {
+                    "name": str(msg.get("name") or "tool"),
+                    "response": {"result": str(msg.get("content") or "")},
+                },
+            })
+            continue
+        flush_tools()
+        if role == "user":
+            out.append({"role": "user", "parts": [{"text": str(msg.get("content") or "")}]})
+        elif role == "assistant":
+            state = msg.get("providerState")
+            if (isinstance(state, dict) and state.get("transport") == transport
+                    and isinstance(state.get("parts"), list) and state["parts"]):
+                out.append({"role": "model", "parts": state["parts"]})
+                continue
+            parts = []
+            if msg.get("content"):
+                parts.append({"text": str(msg["content"])})
+            for call in msg.get("toolCalls") or []:
+                if isinstance(call, dict) and call.get("name"):
+                    parts.append({
+                        "functionCall": {
+                            "name": str(call["name"]),
+                            "args": _parse_tool_args(call.get("arguments")),
+                        },
+                    })
+            if parts:
+                out.append({"role": "model", "parts": parts})
+    flush_tools()
+    return out or [{"role": "user", "parts": [{"text": prompt}]}]
+
+
 def _reply(text, finish_reason, usage, prompt_key, completion_key, total_key, system, prompt, *,
-           cache_hit_tokens=0, thoughts_tokens=None, zero_total_is_missing=False):
+           cache_hit_tokens=0, thoughts_tokens=None, zero_total_is_missing=False,
+           tool_calls=None, assistant_message=None, include_turn=False):
     input_tokens = _stat(usage, prompt_key, estimate_tokens(system + prompt))
     output_tokens = _stat(usage, completion_key, estimate_tokens(text)) + (thoughts_tokens or 0)
     total = _stat(usage, total_key, input_tokens + output_tokens)
@@ -476,11 +710,49 @@ def _reply(text, finish_reason, usage, prompt_key, completion_key, total_key, sy
                "cacheHitTokens": cache_hit_tokens}
     if thoughts_tokens is not None:
         counted["thoughtsTokens"] = thoughts_tokens
-    return {"text": text, "finishReason": finish_reason, "cacheHitTokens": cache_hit_tokens, "usage": counted}
+    result = {"text": text, "finishReason": finish_reason, "cacheHitTokens": cache_hit_tokens, "usage": counted}
+    if include_turn or tool_calls:
+        result["toolCalls"] = list(tool_calls or [])
+        result["assistantMessage"] = assistant_message or {
+            "role": "assistant", "content": text, "toolCalls": list(tool_calls or []),
+        }
+    return result
 
 
-async def _call_transport(client, transport, creds, system, prompt, temperature, max_tokens):
+async def _call_transport(client, transport, creds, system, prompt, temperature, max_tokens, *,
+                          messages=None, tools=None, reasoning_effort=None, cache_key=None):
     provider, api_key = creds.provider, creds.api_key
+    include_turn = messages is not None or tools is not None
+    estimate_input = _messages_estimate_text(messages, prompt)
+    if provider == SIWC:
+        try:
+            response = await call_responses(
+                creds.siwc, creds.model, system, prompt, creds.siwc_epoch,
+                messages=messages, tools=tools, reasoning_effort=reasoning_effort, cache_key=cache_key,
+            )
+        except SiwcError as error:
+            if tools and error.code == "SIWC_CAPABILITY_UNSUPPORTED" and "（tools）" in str(error):
+                raise LLMError("ChatGPT 当前模型不支持原生工具调用。", code="TOOLS_UNSUPPORTED", status=400) from None
+            raise LLMError(str(error), code=error.code, status=error.status, retryable=error.retryable) from None
+        text = response["text"]
+        finish = response["finishReason"]
+        tool_calls = response.get("toolCalls") or []
+        raw_output = response.get("rawOutput") or []
+        if output_was_truncated(finish):
+            raise LLMError("ChatGPT 输出被截断，请缩小任务范围或换模型后继续。",
+                           code="OUTPUT_TRUNCATED", status=502, finish_reason=finish)
+        usage = _object(response.get("usage"))
+        assistant_msg = {
+            "role": "assistant",
+            "content": text,
+            "toolCalls": tool_calls,
+            "providerState": {"transport": "openai-responses-siwc", "output": raw_output},
+        }
+        reply = _reply(text, finish, usage, "input_tokens", "output_tokens", "total_tokens", system, estimate_input,
+                       cache_hit_tokens=_stat(_object(usage.get("input_tokens_details")), "cached_tokens"),
+                       tool_calls=tool_calls, assistant_message=assistant_msg, include_turn=include_turn)
+        reply["usage"]["thoughtsTokens"] = _stat(_object(usage.get("output_tokens_details")), "reasoning_tokens")
+        return reply
     root = creds.base_url.rstrip("/")
     if not root:
         raise LLMError("请先保存供应商的 API 地址。", code="CONFIG_REQUIRED", status=400)
@@ -492,12 +764,24 @@ async def _call_transport(client, transport, creds, system, prompt, temperature,
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
         model = creds.model or ("deepseek-flash" if transport == "deepseek" else "gpt-4o-mini")
-        messages = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": prompt}]
+        wire_messages = _build_openai_messages(system, prompt, messages, transport)
         modern = provider == "openai" and re.match(r"^(?:gpt-[5-9](?:[.-]|$)|o[134](?:-|$))", model, re.I)
         fixed_temperature = provider == "moonshot" and re.match(r"^kimi-k[2-9](?:[.-]|$)", model, re.I)
-        body = {"model": model, "messages": messages, "max_completion_tokens" if modern else "max_tokens": max_tokens}
+        body = {"model": model, "messages": wire_messages, "max_completion_tokens" if modern else "max_tokens": max_tokens}
         if not (modern or fixed_temperature):
             body["temperature"] = temperature
+        if tools:
+            body["tools"] = [
+                {"type": "function", "function": {
+                    "name": str(t["name"]),
+                    "description": str(t.get("description") or ""),
+                    "parameters": t.get("parameters") or {"type": "object", "properties": {}},
+                }}
+                for t in tools if isinstance(t, dict) and t.get("name")
+            ]
+            body["tool_choice"] = "auto"
+        if provider == "openai" and isinstance(cache_key, str) and cache_key.strip():
+            body["prompt_cache_key"] = cache_key.strip()[:64]
         if transport == "deepseek":
             label = "DeepSeek"
             body["thinking"] = {"type": "enabled" if creds.thinking_mode == "enabled" else "disabled"}
@@ -506,14 +790,34 @@ async def _call_transport(client, transport, creds, system, prompt, temperature,
         endpoint = root + ("/messages" if root.endswith("/v1") else "/v1/messages")
         headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01"}
         body = {"model": creds.model or "claude-3-5-sonnet-latest", "max_tokens": max_tokens,
-                "temperature": temperature, "messages": [{"role": "user", "content": prompt}]}
+                "temperature": temperature, "messages": _build_anthropic_messages(prompt, messages)}
         if system:
             body["system"] = system
+        if tools:
+            body["tools"] = [
+                {
+                    "name": str(t["name"]),
+                    "description": str(t.get("description") or ""),
+                    "input_schema": t.get("parameters") or {"type": "object", "properties": {}},
+                }
+                for t in tools if isinstance(t, dict) and t.get("name")
+            ]
+            body["tool_choice"] = {"type": "auto"}
     else:
         generation = {"temperature": temperature, "maxOutputTokens": max_tokens}
-        body = {"contents": [{"role": "user", "parts": [{"text": prompt}]}], "generationConfig": generation}
+        body = {"contents": _build_gemini_contents(prompt, messages, transport), "generationConfig": generation}
         if system:
             body["systemInstruction"] = {"parts": [{"text": system}]}
+        if tools:
+            body["tools"] = [{"functionDeclarations": [
+                {
+                    "name": str(t["name"]),
+                    "description": str(t.get("description") or ""),
+                    "parameters": _strip_gemini_schema(t.get("parameters") or {"type": "object", "properties": {}}),
+                }
+                for t in tools if isinstance(t, dict) and t.get("name")
+            ]}]
+            body["toolConfig"] = {"functionCallingConfig": {"mode": "AUTO"}}
         if transport == "vertex":
             label = "Vertex"
             endpoint = build_vertex_endpoint(root, creds.model)
@@ -533,6 +837,8 @@ async def _call_transport(client, transport, creds, system, prompt, temperature,
         del body["generationConfig"]["thinkingConfig"]
         response = await _post(client, endpoint, body, headers)
     if not response.is_success:
+        if tools and _rejects_tools(response.status_code, response.text):
+            raise LLMError(f"{label} 当前模型或接口不支持原生工具调用。", code="TOOLS_UNSUPPORTED", status=400)
         raise _http_error(label, response, api_key, provider != "openai")
     try:
         data = _object(response.json())
@@ -541,34 +847,128 @@ async def _call_transport(client, transport, creds, system, prompt, temperature,
 
     if transport in ("openai", "deepseek"):
         choice = _head(data.get("choices"))
-        text = _text(_object(choice.get("message")).get("content"))
+        message = _object(choice.get("message"))
+        text = _text(message.get("content"))
         finish = choice.get("finish_reason")
-        if not text.strip() and max_tokens >= 500:
+        raw_tool_calls = _records(message.get("tool_calls"))
+        tool_calls = []
+        if tools:
+            for idx, raw_call in enumerate(raw_tool_calls):
+                fn = _object(raw_call.get("function"))
+                name = fn.get("name")
+                if not isinstance(name, str) or not name:
+                    continue
+                call_id = raw_call.get("id") if isinstance(raw_call.get("id"), str) and raw_call.get("id") else f"call_{idx}"
+                raw_args = fn.get("arguments")
+                raw_str = raw_args if isinstance(raw_args, str) else json.dumps(raw_args or {}, ensure_ascii=False)
+                tool_calls.append({
+                    "id": call_id,
+                    "name": name,
+                    "arguments": _parse_tool_args(raw_args),
+                    "rawArguments": raw_str,
+                })
+        if ((_unexpected_tool_call(finish) and (not tools or not tool_calls))
+                or (not tools and raw_tool_calls and not text.strip())):
+            raise LLMError(f"{label} 意外触发了未声明的工具调用（{finish or 'tool_calls'}），正在重试。",
+                           code="UNEXPECTED_TOOL_CALL", status=502, retryable=True, finish_reason=finish)
+        if str(finish or "").lower() == "content_filter" and not text.strip() and not tool_calls:
+            raise LLMError(f"{label} 触发上游内容安全拦截（{finish}），建议微调当前章节章纲敏感词或切换模型后从断点继续。",
+                           code="CONTENT_BLOCKED", status=422, retryable=False, finish_reason=finish)
+        if not text.strip() and not tool_calls and max_tokens >= 500:
             raise LLMError("OpenAI API returned empty content", code="EMPTY_RESPONSE", status=502,
                            retryable=True, finish_reason=finish)
         usage = _object(data.get("usage"))
-        return _reply(text, finish, usage, "prompt_tokens", "completion_tokens", "total_tokens", system, prompt,
-                      cache_hit_tokens=_stat(usage, "prompt_cache_hit_tokens"),
-                      zero_total_is_missing=transport == "openai")
+        cache_hit = (_stat(usage, "prompt_cache_hit_tokens")
+                     or _stat(_object(usage.get("prompt_tokens_details")), "cached_tokens"))
+        safe_msg = {k: message[k] for k in ("role", "content", "tool_calls", "reasoning_content", "extra_content")
+                    if k in message}
+        safe_msg["role"] = "assistant"
+        assistant_msg = {
+            "role": "assistant",
+            "content": text,
+            "toolCalls": tool_calls,
+            "providerState": {"transport": transport, "message": safe_msg},
+        }
+        reply = _reply(text, finish, usage, "prompt_tokens", "completion_tokens", "total_tokens", system, estimate_input,
+                       cache_hit_tokens=cache_hit, zero_total_is_missing=transport == "openai",
+                       tool_calls=tool_calls, assistant_message=assistant_msg, include_turn=include_turn)
+        reasoning_tokens = _object(usage.get("completion_tokens_details")).get("reasoning_tokens")
+        if type(reasoning_tokens) in (int, float) and math.isfinite(reasoning_tokens) and reasoning_tokens > 0:
+            reply["usage"]["thoughtsTokens"] = reasoning_tokens
+        return reply
 
     if transport == "anthropic":
-        text = "".join(_text(part.get("text")) for part in _records(data.get("content")))
-        return _reply(text, data.get("stop_reason"), _object(data.get("usage")), "input_tokens", "output_tokens",
-                      None, system, prompt)
+        content_blocks = _records(data.get("content"))
+        text = "".join(_text(part.get("text")) for part in content_blocks)
+        tool_calls = []
+        if tools:
+            for part in content_blocks:
+                if part.get("type") == "tool_use" and isinstance(part.get("id"), str) and isinstance(part.get("name"), str):
+                    args = _parse_tool_args(part.get("input"))
+                    tool_calls.append({
+                        "id": part["id"],
+                        "name": part["name"],
+                        "arguments": args,
+                        "rawArguments": json.dumps(args, ensure_ascii=False),
+                    })
+        usage = _object(data.get("usage"))
+        assistant_msg = {
+            "role": "assistant",
+            "content": text,
+            "toolCalls": tool_calls,
+            "providerState": {"transport": "anthropic", "content": content_blocks},
+        }
+        return _reply(text, data.get("stop_reason"), usage, "input_tokens", "output_tokens",
+                      None, system, estimate_input,
+                      cache_hit_tokens=_stat(usage, "cache_read_input_tokens"),
+                      tool_calls=tool_calls, assistant_message=assistant_msg, include_turn=include_turn)
 
     candidate = _head(data.get("candidates"))
     parts = _records(_object(candidate.get("content")).get("parts"))
     text = "".join(_text(part.get("text")) for part in parts if not part.get("thought"))
+    raw_fc_parts = [part for part in parts if isinstance(part.get("functionCall"), dict)]
+    tool_calls = []
+    if tools:
+        for idx, part in enumerate(parts):
+            fc = part.get("functionCall")
+            if isinstance(fc, dict) and isinstance(fc.get("name"), str) and fc["name"]:
+                args = _parse_tool_args(fc.get("args"))
+                call_id = fc.get("id") if isinstance(fc.get("id"), str) and fc["id"] else f"gemini_call_{idx}"
+                tool_calls.append({
+                    "id": call_id,
+                    "name": fc["name"],
+                    "arguments": args,
+                    "rawArguments": json.dumps(args, ensure_ascii=False),
+                })
+    prompt_block = _object(data.get("promptFeedback")).get("blockReason")
     finish = candidate.get("finishReason")
-    if transport == "vertex" and not text.strip() and finish == "MAX_TOKENS":
+    if ((_unexpected_tool_call(finish) and (not tools or not tool_calls))
+            or (not tools and raw_fc_parts and not text.strip())):
+        raise LLMError(f"{label} 意外触发了未声明的工具调用（{finish or 'functionCall'}），正在重试。",
+                       code="UNEXPECTED_TOOL_CALL", status=502, retryable=True, finish_reason=finish)
+    if ((prompt_block or str(finish or "").upper() in {"SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST", "SPII", "IMAGE_SAFETY"})
+            and not text.strip() and not tool_calls):
+        reason = str(prompt_block or finish)
+        raise LLMError(f"{label} 触发上游内容安全拦截（{reason}），建议微调当前章节章纲敏感词或切换模型后从断点继续。",
+                       code="CONTENT_BLOCKED", status=422, retryable=False, finish_reason=reason)
+    if transport == "vertex" and not text.strip() and not tool_calls and finish == "MAX_TOKENS":
         raise LLMError("Vertex 返回空内容 (finishReason: MAX_TOKENS，思考消耗完输出预算，请调大 maxTokens)",
                        code="EMPTY_RESPONSE", status=502, retryable=True, finish_reason=finish)
     usage = _object(data.get("usageMetadata"))
-    return _reply(text, finish, usage, "promptTokenCount", "candidatesTokenCount", "totalTokenCount", system, prompt,
-                  thoughts_tokens=_stat(usage, "thoughtsTokenCount") if transport == "vertex" else None)
+    assistant_msg = {
+        "role": "assistant",
+        "content": text,
+        "toolCalls": tool_calls,
+        "providerState": {"transport": transport, "parts": parts},
+    }
+    return _reply(text, finish, usage, "promptTokenCount", "candidatesTokenCount", "totalTokenCount", system, estimate_input,
+                  cache_hit_tokens=_stat(usage, "cachedContentTokenCount"),
+                  thoughts_tokens=_stat(usage, "thoughtsTokenCount") if transport == "vertex" else None,
+                  tool_calls=tool_calls, assistant_message=assistant_msg, include_turn=include_turn)
 
 
-async def _provider_attempt(client, transport, creds, key, system, prompt, temperature, budget, timeout_ms, parallel):
+async def _provider_attempt(client, transport, creds, key, system, prompt, temperature, budget, timeout_ms, parallel, *,
+                            messages=None, tools=None, reasoning_effort=None, cache_key=None):
     while True:
         _, waiter = _enter_circuit(key)
         if waiter is not None:
@@ -580,7 +980,10 @@ async def _provider_attempt(client, transport, creds, key, system, prompt, tempe
                 # Recheck after pacing: a parallel call may have claimed the probe in the meantime.
                 claim, waiter = _enter_circuit(key, claim=True)
                 if waiter is None:
-                    result = await _call_transport(client, transport, creds, system, prompt, temperature, budget)
+                    result = await _call_transport(
+                        client, transport, creds, system, prompt, temperature, budget,
+                        messages=messages, tools=tools, reasoning_effort=reasoning_effort, cache_key=cache_key,
+                    )
         except TimeoutError:
             error = _timeout_error(timeout_ms)
             _settle_circuit(claim, error)
@@ -621,11 +1024,25 @@ async def call_llm(*, provider="mock", base_url="", api_key="", model="", thinki
                    system="", prompt="", temperature=0.7, max_tokens=DEFAULT_MAX_TOKENS,
                    timeout_ms=DEFAULT_TIMEOUT_MS, retries=None, max_retries=None, test_scenario=None,
                    use_saved_connection=False, allow_parallel=False, retry_empty_response=True,
-                   apply_output_floor=True, store=None, client: httpx.AsyncClient | None = None):
+                   apply_output_floor=True, store=None, client: httpx.AsyncClient | None = None,
+                   siwc_context=None, siwc_profile=None, messages=None, tools=None,
+                   reasoning_effort=None, cache_key=None):
     """Call a model, returning the same camelCase response fields as the Node gateway."""
     started = _clock()
     effective_timeout = max(1000, int(timeout_ms or DEFAULT_TIMEOUT_MS))
-    creds = await _resolve_credentials(provider, base_url, api_key, model, thinking_mode, use_saved_connection, store)
+    if str(provider).lower() == SIWC:
+        service = getattr(store, "openai_siwc", None)
+        if service is None or (siwc_context not in ("provider-test", "chief-editor") and not siwc_all_stages()):
+            raise LLMError("此阶段尚未启用 ChatGPT 订阅模型。", code="SIWC_DISABLED", status=403)
+        if base_url not in ("", SIWC_RESOURCE) or api_key:
+            raise LLMError("ChatGPT 订阅连接只使用官方地址与已授权账号。", code="SIWC_OAUTH_ONLY", status=400)
+        try:
+            service.check_selection(model, siwc_profile)
+        except SiwcError as error:
+            raise LLMError(str(error), code=error.code, status=error.status) from None
+        creds = _Credentials(SIWC, SIWC_RESOURCE, "", model, "disabled", service, service.epoch)
+    else:
+        creds = await _resolve_credentials(provider, base_url, api_key, model, thinking_mode, use_saved_connection, store)
     if creds.provider == "mock":
         result = await call_mock_llm(system=system, prompt=prompt, timeout_ms=effective_timeout,
                                      test_scenario=test_scenario)
@@ -658,18 +1075,29 @@ async def call_llm(*, provider="mock", base_url="", api_key="", model="", thinki
             _check_circuit(key)
             tried.add(budget)
             try:
-                result = await _provider_attempt(active_client, transport, creds, key, system, prompt,
-                                                 temperature, budget, effective_timeout, allow_parallel)
+                result = await _provider_attempt(
+                    active_client, transport, creds, key, system, prompt,
+                    temperature, budget, effective_timeout, allow_parallel,
+                    messages=messages, tools=tools, reasoning_effort=reasoning_effort, cache_key=cache_key,
+                )
                 finish = result.get("finishReason")
                 if guard and output_was_truncated(finish):
                     raise _truncated_error(finish, result["text"], budget, rejected_at, stage)
-                if guard and not result["text"].strip():
+                if guard and not result["text"].strip() and not result.get("toolCalls"):
                     raise LLMError("模型未返回可见内容。", code="EMPTY_RESPONSE", status=502,
                                    retryable=True, finish_reason=finish)
                 return {**result, "durationMs": _elapsed(started)}
             except LLMError as error:
                 if error.code == "CIRCUIT_OPEN" or (error.status == 429 and creds.provider == "openai"):
                     raise
+                if creds.provider == SIWC:
+                    # The preview endpoint offers no wire-level output budget to increase.
+                    if not error.retryable or attempt == attempts:
+                        raise
+                    _check_circuit(key)
+                    await _sleep(_backoff(creds, error, attempt))
+                    attempt += 1
+                    continue
                 if guard and error.code in {"EMPTY_RESPONSE", "OUTPUT_TRUNCATED"} and output_was_truncated(error.finish_reason):
                     truncation = error if error.code == "OUTPUT_TRUNCATED" else _truncated_error(
                         error.finish_reason, "", budget, rejected_at, stage,
@@ -703,19 +1131,23 @@ async def call_llm(*, provider="mock", base_url="", api_key="", model="", thinki
 async def test_connection(*, provider="deepseek", base_url="", api_key="", model="", thinking_mode="disabled",
                           timeout_ms=15_000, store=None, client: httpx.AsyncClient | None = None):
     started = _clock()
-    creds = await _resolve_credentials(provider, base_url, api_key, model, thinking_mode, False, store)
+    siwc = str(provider).lower() == SIWC
+    creds = (_Credentials(SIWC, SIWC_RESOURCE, "", model, "disabled") if siwc else
+             await _resolve_credentials(provider, base_url, api_key, model, thinking_mode, False, store))
     result = {"provider": creds.provider, "model": creds.model, "baseUrl": creds.base_url,
               "thinkingMode": creds.thinking_mode}
     try:
         if provider_requires_key(creds.provider) and not creds.api_key:
             raise LLMError(f"未配置 {creds.provider} API Key", code="CONFIG_REQUIRED", status=400)
-        reply = await call_llm(provider=creds.provider, base_url=creds.base_url, api_key=creds.api_key,
+        reply = await call_llm(provider=creds.provider, base_url=base_url if siwc else creds.base_url,
+                               api_key=api_key if siwc else creds.api_key,
                                model=creds.model, thinking_mode=creds.thinking_mode, timeout_ms=timeout_ms,
                                system="你是连通性探测助手，请简短回复。", prompt="回复OK", temperature=0,
-                               max_tokens=protected_output_budget(4096, 16_384), retries=0, store=store, client=client)
+                               max_tokens=protected_output_budget(4096, 16_384), retries=0, store=store, client=client,
+                               **({"siwc_context": "provider-test"} if siwc else {}))
     except LLMError as error:
         return {**result, "ok": False, "latencyMs": _elapsed(started), "replyPreview": "",
-                "usage": None, "error": str(error)}
+                "usage": None, "error": str(error), **({"code": error.code} if siwc else {})}
     return {**result, "ok": True, "latencyMs": reply["durationMs"], "replyPreview": reply["text"].strip()[:80],
             "usage": reply["usage"], "error": None}
 

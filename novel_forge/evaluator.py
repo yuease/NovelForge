@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import math
+import os
 import re
 import threading
 from datetime import datetime, timezone
@@ -11,6 +12,7 @@ from decimal import Decimal
 from string import Template
 
 from .llm import DEFAULT_MAX_TOKENS, LLMError, call_llm, next_output_budget, output_was_truncated
+from .manuscript_tools import readonly_tool_specs, run_readonly_tool
 from .storage import _json, count_chinese_words
 from .verifier import _llm_options, _notify, _strict_json
 
@@ -457,20 +459,101 @@ def _mock_report(job, chapters, signals, mode):
     }
 
 
-async def _checked_review(request, check, label, on_retry, limit_advice, *, store, client):
+MAX_EVAL_TOOL_ROUNDS = 5
+MAX_EVAL_TOOLS_PER_ROUND = 6
+_EVAL_TOOL_GUIDE = (
+    "\n【跨章只读查证工具】当你怀疑某处设定、伏笔、人物年龄/金额/器物或时间线「前文未交代」或「与别章矛盾」时，"
+    "请先调用 search_manuscript、read_chapter 或 read_chapters_batch 核对全书真实原文再下判断；"
+    "严禁把前文已交代的内容误判为设定冲突或遗漏。查证完毕后，最终回复仍必须严格输出符合要求的单个合法 JSON 对象。"
+)
+
+
+def _eval_tools_enabled():
+    return os.getenv("NOVEL_FORGE_EVAL_TOOLS", "1") != "0"
+
+
+async def _checked_review(request, check, label, on_retry, limit_advice, *, store, client,
+                          book=None, tools_disabled=None):
     retry_instruction = (
         "\n上一次回复未完整通过 JSON 校验。重新审读同一段，只输出一个完整 JSON 对象，"
         "按原有字段输出，字符串中的引号和换行须正确转义。不要解释、不要代码围栏。" + limit_advice
     )
     budget, apply_floor = request["max_tokens"], True
+    provider_key = (request.get("provider"), request.get("model"))
+    disabled_set = tools_disabled if tools_disabled is not None else set()
+
     for attempt in range(2):
         reason = "返回的 JSON 无效或缺少必要字段"
-        system = request["system"] + "\n最终回复必须是一个完整 JSON 对象。不要输出 Markdown。"
+        use_tools = bool(book and _eval_tools_enabled() and request.get("provider") != "mock"
+                         and provider_key not in disabled_set)
+        tools = readonly_tool_specs(("current",)) if use_tools else None
+        base_system = request["system"] + "\n最终回复必须是一个完整 JSON 对象。不要输出 Markdown。" + (
+            retry_instruction if attempt else ""
+        )
+        system = (request["system"] + _EVAL_TOOL_GUIDE + "\n最终回复必须是一个完整 JSON 对象。不要输出 Markdown。"
+                  + (retry_instruction if attempt else "")) if use_tools else base_system
         try:
-            reply = await call_llm(
-                **{**request, "system": system + (retry_instruction if attempt else ""), "max_tokens": budget},
-                retry_empty_response=False, apply_output_floor=apply_floor, store=store, client=client,
-            )
+            if use_tools:
+                messages = [{"role": "user", "content": request["prompt"]}]
+                seen_calls = {}
+                evidence_notes = []
+                reply = None
+                for tool_round in range(MAX_EVAL_TOOL_ROUNDS + 1):
+                    try:
+                        reply = await call_llm(
+                            **{**request, "system": system, "prompt": "", "messages": messages,
+                               "tools": tools, "max_tokens": budget},
+                            retry_empty_response=False, apply_output_floor=apply_floor, store=store, client=client,
+                        )
+                    except LLMError as tool_err:
+                        if tool_err.code == "TOOLS_UNSUPPORTED":
+                            disabled_set.add(provider_key)
+                            use_tools = False
+                            reply = await call_llm(
+                                **{**request, "system": base_system, "max_tokens": budget},
+                                retry_empty_response=False, apply_output_floor=apply_floor, store=store, client=client,
+                            )
+                            break
+                        raise
+                    tool_calls = [c for c in (reply.get("toolCalls") or [])[:MAX_EVAL_TOOLS_PER_ROUND]
+                                  if isinstance(c, dict)]
+                    if not tool_calls:
+                        break
+                    if tool_round >= MAX_EVAL_TOOL_ROUNDS:
+                        digest = "\n".join(evidence_notes[-16:])[:6000]
+                        synthesis_prompt = request["prompt"] + (
+                            f"\n\n【本轮跨章核实摘录（请直接据此输出最终合法 JSON）】\n{digest}" if digest else ""
+                        )
+                        reply = await call_llm(
+                            **{**request, "system": base_system, "prompt": synthesis_prompt, "max_tokens": budget},
+                            retry_empty_response=False, apply_output_floor=apply_floor, store=store, client=client,
+                        )
+                        break
+                    await on_retry(f"{label}正在跨章核实原稿（第 {tool_round + 1} 轮）…")
+                    messages.append(reply.get("assistantMessage") or {
+                        "role": "assistant", "content": reply.get("text") or "", "toolCalls": tool_calls,
+                    })
+                    for call in tool_calls:
+                        name = str(call.get("name") or "")
+                        args = call.get("arguments") if isinstance(call.get("arguments"), dict) else {}
+                        sig = _json({"name": name, "args": args})
+                        if sig in seen_calls:
+                            payload = {"说明": "与前一次完全相同的查证条件，请直接复用前序结果。"}
+                        else:
+                            payload, _ = await asyncio.to_thread(run_readonly_tool, {"current": book}, "current", name, args)
+                            seen_calls[sig] = True
+                            evidence_notes.append(f"- {name}({_json(args)[:100]}): {_json(payload)[:350]}")
+                        messages.append({
+                            "role": "tool",
+                            "toolCallId": str(call.get("id") or ""),
+                            "name": name or "tool",
+                            "content": _json(payload),
+                        })
+            else:
+                reply = await call_llm(
+                    **{**request, "system": base_system, "max_tokens": budget},
+                    retry_empty_response=False, apply_output_floor=apply_floor, store=store, client=client,
+                )
             if output_was_truncated(reply.get("finishReason")):
                 reason = "输出被模型截断"
             elif not _has_text(reply.get("text")):
@@ -816,6 +899,9 @@ async def _complete_evaluation(job, ordered, checkpoint, *, update, log, reused,
     retries = _setting(max_retries, configuration.get("max_retries"), 4)
     stored_batches = {item["batchRange"] for item in checkpoint["batchResults"]}
 
+    book_map = {_chapter_number(chapter): chapter for chapter in ordered}
+    tools_disabled = set()
+
     def request(kind, prompt):
         provider, model = selection[f"{kind}Provider"], selection[f"{kind}Model"]
         same_provider = provider == default_provider
@@ -828,6 +914,7 @@ async def _complete_evaluation(job, ordered, checkpoint, *, update, log, reused,
             "temperature": 0.2 if kind == "flash" else 0.25,
             "max_tokens": flash_max_tokens if kind == "flash" else DEFAULT_MAX_TOKENS,
             "timeout_ms": timeout if kind == "flash" else max(timeout, 360_000), "max_retries": retries,
+            "cache_key": f"nf-eval-{job.get('id') or 'book'}-{kind}"[:64],
         }
         return {**settings, **prompt}
 
@@ -866,6 +953,8 @@ async def _complete_evaluation(job, ordered, checkpoint, *, update, log, reused,
                 request("flash", prompt), lambda value: _valid_batch(value, span),
                 f"初审第 {index}/{total} 批（{start}–{end} 章）", notify_progress,
                 "简写时间线和处境变化，问题优先 P0/P1，每处引文最多 60 字。", store=store, client=client,
+                book=book_map if len(ordered) > len(batch) else None,
+                tools_disabled=tools_disabled,
             )
             await save_batch({**result, "batchRange": span}, f"{selection['flashProvider']}/{selection['flashModel']}")
             if offset + batch_size < len(ordered):
@@ -880,6 +969,8 @@ async def _complete_evaluation(job, ordered, checkpoint, *, update, log, reused,
         pro_review = await _checked_review(
             request("pro", _build_pro_review(job, ordered, batches, signals)), _valid_pro_review,
             "精读", notify_progress, "保留六维评分，每条说明精简为一句，优先给出关键 P0/P1 问题。", store=store, client=client,
+            book=book_map if len(ordered) > len(_sample_chapters(ordered)) else None,
+            tools_disabled=tools_disabled,
         )
         await save_progress(
             {"proReview": pro_review, "proUsed": f"{selection['proProvider']}/{selection['proModel']}", "stage": "finalizing"},

@@ -145,14 +145,15 @@ _CHAPTER_OUTLINES_SYSTEM = """[TASK:CHAPTER_OUTLINES]
 要求：
 1. 每章必须包含明确目标、关键事件链、情绪/冲突转折、信息增量和章末钩子。
 2. 严格承接前文章纲、选题立项包（核心冲突与黄金三章设计）、当前已发生规范事实与未回收伏笔。
-3. 严格输出 JSON 数组，不要输出多余解释。"""
+3. 涉及疫病、医案、投毒、攻防或刑罚冲突时，仅采用常见风寒/细菌性热病、日常卫生防疫、普通化学杂质、机械装备或常规缉捕审讯等合规桥段，禁止设计烈性病原体播撒、芽孢/病菌提取、毒菌涂箭或药膏掺菌、水源投毒、气溶胶制毒、火药/炸药/起爆与延时自燃装置配比制法，或极端酷刑屠杀细节。
+4. 严格输出 JSON 数组，不要输出多余解释。"""
 
-_CHAPTER_OUTLINES_PROMPT = Template("""请生成连续章纲：
-起始章节：${start_chapter}
-结束章节：${end_chapter}${total_block}
-单章目标字数：${target_words}
+_CHAPTER_OUTLINES_PROMPT = Template("""单章目标字数：${target_words}
 【全书总纲】
-${book_plan}${topic_block}${prev_context}${facts_block}${direction_block}${finale_plan_block}
+${book_plan}${topic_block}
+请生成连续章纲：
+起始章节：${start_chapter}
+结束章节：${end_chapter}${total_block}${prev_context}${facts_block}${direction_block}${finale_plan_block}
 
 请输出 JSON 数组，每项格式如下：
 [
@@ -185,12 +186,12 @@ _CHAPTER_WRITE_SYSTEM = Template("""[TASK:CHAPTER_WRITE]
 6. 文风要求：${style_guide}${meme_block}
 7. 直接输出小说正文第一段，**不要在正文中输出章节标题（如“第X章 …”或“## 第X章 …”），也不要输出“好的”、“以下是正文”等元话语**。${draft_rule}""")
 
-_CHAPTER_WRITE_PROMPT = Template("""请撰写第${chapter_number}${total_suffix}章正文：
-书名：${book_title}
+_CHAPTER_WRITE_PROMPT = Template("""书名：${book_title}
 叙事视角：${pov}
-本章目标字数：${target_words}${book_anchors}${finale}
+本章目标字数：${target_words}${book_anchors}${style_block}
+请撰写第${chapter_number}${total_suffix}章正文：${finale}
 本章标题：${chapter_title}
-本章章纲：${outline}${style_block}${summary_block}${ending_block}
+本章章纲：${outline}${summary_block}${ending_block}
 【本章相关规范事实 Relevant Facts（必须严格遵守）】
 ${facts}""")
 
@@ -323,7 +324,7 @@ _REPAIR_AI_FIX_BLOCK = Template("""
 ${ai_issues}""")
 
 _REPAIR_SYSTEM = Template("""[TASK:REPAIR]
-你是专业小说精修编辑。请根据审校指出的问题列表，对第${chapter_number}章正文进行一次性定向修复（同时修正设定/因果冲突与指定 AI 味问题）。
+你是专业小说精修编辑。请根据审校指出的问题列表，对当前章节正文进行一次性定向修复（同时修正设定/因果冲突与指定 AI 味问题）。
 要求：
 1. 彻底解决所有 severity="error" 的一致性、门牌/金额/时间线、占位符或视角问题。${hard_style_rule}
 2. ${style_instruction}
@@ -674,6 +675,7 @@ _ARC_OUTLINES_SYSTEM = """[TASK:ARC_OUTLINES]
 你是剧情单元编剧。根据已经发生的正文事实与总纲路标，只规划当前单元。核心口径锁为不可变硬设定，动态数值与人物去向以有证据的前文为准。
 禁止重演已演桥段清单中的破局机制、大招和信息揭示；强化旧伏笔必须带来新的信息或后果。勿提前消耗终局破局。
 同一反派连续两个单元没有新增实质筹码，必须退场或转幕后。章名和断章方式要与近期章节有清晰差异。
+涉及疫病、医案、投毒、攻防或刑罚冲突时，仅采用常见风寒/细菌性热病、日常卫生防疫、普通化学杂质、机械装备或常规缉捕审讯等合规桥段，禁止设计烈性病原体播撒、芽孢/病菌提取、毒菌涂箭或药膏掺菌、水源投毒、气溶胶制毒、火药/炸药/起爆与延时自燃装置配比制法，或极端酷刑屠杀细节。
 只输出完整 JSON 对象。"""
 
 
@@ -1328,7 +1330,7 @@ def build_repair_prompt(*, chapter_number, chapter_text, issues=None, ai_issues=
         "同步清理列出的 AI 味问题：删掉“写完动作又旁白解释”的多余句子，替换机械重复的身体反应套话，让不同角色对话贴合各自立场。"
     )
     system = _REPAIR_SYSTEM.substitute(
-        chapter_number=chapter_number, pov=pov, target_words=target_words, style_instruction=style_instruction,
+        pov=pov, target_words=target_words, style_instruction=style_instruction,
         hard_style_rule=' type="ai_flavor" 且 severity="error" 的项目同样必须修复。' if chapter_ai_gate else "",
     )
     if story_ledger:

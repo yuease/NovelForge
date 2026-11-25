@@ -113,6 +113,7 @@ class RevisionRuntime:
         self.lock = asyncio.Lock()
         self.model_slots = asyncio.Semaphore(4)
         self.on_failure = None
+        self._tools_unsupported = set()
 
     def require(self, job_id, run_id):
         record = self.store.get(run_id)
@@ -316,8 +317,12 @@ class RevisionRuntime:
                               recovery=recovery if recovery.get("stage") == record["stage"] else None)
             elif action == "archive" and record["status"] in ("error", "paused", "ready", "needs_review") and run not in self.tasks:
                 self.store.update(run, "archived")
-            elif action == "apply" and record["status"] in ("ready", "applied") and run not in self.tasks:
-                await self.apply(job_id, run, record)
+            elif (action == "apply" and run not in self.tasks
+                  and (record["status"] in ("ready", "applied")
+                       or (payload.get("force") is True
+                           and record["status"] in ("needs_review", "archived")
+                           and record.get("hasCandidate")))):
+                await self.apply(job_id, run, record, force=payload.get("force") is True)
             else:
                 raise WorkerError("当前任务状态无法执行此操作。", 409, "REVISION_STATE")
             return self.store.get(run)
@@ -330,7 +335,8 @@ class RevisionRuntime:
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
-    async def model_json(self, run, role, instructions, data, verify, max_tokens=DEFAULT_MAX_TOKENS, *, fallback_on_final=None):
+    async def model_json(self, run, role, instructions, data, verify, max_tokens=DEFAULT_MAX_TOKENS, *,
+                         fallback_on_final=None, tools=None, tool_runner=None):
         record = self.store.get(run)
         selection = record["editor" if role == "editor" else "verifier"]
         original_input = compact_json(data)
@@ -353,22 +359,88 @@ class RevisionRuntime:
                             run, record["stage"], role, model_call["inputHash"][:12], str(exc)[:600])
                 correction = "\n上一份结果校验失败，请严格修正以下问题：" + str(exc)
                 details = exc.details
+        provider_key = (selection.get("provider"), selection.get("model"))
+        cache_key = f"nf-rev-{run[:16]}-{role}"[:64]
+        system_prompt = f"[TASK:REVISION_{role.upper()}]\n{COMMON}\n{instructions}"
         for attempt in range(1, 4):
             self.check_pause(run)
             context = (run, record["stage"], role, model_call["inputHash"][:12], attempt, attempt - 1)
-            async with self.model_slots:
-                started = perf_counter()
-                try:
-                    result = await self.worker.request("revision-model", jobId=record["jobId"], payload={
-                        **selection, "role": role,
-                        "system": f"[TASK:REVISION_{role.upper()}]\n{COMMON}\n{instructions}",
-                        "prompt": original_input + correction, "maxTokens": max_tokens,
-                    })
-                except WorkerError as exc:
-                    log.warning("revision_model_failed run=%s stage=%s role=%s input=%s attempt=%d retries=%d "
-                                "elapsedMs=%.0f code=%s httpStatus=%s",
-                                *context, (perf_counter() - started) * 1000, exc.code, exc.status)
-                    raise
+            use_tools = bool(tools and tool_runner and getattr(self.worker, "supports_native_tools", False)
+                             and not record.get("isMock") and provider_key not in self._tools_unsupported)
+            started = perf_counter()
+            try:
+                if use_tools:
+                    messages = [{"role": "user", "content": original_input + correction}]
+                    seen_calls = {}
+                    evidence_notes = []
+                    result = None
+                    for tool_round in range(5):
+                        self.check_pause(run)
+                        async with self.model_slots:
+                            try:
+                                result = await self.worker.request("revision-model", jobId=record["jobId"], payload={
+                                    **selection, "role": role, "system": system_prompt, "prompt": "",
+                                    "messages": messages, "tools": tools, "maxTokens": max_tokens,
+                                    "cacheKey": cache_key,
+                                })
+                            except WorkerError as exc:
+                                if exc.code == "TOOLS_UNSUPPORTED":
+                                    self._tools_unsupported.add(provider_key)
+                                    use_tools = False
+                                    result = await self.worker.request("revision-model", jobId=record["jobId"], payload={
+                                        **selection, "role": role, "system": system_prompt,
+                                        "prompt": original_input + correction, "maxTokens": max_tokens,
+                                        "cacheKey": cache_key,
+                                    })
+                                    break
+                                raise
+                        tool_calls = [c for c in (result.get("toolCalls") or [])[:6] if isinstance(c, dict)]
+                        if not tool_calls:
+                            break
+                        if tool_round >= 4:
+                            digest_text = "\n".join(evidence_notes[-16:])[:6000]
+                            synth_prompt = original_input + correction + (
+                                f"\n\n【本轮跨章查证记录（请直接按原格式输出最终 JSON）】\n{digest_text}"
+                                if digest_text else ""
+                            )
+                            async with self.model_slots:
+                                result = await self.worker.request("revision-model", jobId=record["jobId"], payload={
+                                    **selection, "role": role, "system": system_prompt,
+                                    "prompt": synth_prompt, "maxTokens": max_tokens, "cacheKey": cache_key,
+                                })
+                            break
+                        messages.append(result.get("assistantMessage") or {
+                            "role": "assistant", "content": result.get("text") or "", "toolCalls": tool_calls,
+                        })
+                        for call in tool_calls:
+                            name = str(call.get("name") or "")
+                            args = call.get("arguments") if isinstance(call.get("arguments"), dict) else {}
+                            sig = compact_json({"name": name, "args": args})
+                            if sig in seen_calls:
+                                payload = {"说明": "与前一次完全相同的查证条件，请直接复用前序结果。"}
+                            else:
+                                payload = await tool_runner(name, args)
+                                seen_calls[sig] = True
+                                evidence_notes.append(f"- {name}({compact_json(args)[:100]}): {compact_json(payload)[:350]}")
+                            messages.append({
+                                "role": "tool",
+                                "toolCallId": str(call.get("id") or ""),
+                                "name": name or "tool",
+                                "content": compact_json(payload),
+                            })
+                else:
+                    async with self.model_slots:
+                        result = await self.worker.request("revision-model", jobId=record["jobId"], payload={
+                            **selection, "role": role,
+                            "system": system_prompt,
+                            "prompt": original_input + correction, "maxTokens": max_tokens,
+                            "cacheKey": cache_key,
+                        })
+            except WorkerError as exc:
+                log.warning("revision_model_failed run=%s stage=%s role=%s input=%s attempt=%d retries=%d "
+                            "elapsedMs=%.0f code=%s httpStatus=%s",
+                            *context, (perf_counter() - started) * 1000, exc.code, exc.status)
+                raise
             elapsed = (perf_counter() - started) * 1000
             parsed = None
             try:

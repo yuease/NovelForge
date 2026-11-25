@@ -1,9 +1,10 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useId, useState } from 'react'
 import type { FormEvent } from 'react'
 import { AnimatePresence, motion } from 'motion/react'
 import { BookMarked, Cpu, Feather, Lightbulb, Rocket, Ruler, Sparkles, Wand2, X } from 'lucide-react'
 import { api } from '../lib/api'
 import { cn } from '../lib/cn'
+import { COLLAPSE_MOTION, SPRING_INDICATOR } from '../lib/motion'
 import { navigate } from '../lib/router'
 import { formatNumber, formatWords, messageOf } from '../lib/format'
 import type { CreateJobInput, LLMProvider, MemeLevel, MemeSourceMode, POVType, ThinkingMode } from '../lib/types'
@@ -91,6 +92,7 @@ const DEFAULT_DRAFT: Draft = {
 
 export default function CreatePage() {
   const { prefill, consumePrefill, onJobCreated } = useStudio()
+  const presetRingId = useId()
   const [draft, setDraft] = useSessionState<Draft>('nf_create_draft', DEFAULT_DRAFT)
   const set = <K extends keyof Draft>(key: K, value: Draft[K]) => setDraft((d) => ({ ...d, [key]: value }))
 
@@ -183,7 +185,7 @@ export default function CreatePage() {
         description="写下故事方向，墨枢会完成选题、规划、撰写与审校。没有梗概也可以，交给热点选题。"
       />
 
-      <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_360px]">
+      <div className="grid gap-6 @[860px]/main:grid-cols-[minmax(0,1fr)_350px]">
         <div className="grid min-w-0 gap-6">
           {/* Premise – the hero input */}
           <Card padding="lg" className={cn('transition-shadow duration-300', premiseFocused && 'nf-glow-border')}>
@@ -208,10 +210,10 @@ export default function CreatePage() {
             />
             <AnimatePresence initial={false}>
               {draft.hotspotContext != null && (
-                <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: 'auto' }} exit={{ opacity: 0, height: 0 }} className="overflow-hidden">
+                <motion.div {...COLLAPSE_MOTION} className="overflow-hidden">
                   <div className="mt-3 flex items-center gap-2">
                     <Badge tone="primary" icon={<Sparkles />}>已关联热点灵感</Badge>
-                    <button type="button" className="rounded-full p-1 text-muted hover:bg-surface-2 hover:text-ink" aria-label="移除热点关联" onClick={() => set('hotspotContext', undefined)}>
+                    <button type="button" className="rounded-full p-1 text-muted transition-colors hover:bg-surface-2 hover:text-ink" aria-label="移除热点关联" onClick={() => set('hotspotContext', undefined)}>
                       <X className="size-3.5" />
                     </button>
                   </div>
@@ -274,7 +276,7 @@ export default function CreatePage() {
             />
             <AnimatePresence initial={false}>
               {draft.memeLevel !== 'none' && (
-                <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: 'auto' }} exit={{ opacity: 0, height: 0 }} className="overflow-hidden">
+                <motion.div {...COLLAPSE_MOTION} className="overflow-hidden">
                   <Checkbox
                     className="mt-4"
                     checked={draft.memeSourceMode === 'include_archive_elements'}
@@ -294,20 +296,27 @@ export default function CreatePage() {
               {WORD_PRESETS.map((p) => {
                 const active = draft.targetWords === p.words && draft.totalChapters === p.chapters
                 return (
-                  <motion.button
+                  <button
                     key={p.label}
                     type="button"
-                    whileTap={{ scale: 0.97 }}
                     onClick={() => setDraft((d) => ({ ...d, targetWords: p.words, totalChapters: p.chapters }))}
                     aria-pressed={active}
                     className={cn(
-                      'rounded-md border px-4 py-3 text-left transition-all duration-200',
-                      active ? 'border-primary bg-primary-soft/70 shadow-[0_0_0_1px_var(--nf-primary)]' : 'border-line hover:border-line-strong hover:bg-surface-2/60',
+                      'relative rounded-md border px-4 py-3 text-left transition-[border-color,background-color,transform] duration-150 active:scale-[.975]',
+                      active ? 'border-transparent' : 'border-line hover:border-line-strong hover:bg-surface-2/60',
                     )}
                   >
-                    <div className={cn('font-display text-title font-medium', active ? 'text-primary' : 'text-ink')}>{p.label}</div>
-                    <div className="mt-0.5 text-caption text-muted">{p.sub}</div>
-                  </motion.button>
+                    {active && (
+                      <motion.span
+                        layoutId={presetRingId}
+                        transition={SPRING_INDICATOR}
+                        aria-hidden
+                        className="pointer-events-none absolute inset-0 rounded-md border border-primary bg-primary-soft/70 shadow-[0_0_0_1px_var(--nf-primary)]"
+                      />
+                    )}
+                    <div className={cn('relative font-display text-title font-medium transition-colors duration-150', active ? 'text-primary' : 'text-ink')}>{p.label}</div>
+                    <div className="relative mt-0.5 text-caption text-muted">{p.sub}</div>
+                  </button>
                 )
               })}
             </div>
@@ -329,7 +338,7 @@ export default function CreatePage() {
         </div>
 
         {/* Right rail */}
-        <aside className="min-w-0 lg:sticky lg:top-20 lg:self-start">
+        <aside className="min-w-0 @[860px]/main:sticky @[860px]/main:top-20 @[860px]/main:self-start">
           <div className="grid gap-6">
             <Card padding="lg">
               <CardHeader
@@ -395,9 +404,9 @@ export default function CreatePage() {
                   { label: '模型', value: model || '—' },
                 ]}
               />
-              <AnimatePresence>
+              <AnimatePresence initial={false}>
                 {error && (
-                  <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: 'auto' }} exit={{ opacity: 0, height: 0 }} className="overflow-hidden">
+                  <motion.div {...COLLAPSE_MOTION} className="overflow-hidden">
                     <Alert tone="danger" className="mt-4" onClose={() => setError(null)}>{error}</Alert>
                   </motion.div>
                 )}

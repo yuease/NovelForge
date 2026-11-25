@@ -4,6 +4,7 @@ export type LLMProvider =
   | 'mock'
   | 'deepseek'
   | 'openai'
+  | 'openai-siwc'
   | 'gemini'
   | 'vertex'
   | 'anthropic'
@@ -123,6 +124,23 @@ export interface ProviderCatalogEntry {
   discoverySupported: boolean
   discoveryBlock?: 'vertex-oauth'
   modelSource: 'discovered' | 'preset' | 'manual'
+  authKind?: 'oauth'
+  oauthState?: SiwcState
+  accountLabel?: string
+  profileId?: string
+  catalogVersion?: number
+  allStages?: boolean
+  modelLabels?: Record<string, string>
+}
+
+export type SiwcState = 'signed_out' | 'connected' | 'permission_required' | 'reauthorize' | 'storage_error' | 'disabled'
+export type SiwcStatus = {
+  enabled: boolean
+  configured: boolean
+  state: SiwcState
+  accountLabel: string
+  profileId: string
+  quotaLimited: boolean
 }
 
 export interface ModelCatalog {
@@ -140,6 +158,7 @@ export interface ProviderTestResult {
   replyPreview?: string
   usage?: unknown
   error?: string
+  code?: string
 }
 
 export interface LLMConfig {
@@ -259,6 +278,7 @@ export interface TokenUsageSummary {
 }
 
 export type RevisionSelection = { provider: LLMProvider; model: string; useSavedConnection?: boolean }
+export type EditorModelSelection = RevisionSelection & { siwcProfileId?: string }
 
 export type RevisionAction = 'pause' | 'resume' | 'archive' | 'apply' | 'repair' | 'decide' | 'restore' | 'continue-round'
 export type RevisionAmendment = { before: string; after: string; evidence: string }
@@ -268,6 +288,7 @@ export type RevisionActionPayload =
   | { decisions: Record<string, string> }
   | { chapter: number; field: 'title' | 'content'; text: string; evidence: string }
   | { turn: number }
+  | { force?: boolean }
 
 export interface RevisionRun {
   id: string

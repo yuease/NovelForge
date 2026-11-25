@@ -6,15 +6,16 @@ import {
   Hash, Layers, Plus, RefreshCw, Settings2, Sparkles, Terminal, Trash2,
 } from 'lucide-react'
 import { cn } from '../lib/cn'
+import { COLLAPSE_MOTION, EASE_OUT, TAB_MOTION } from '../lib/motion'
 import { navigate } from '../lib/router'
 import { estimateJobCostCny, formatCny } from '../lib/pricing'
-import { formatNumber, formatTokens, formatWords, messageOf } from '../lib/format'
+import { formatNumber, formatTokens, formatWords, friendlyError, messageOf } from '../lib/format'
 import type { ChapterRecord, JobRecord, LLMConfig, LLMProvider, MemeLevel, SSELogItem } from '../lib/types'
 import { useStudio } from '../state/studio'
 import type { ExtendPayload } from '../state/studio'
 import {
   Alert, AnimatedNumber, Badge, Button, Card, Checkbox, Collapsible, Drawer, EmptyState, Field, IconButton,
-  Input, PageHeader, Progress, ProgressRing, Select, SectionLabel, Segmented, StatusBadge, Stagger, StaggerItem,
+  Input, PageHeader, Progress, ProgressRing, Select, SectionLabel, Segmented, StatusBadge, StaggerItem,
   Textarea, Thinking, useToast,
 } from '../components/ui'
 import { ModelPicker, ModelSelect, isModelChoiceReady, resolveSelectedModel, useModelCatalog } from '../components/model/ModelPicker'
@@ -53,11 +54,11 @@ export default function MonitorPage() {
   return (
     <>
       <PageHeader title="实时进度" description="追踪作品的工作流、章节与用量。" />
-      <div className="grid gap-6 xl:grid-cols-[300px_minmax(0,1fr)]">
+      <div className="grid grid-cols-1 gap-6 @[900px]/main:grid-cols-[300px_minmax(0,1fr)]">
         <JobList jobs={jobs} activeId={activeJob?.id} onSelect={selectJob} onRefresh={refreshJobs} />
-        <AnimatePresence mode="wait">
+        <AnimatePresence mode="wait" initial={false}>
           {activeJob ? (
-            <motion.div key={activeJob.id} initial={{ opacity: 0, x: 12 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -12 }} transition={{ duration: 0.25 }} className="min-w-0">
+            <motion.div key={activeJob.id} initial={TAB_MOTION.initial} animate={TAB_MOTION.animate} exit={TAB_MOTION.exit} className="min-w-0">
               <JobFocus job={activeJob} />
             </motion.div>
           ) : (
@@ -78,7 +79,7 @@ function JobList({ jobs, activeId, onSelect, onRefresh }: { jobs: JobRecord[]; a
   const shown = jobs.filter((j) => filter === 'all' || (filter === 'done' ? j.status === 'completed' : j.status !== 'completed'))
 
   return (
-    <aside aria-label="任务列表" className="min-w-0 xl:sticky xl:top-20 xl:self-start">
+    <aside aria-label="任务列表" className="min-w-0 @[900px]/main:sticky @[900px]/main:top-20 @[900px]/main:self-start">
       <div className="mb-3 flex items-center justify-between gap-2">
         <Segmented
           size="sm"
@@ -103,18 +104,18 @@ function JobList({ jobs, activeId, onSelect, onRefresh }: { jobs: JobRecord[]; a
         </IconButton>
       </div>
       {shown.length === 0 && <p className="px-2 py-6 text-center text-caption text-muted">没有符合条件的作品</p>}
-      <Stagger className="flex gap-3 overflow-x-auto p-1 pb-2 xl:max-h-[calc(100vh-200px)] xl:flex-col xl:overflow-y-auto xl:overflow-x-hidden">
-        {shown.map((job) => {
+      <div className="flex gap-3 overflow-x-auto p-1 pb-2 @[900px]/main:max-h-[calc(100vh-200px)] @[900px]/main:flex-col @[900px]/main:overflow-y-auto @[900px]/main:overflow-x-hidden">
+        {shown.map((job, idx) => {
           const selected = job.id === activeId
           const running = job.status === 'running'
           return (
-            <StaggerItem key={job.id} layout className="w-64 shrink-0 xl:w-auto">
+            <StaggerItem key={job.id} index={idx} className="w-64 shrink-0 @[900px]/main:w-auto">
               <button
                 type="button"
                 onClick={() => onSelect(job.id)}
                 aria-pressed={selected}
                 className={cn(
-                  'w-full rounded-lg border p-4 text-left transition-all duration-200',
+                  'w-full rounded-lg border p-4 text-left transition-[border-color,background-color,box-shadow,transform] duration-[160ms] ease-[var(--ease-standard)] active:scale-[.985]',
                   selected ? 'border-primary bg-primary-soft/60 shadow-[0_0_0_1px_var(--nf-primary)]' : 'border-line bg-surface hover:border-line-strong hover:shadow-raised',
                   running && !selected && 'nf-glow-border',
                 )}
@@ -133,7 +134,7 @@ function JobList({ jobs, activeId, onSelect, onRefresh }: { jobs: JobRecord[]; a
             </StaggerItem>
           )
         })}
-      </Stagger>
+      </div>
     </aside>
   )
 }
@@ -173,12 +174,12 @@ function JobFocus({ job }: { job: JobRecord }) {
   const stageLabel = job.stage ? STAGES[job.stage] ?? job.stage : undefined
 
   return (
-    <div className="grid gap-6">
-      <Card variant={running ? 'glow' : 'default'} padding="lg" as="section">
+    <div className="grid min-w-0 grid-cols-1 gap-6">
+      <Card variant={running ? 'glow' : 'default'} padding="lg" as="section" className="@container/hero">
         <div className="flex flex-wrap items-start justify-between gap-5">
           <div className="flex min-w-0 items-center gap-5">
             <ProgressRing value={progress} size={84} stroke={7}>
-              <span className="font-display text-title font-medium tabular-nums text-ink">{progress}<span className="text-caption text-muted">%</span></span>
+              <span className="font-display text-title font-medium tabular-nums text-ink"><AnimatedNumber value={progress} /><span className="text-caption text-muted">%</span></span>
             </ProgressRing>
             <div className="min-w-0">
               <div className="flex flex-wrap items-center gap-2">
@@ -207,7 +208,7 @@ function JobFocus({ job }: { job: JobRecord }) {
           </div>
         </div>
 
-        <div className="mt-6 grid grid-cols-2 gap-3 lg:grid-cols-4">
+        <div className="mt-6 grid grid-cols-2 gap-3 @[560px]/hero:grid-cols-4">
           <Metric icon={<Layers />} label="已存章节" value={<AnimatedNumber value={job.completedChapters ?? 0} />} suffix={`/ ${job.totalChapters} 章`} />
           <Metric icon={<FileText />} label="累计字数" value={<AnimatedNumber value={job.totalWords ?? 0} />} suffix={`/ ${formatWords(job.targetWords)}`} />
           <Metric icon={<Hash />} label="Tokens" value={formatTokens(job.tokenUsage?.totalTokens)} suffix={job.tokenUsage?.cacheHitTokens ? `缓存 ${formatTokens(job.tokenUsage.cacheHitTokens)}` : undefined} />
@@ -220,9 +221,9 @@ function JobFocus({ job }: { job: JobRecord }) {
           />
         </div>
 
-        <AnimatePresence>
+        <AnimatePresence initial={false}>
           {retry?.waiting && (
-            <motion.div initial={{ height: 0, opacity: 0 }} animate={{ height: 'auto', opacity: 1 }} exit={{ height: 0, opacity: 0 }} className="overflow-hidden">
+            <motion.div initial={COLLAPSE_MOTION.initial} animate={COLLAPSE_MOTION.animate} exit={COLLAPSE_MOTION.exit} className="overflow-hidden">
               <Alert tone="warning" className="mt-5" title="正在冷却，等待自动重试">
                 {retry.message || retry.code}
                 {retry.attempt ? ` · 第 ${retry.attempt}${retry.maxAttempts ? `/${retry.maxAttempts}` : ''} 次` : ''}
@@ -249,25 +250,34 @@ function JobFocus({ job }: { job: JobRecord }) {
         volumeSummaries={facts?.volumeSummaries}
       />
 
-      {(job.status === 'failed' || job.status === 'error' || job.status === 'interrupted') && errorMessage && (
-        <Alert tone="danger" title="最近的异常">
-          <p>{errorMessage}</p>
-          {issues.length > 0 && (
-            <ul className="mt-2 grid gap-1">
-              {issues.map((issue, i) => (
-                <li key={i} className="flex gap-2"><span>·</span><span>{issue.message ?? issue.type}{issue.sourceChapter ? `（来源第 ${issue.sourceChapter} 章）` : ''}</span></li>
-              ))}
-            </ul>
-          )}
-        </Alert>
-      )}
+      {(job.status === 'failed' || job.status === 'error' || job.status === 'interrupted') && errorMessage && (() => {
+        const info = friendlyError(rawError)
+        return (
+          <Alert tone="danger" title={info.title}>
+            <p>{info.summary}</p>
+            {issues.length > 0 && (
+              <ul className="mt-2 grid gap-1">
+                {issues.map((issue, i) => (
+                  <li key={i} className="flex gap-2"><span>·</span><span>{issue.message ?? issue.type}{issue.sourceChapter ? `（来源第 ${issue.sourceChapter} 章）` : ''}</span></li>
+                ))}
+              </ul>
+            )}
+            {info.detail && (
+              <details className="mt-2.5 text-caption">
+                <summary className="cursor-pointer select-none opacity-80 hover:opacity-100">查看技术详情</summary>
+                <pre className="mt-1.5 max-h-40 overflow-auto whitespace-pre-wrap break-all rounded-sm bg-black/5 p-2.5 font-mono text-[11px] leading-relaxed dark:bg-white/5">{info.detail}</pre>
+              </details>
+            )}
+          </Alert>
+        )
+      })()}
       {job.status === 'completed' && !errorMessage && (
         <Alert tone="success" title="已保存全部章节" action={<Button size="sm" variant="secondary" onClick={() => navigate('reader')}>去阅读</Button>}>
           可以在「成稿与导出」中阅读、修订并导出全书。
         </Alert>
       )}
 
-      <div className="grid gap-6 2xl:grid-cols-2">
+      <div className="grid min-w-0 grid-cols-1 gap-6 @[960px]/main:grid-cols-2">
         <RunDetails job={job} chapters={chapters} />
         <Diagnostics job={job} logs={sseLogs} connected={sseConnected} onClear={clearLogs} />
       </div>
@@ -289,10 +299,10 @@ function JobFocus({ job }: { job: JobRecord }) {
 
 function Metric({ icon, label, value, suffix, title }: { icon: ReactNode; label: string; value: ReactNode; suffix?: string; title?: string }) {
   return (
-    <div className="rounded-md bg-surface-2 p-4" title={title}>
-      <div className="flex items-center gap-1.5 text-caption text-muted [&_svg]:size-3.5">{icon}{label}</div>
-      <div className="mt-1.5 font-display text-headline font-normal tabular-nums text-ink">{value}</div>
-      {suffix && <div className="text-caption tabular-nums text-muted">{suffix}</div>}
+    <div className="min-w-0 overflow-hidden rounded-md bg-surface-2 p-4" title={title}>
+      <div className="flex items-center gap-1.5 truncate text-caption text-muted [&_svg]:size-3.5 [&_svg]:shrink-0">{icon}<span className="truncate">{label}</span></div>
+      <div className="mt-1.5 truncate font-display text-headline font-normal tabular-nums text-ink">{value}</div>
+      {suffix && <div className="truncate text-caption tabular-nums text-muted">{suffix}</div>}
     </div>
   )
 }
@@ -412,11 +422,10 @@ function Diagnostics({ job, logs, connected, onClear }: { job: JobRecord; logs: 
             return (
               <motion.div
                 key={e.id}
-                layout
-                initial={{ opacity: 0, y: -8 }}
+                initial={{ opacity: 0, y: -4 }}
                 animate={{ opacity: 1, y: 0 }}
-                transition={{ duration: 0.3 }}
-                className={cn('grid grid-cols-[64px_minmax(0,1fr)] gap-x-3 rounded-sm px-2 py-1.5 hover:bg-surface sm:grid-cols-[64px_120px_minmax(0,1fr)]', isErr && 'bg-danger-soft')}
+                transition={{ duration: 0.16, ease: EASE_OUT }}
+                className={cn('grid grid-cols-[64px_minmax(0,1fr)] gap-x-3 rounded-sm px-2 py-1.5 transition-colors duration-[140ms] hover:bg-surface sm:grid-cols-[64px_120px_minmax(0,1fr)]', isErr && 'bg-danger-soft')}
               >
                 <time className="tabular-nums text-muted">{e.timestamp || '—'}</time>
                 <code className={cn('hidden truncate sm:block', isErr ? 'text-danger' : 'text-primary')}>{e.type}</code>
@@ -501,13 +510,13 @@ function ExtendPanel({ job, busy, onSubmit }: { job: JobRecord; busy: boolean; o
           {(id) => <Input id={id} type="number" min={0} value={target || ''} placeholder="自动" onChange={(e) => setTarget(Number(e.target.value))} />}
         </Field>
       </div>
-      <Field label="玩梗浓度">
+      <Field label="网感浓度">
         {(id) => (
           <Select id={id} value={memeLevel} onChange={(e) => setMemeLevel(e.target.value as MemeLevel | '')}>
             <option value="">沿用原设置</option>
             <option value="none">写实正剧</option>
             <option value="light">适度玩梗</option>
-            <option value="rich">高浓度玩梗</option>
+            <option value="rich">爆款网感</option>
           </Select>
         )}
       </Field>

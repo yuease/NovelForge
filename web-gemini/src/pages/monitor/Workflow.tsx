@@ -1,11 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { AnimatePresence, motion } from 'motion/react'
+import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
 import {
-  AlertTriangle, Archive, ArrowDownRight, ArrowLeft, ArrowRight, BookOpenCheck, Check, CircleAlert,
+  AlertTriangle, Archive, ArrowDownRight, ArrowRight, BookOpenCheck, Check, CircleAlert,
   ClipboardList, Database, Feather, Flag, Layers, Lightbulb, ListTree, Play, ScanLine, ShieldCheck,
   Sparkles, TimerReset, Wrench,
 } from 'lucide-react'
 import { cn } from '../../lib/cn'
+import { EASE_EXIT, EASE_OUT, SPRING_TACTILE, boundedDelay } from '../../lib/motion'
 import type { ArcPlan, ArcSummary, VolumeSummary } from '../../lib/types'
 import { Badge, Card, Progress } from '../../components/ui'
 
@@ -166,6 +167,7 @@ export function WorkflowGraph({
   volumeSummaries,
 }: WorkflowGraphProps) {
   const pane = useRef<HTMLDivElement>(null)
+  const reducedMotion = useReducedMotion()
   const current = live && frame?.runActive ? frame.activeNode : null
 
   useEffect(() => {
@@ -181,7 +183,7 @@ export function WorkflowGraph({
   const lastName = nodeLabel(frame?.lastNode)
   const chapter = current ? frame?.activeChapter : undefined
   const activeHint = current === 'outlines' && typeof chapter === 'number' && chapter > 1
-    ? `正在滚纲 · 第 ${chapter} 章起`
+    ? `正在规划下阶段细纲 · 第 ${chapter} 章起`
     : currentName
       ? `正在执行 · ${currentName}${typeof chapter === 'number' ? ` · 第 ${chapter} 章` : ''}`
       : null
@@ -210,11 +212,11 @@ export function WorkflowGraph({
   const rollingLoops = frame?.edgeVisits['archive:outlines'] ?? 0
 
   return (
-    <Card padding="none" as="section" aria-label="LangGraph 工作流">
+    <Card padding="none" as="section" aria-label="创作流水线" className="min-w-0 overflow-hidden">
       <div className="flex flex-wrap items-start justify-between gap-3 px-5 pt-5">
         <div className="min-w-0">
           <div className="flex flex-wrap items-center gap-2">
-            <h3 className="text-title font-medium text-ink">工作流</h3>
+            <h3 className="text-title font-medium text-ink">创作流水线</h3>
             {sortedArcs.length > 0 && (
               <Badge tone="primary" icon={<Sparkles />}>
                 滚动单元 · {sortedArcs.length} 段
@@ -227,9 +229,8 @@ export function WorkflowGraph({
               <motion.span
                 key={status}
                 initial={{ opacity: 0, y: 4 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: -4 }}
-                transition={{ duration: 0.18 }}
+                animate={{ opacity: 1, y: 0, transition: { duration: 0.18, ease: EASE_OUT } }}
+                exit={{ opacity: 0, y: -4, transition: { duration: 0.1, ease: EASE_EXIT } }}
                 className={cn('truncate', current && 'font-medium text-ink')}
               >
                 {status}
@@ -248,7 +249,7 @@ export function WorkflowGraph({
       </div>
 
       <div ref={pane} tabIndex={0} aria-label="工作流图，可横向滚动" className="overflow-x-auto px-5 pb-2 pt-4">
-        <div className="relative mx-auto min-w-[760px]" style={{ aspectRatio: `${W} / ${H}` }}>
+        <div className="relative mx-auto min-w-[700px]" style={{ aspectRatio: `${W} / ${H}` }}>
           <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" className="absolute inset-0 size-full overflow-visible" aria-hidden>
             <defs>
               <marker id="wf-arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
@@ -343,16 +344,15 @@ export function WorkflowGraph({
                     <motion.span
                       aria-hidden
                       className="pointer-events-none absolute -inset-1.5 rounded-full bg-[image:var(--nf-gradient-soft)]"
-                      animate={{ opacity: [0.35, 0.85, 0.35], scale: [0.98, 1.04, 0.98] }}
-                      transition={{ duration: 2.2, repeat: Infinity, ease: 'easeInOut' }}
+                      animate={reducedMotion ? { opacity: 0.65 } : { opacity: [0.35, 0.85, 0.35], scale: [0.98, 1.03, 0.98] }}
+                      transition={reducedMotion ? { duration: 0 } : { duration: 2.2, repeat: Infinity, ease: 'easeInOut' }}
                     />
                   )}
                   <motion.div
-                    layout
-                    animate={active ? { scale: 1.05 } : { scale: 1 }}
-                    transition={{ type: 'spring', stiffness: 400, damping: 26 }}
+                    animate={active ? { scale: 1.035 } : { scale: 1 }}
+                    transition={SPRING_TACTILE}
                     className={cn(
-                      'relative flex w-[168px] items-center gap-2.5 rounded-full border bg-surface py-1.5 pl-1.5 pr-3 transition-[border-color,box-shadow,background-color] duration-300',
+                      'relative flex w-[168px] items-center gap-2.5 rounded-full border bg-surface py-1.5 pl-1.5 pr-3 transition-[border-color,box-shadow,background-color] duration-200',
                       active && 'nf-glow-border',
                       !active && error && 'border-danger/50 bg-danger-soft',
                       done && 'border-primary/35 shadow-card',
@@ -361,7 +361,7 @@ export function WorkflowGraph({
                   >
                     <span
                       className={cn(
-                        'grid size-8 shrink-0 place-items-center rounded-full transition-colors duration-300',
+                        'grid size-8 shrink-0 place-items-center rounded-full transition-colors duration-200',
                         active ? 'nf-gradient-bg is-animated text-white' : error ? 'bg-danger text-white' : visits ? 'bg-primary-soft text-primary' : 'bg-surface-2 text-muted',
                       )}
                     >
@@ -371,9 +371,9 @@ export function WorkflowGraph({
                       <span className={cn('block truncate text-caption font-medium', active || visits ? 'text-ink' : 'text-body')}>{n.title}</span>
                       <motion.span
                         key={`${n.id}-${label}`}
-                        initial={{ opacity: 0.5, y: 2 }}
+                        initial={{ opacity: 0.45, y: 2 }}
                         animate={{ opacity: 1, y: 0 }}
-                        transition={{ duration: 0.2 }}
+                        transition={{ duration: 0.16, ease: EASE_OUT }}
                         className={cn('block truncate text-[11px] tabular-nums', active ? 'font-medium text-primary' : error ? 'text-danger' : 'text-muted')}
                       >
                         {label}
@@ -404,7 +404,7 @@ export function WorkflowGraph({
           {lastName && <span>最近节点 · {lastName}{frame?.lastChapter ? `（第 ${frame.lastChapter} 章）` : ''}</span>}
           {rollingLoops > 0 && <span className="inline-flex items-center gap-1 text-primary"><Sparkles className="size-3" />已滚动规划 {rollingLoops} 轮新单元</span>}
           {skipped > 0 && <span className="inline-flex items-center gap-1"><ArrowRight className="size-3" />章节齐全，细纲直达校准</span>}
-          <span className="inline-flex items-center gap-1"><ArrowDownRight className="size-3" />虚线为章节循环、单元归档或修复分支</span>
+          <span className="inline-flex items-center gap-1"><ArrowDownRight className="size-3" />虚线表示自动循环、归档或修复路径</span>
         </div>
         <div
           data-node="retry"
@@ -414,9 +414,8 @@ export function WorkflowGraph({
           )}
         >
           <TimerReset className="size-3.5" aria-hidden />
-          <span className="font-medium text-body">等待重试</span>
-          <span>{current === 'retry' ? '执行中' : retryVisits ? `经过 ${retryVisits} 次` : '可重试异常时'}</span>
-          <ArrowLeft className="size-3" aria-hidden /><span>返回选题</span>
+          <span className="font-medium text-body">自动重试</span>
+          <span>{current === 'retry' ? '冷却等待中' : retryVisits ? `已重试 ${retryVisits} 次` : '异常冷却后自动续跑'}</span>
         </div>
       </div>
     </Card>
@@ -442,6 +441,7 @@ function ArcProgressStrip({
   summaryByArc: Map<number, ArcSummary>
   volumeSummaries?: VolumeSummary[]
 }) {
+  const reducedMotion = useReducedMotion()
   if (totalChapters <= 0) return null
 
   /* Rolling-arc segmented timeline */
@@ -462,11 +462,11 @@ function ArcProgressStrip({
             已规划 {Math.min(plannedEnd, totalChapters)} / {totalChapters} 章 · 已归档 {archivedCount} 个单元
           </span>
         </div>
-        <div className="flex flex-wrap gap-2 sm:flex-nowrap">
-          {arcs.map((arc) => {
+        <div className="flex max-h-[260px] flex-wrap gap-2 overflow-y-auto">
+          {arcs.map((arc, idx) => {
             const span = Math.max(1, arc.endChapter - arc.startChapter + 1)
             const doneInArc = Math.max(0, Math.min(span, completedChapters - arc.startChapter + 1))
-            const fillPct = Math.round((doneInArc / span) * 100)
+            const fillRatio = doneInArc / span
             const summary = summaryByArc.get(arc.arcIndex)
             const driftCount = summary?.driftChecks?.length ?? 0
             const isWritingHere =
@@ -488,14 +488,13 @@ function ArcProgressStrip({
             return (
               <motion.div
                 key={arc.arcIndex}
-                layout
-                initial={{ opacity: 0, scale: 0.96 }}
-                animate={{ opacity: 1, scale: 1 }}
-                transition={{ duration: 0.25 }}
+                initial={{ opacity: 0, y: 5 }}
+                animate={{ opacity: 1, y: 0 }}
+                transition={{ duration: 0.2, delay: boundedDelay(idx, 0.018, 0.14), ease: EASE_OUT }}
                 title={tooltip}
-                style={{ flexGrow: span, flexBasis: 0 }}
+                style={{ flex: `${span} 1 150px` }}
                 className={cn(
-                  'min-w-[128px] overflow-hidden rounded-md border bg-surface px-3 py-2 transition-colors',
+                  'min-w-0 max-w-full overflow-hidden rounded-md border bg-surface px-3 py-2 transition-colors duration-200',
                   isLiveHere ? 'nf-glow-border' : summary ? 'border-success/35' : complete ? 'border-primary/35' : 'border-line',
                 )}
               >
@@ -526,12 +525,12 @@ function ArcProgressStrip({
                 <div className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-surface-3">
                   <motion.div
                     className={cn(
-                      'h-full rounded-full',
+                      'h-full w-full origin-left rounded-full',
                       isLiveHere ? 'nf-gradient-bg is-animated' : summary ? 'bg-g-green' : 'bg-g-blue',
                     )}
-                    initial={{ width: 0 }}
-                    animate={{ width: `${fillPct}%` }}
-                    transition={{ duration: 0.65, ease: [0.2, 0, 0, 1] }}
+                    initial={reducedMotion ? false : { scaleX: 0 }}
+                    animate={{ scaleX: fillRatio }}
+                    transition={reducedMotion ? { duration: 0 } : { duration: 0.45, ease: EASE_OUT }}
                   />
                 </div>
               </motion.div>
@@ -539,17 +538,16 @@ function ArcProgressStrip({
           })}
 
           {remainingUnplanned > 0 && (
-            <motion.div
-              layout
-              style={{ flexGrow: Math.min(remainingUnplanned, 8), flexBasis: 0 }}
+            <div
+              style={{ flex: `${Math.min(remainingUnplanned, 8)} 1 130px` }}
               className={cn(
-                'flex min-w-[110px] flex-col justify-center rounded-md border border-dashed px-3 py-2 text-[11px]',
+                'flex min-w-0 max-w-full flex-col justify-center rounded-md border border-dashed px-3 py-2 text-[11px] transition-colors duration-200',
                 rollingNext ? 'nf-glow-border bg-surface text-primary' : 'border-line-strong bg-surface/50 text-muted',
               )}
             >
               <span className="font-medium">{rollingNext ? '正在规划下单元…' : '待滚动规划'}</span>
               <span className="mt-0.5 tabular-nums opacity-85">剩余 {remainingUnplanned} 章</span>
-            </motion.div>
+            </div>
           )}
         </div>
       </div>

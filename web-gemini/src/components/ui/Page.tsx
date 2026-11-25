@@ -1,7 +1,8 @@
 import type { ReactNode } from 'react'
 import { motion } from 'motion/react'
-import type { HTMLMotionProps, Variants } from 'motion/react'
+import type { HTMLMotionProps } from 'motion/react'
 import { cn } from '../../lib/cn'
+import { boundedDelay, EASE_OUT, STAGGER_CHILD, STAGGER_PARENT } from '../../lib/motion'
 
 /** Every page starts with this: title (22px) + one-line description + primary actions on the right. */
 export function PageHeader({
@@ -19,29 +20,35 @@ export function PageHeader({
   )
 }
 
-const ease = [0.2, 0, 0, 1] as const
+export const staggerParent = STAGGER_PARENT
+export const staggerChild = STAGGER_CHILD
 
-export const staggerParent: Variants = {
-  hidden: {},
-  show: { transition: { staggerChildren: 0.045, delayChildren: 0.02 } },
-}
-export const staggerChild: Variants = {
-  hidden: { opacity: 0, y: 10 },
-  show: { opacity: 1, y: 0, transition: { duration: 0.35, ease } },
-}
-
-/** Wrap a list; children should be <StaggerItem>. Items fade-and-rise in sequence. */
+/** Wrap a list; children should be <StaggerItem>. Fast, restrained stagger. */
 export function Stagger({ children, className, ...rest }: HTMLMotionProps<'div'>) {
   return (
-    <motion.div variants={staggerParent} initial="hidden" animate="show" className={className} {...rest}>
+    <motion.div variants={STAGGER_PARENT} initial="hidden" animate="show" className={className} {...rest}>
       {children}
     </motion.div>
   )
 }
 
-export function StaggerItem({ children, className, ...rest }: HTMLMotionProps<'div'>) {
+/** Pass `index` for long lists (>8 items) so late items never queue multi-second delays. */
+export function StaggerItem({ children, index, className, ...rest }: HTMLMotionProps<'div'> & { index?: number }) {
+  if (typeof index === 'number') {
+    return (
+      <motion.div
+        initial={{ opacity: 0, y: 7 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ duration: 0.22, delay: boundedDelay(index), ease: EASE_OUT }}
+        className={className}
+        {...rest}
+      >
+        {children}
+      </motion.div>
+    )
+  }
   return (
-    <motion.div variants={staggerChild} className={className} {...rest}>
+    <motion.div variants={STAGGER_CHILD} className={className} {...rest}>
       {children}
     </motion.div>
   )
@@ -51,9 +58,9 @@ export function StaggerItem({ children, className, ...rest }: HTMLMotionProps<'d
 export function Reveal({ children, delay = 0, className, ...rest }: HTMLMotionProps<'div'> & { delay?: number }) {
   return (
     <motion.div
-      initial={{ opacity: 0, y: 12 }}
+      initial={{ opacity: 0, y: 8 }}
       animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.4, delay, ease }}
+      transition={{ duration: 0.24, delay, ease: EASE_OUT }}
       className={className}
       {...rest}
     >

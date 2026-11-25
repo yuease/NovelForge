@@ -1,12 +1,14 @@
-import { useEffect, useState } from 'react'
-import { motion } from 'motion/react'
-import { Archive, BookOpenCheck, Check, Download, FileCheck2, GitBranch, ListChecks, Pause, PenLine, Play, Search, Settings2 } from 'lucide-react'
+import { useEffect, useRef, useState } from 'react'
+import { AnimatePresence, motion } from 'motion/react'
+import { Archive, BookOpenCheck, Check, ChevronDown, Download, FileCheck2, GitBranch, ListChecks, Pause, PenLine, Play, Search, Settings2 } from 'lucide-react'
 import { api } from '../lib/api'
 import { cn } from '../lib/cn'
+import { downloadFile } from '../lib/download'
 import { messageOf } from '../lib/format'
 import type { Tone } from '../lib/format'
+import { COLLAPSE_MOTION, SPRING_TACTILE } from '../lib/motion'
 import type { JobRecord, ModelCatalog, RevisionAction, RevisionActionPayload, RevisionAmendment, RevisionRun, RevisionSelection } from '../lib/types'
-import { Alert, Badge, Button, Card, CardHeader, Dialog, Disclosure, Drawer, Field, Input, Progress, Select, Textarea, Thinking } from '../components/ui'
+import { Alert, Badge, Button, Card, CardHeader, Dialog, Disclosure, Drawer, Field, Input, PopoverSurface, Progress, Select, Textarea, Thinking, useToast } from '../components/ui'
 import { findProvider, ModelPicker } from '../components/model/ModelPicker'
 import CandidateRoundsPanel from './CandidateRoundsPanel'
 
@@ -61,9 +63,9 @@ function RevisionFlow({ run, finished }: { run: RevisionRun | null; finished: bo
             <motion.div
               initial={false}
               animate={{ scale: live ? 1.03 : 1 }}
-              transition={{ type: 'spring', stiffness: 400, damping: 32 }}
+              transition={SPRING_TACTILE}
               className={cn(
-                'relative flex min-h-11 items-center gap-2 rounded-full border py-1.5 pr-3 pl-1.5 transition-[border-color,background-color] duration-300',
+                'relative flex min-h-11 items-center gap-2 rounded-full border py-1.5 pr-3 pl-1.5 transition-[border-color,background-color] duration-200',
                 live && 'nf-glow-border border-line bg-surface',
                 paused && 'border-warning/45 bg-warning-soft',
                 failed && 'border-danger/45 bg-danger-soft',
@@ -71,7 +73,7 @@ function RevisionFlow({ run, finished }: { run: RevisionRun | null; finished: bo
               )}
             >
               <span className={cn(
-                'grid size-8 shrink-0 place-items-center rounded-full transition-colors duration-300',
+                'grid size-8 shrink-0 place-items-center rounded-full transition-colors duration-200',
                 live ? 'nf-gradient-bg is-animated text-white' : paused ? 'bg-warning-soft text-warning' :
                   failed ? 'bg-danger-soft text-danger' : complete ? 'bg-primary-soft text-primary' : 'bg-surface-2 text-muted',
               )}>
@@ -85,7 +87,16 @@ function RevisionFlow({ run, finished }: { run: RevisionRun | null; finished: bo
                 {complete && <span className="sr-only">已完成</span>}
                 {!active && !complete && <span className="sr-only">待执行</span>}
               </span>
-              {complete && <Check className="ml-auto size-3.5 shrink-0 text-primary lg:hidden xl:block" aria-hidden />}
+              {complete && (
+                <motion.span
+                  initial={{ scale: 0.5, opacity: 0 }}
+                  animate={{ scale: 1, opacity: 1 }}
+                  transition={SPRING_TACTILE}
+                  className="ml-auto shrink-0 text-primary lg:hidden xl:block"
+                >
+                  <Check className="size-3.5" aria-hidden />
+                </motion.span>
+              )}
             </motion.div>
           </li>
         )
@@ -176,10 +187,14 @@ export default function RevisionPanel({
   job, refreshToken, roundModels, editor, verifier, selectedEditor, selectedVerifier, onEditorChange, onVerifierChange,
   catalog, catalogLoading, modelAvailable, modelsReady, onApplied,
 }: Props) {
+  const toast = useToast()
   const [run, setRun] = useState<RevisionRun | null>(null)
   const [legacy, setLegacy] = useState<RevisionRun | null>(null)
   const [loaded, setLoaded] = useState(false)
   const [pending, setPending] = useState<RevisionAction | 'start' | null>(null)
+  const [downloadingKey, setDownloadingKey] = useState<string | null>(null)
+  const [archiveMenuOpen, setArchiveMenuOpen] = useState(false)
+  const archiveMenuRef = useRef<HTMLDivElement>(null)
   const [error, setError] = useState<string | null>(null)
   const [confirmApply, setConfirmApply] = useState(false)
   const [showModels, setShowModels] = useState(false)
@@ -194,6 +209,11 @@ export default function RevisionPanel({
   const waiting = run?.status === 'waiting_author' || run?.status === 'waiting_source'
   const reviewable = run?.status === 'ready' || run?.status === 'needs_review'
   const hasCandidate = Boolean(run?.hasCandidate || reviewable || run?.status === 'applied')
+  const needsAuthorForce = run?.status === 'needs_review' || run?.status === 'archived'
+  const canApply = Boolean(
+    run && !run.isMock && run.changedCount > 0 && hasCandidate
+    && (run.status === 'ready' || run.status === 'needs_review' || run.status === 'archived')
+  )
   const startBlocked = !loaded ? '正在读取修订状态。'
     : job.evaluationStatus === 'running' ? '等当前评估完成后再修订。'
     : !job.evaluationReport ? '完成当前正文的评估后可开始。'
@@ -234,6 +254,38 @@ export default function RevisionPanel({
     return () => { active = false; window.clearInterval(timer) }
   }, [job.id, running, run?.status, refreshToken])
 
+  useEffect(() => {
+    if (!archiveMenuOpen) return
+    const onPointer = (e: PointerEvent) => {
+      if (e.target instanceof Node && !archiveMenuRef.current?.contains(e.target)) setArchiveMenuOpen(false)
+    }
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setArchiveMenuOpen(false) }
+    document.addEventListener('pointerdown', onPointer)
+    window.addEventListener('keydown', onKey)
+    return () => {
+      document.removeEventListener('pointerdown', onPointer)
+      window.removeEventListener('keydown', onKey)
+    }
+  }, [archiveMenuOpen])
+
+  const exportRevisionFile = async (runId: string, artifact: Parameters<typeof api.revisionExportUrl>[2], label: string, fallbackName: string) => {
+    const key = `${runId}:${artifact}`
+    if (downloadingKey) return
+    setDownloadingKey(key)
+    setArchiveMenuOpen(false)
+    try {
+      await downloadFile(api.revisionExportUrl(job.id, runId, artifact), fallbackName)
+      toast(`已下载${label}`, 'success')
+    } catch (err) {
+      toast(messageOf(err, `下载${label}失败`), 'danger')
+    } finally {
+      setDownloadingKey(null)
+    }
+  }
+
+  // Do not show the large revision card before the book has an evaluation report or any revision history.
+  if (!job.evaluationReport && !run && !legacy) return null
+
   const start = async () => {
     setPending('start')
     setError(null)
@@ -271,14 +323,23 @@ export default function RevisionPanel({
     }
   }
 
+  const archiveFiles: Array<{ artifact: Parameters<typeof api.revisionExportUrl>[2]; label: string; name: string }> = run ? [
+    ...(run.hasLedger ? [{ artifact: 'ledger' as const, label: '全书设定清单', name: 'revision_ledger.json' }] : []),
+    ...(run.hasLedger && run.workflowVersion === 2 ? [{ artifact: 'decisions' as const, label: '评估问题裁决', name: 'revision_decisions.json' }] : []),
+    ...((hasCandidate || run.status === 'archived') ? [
+      { artifact: 'original' as const, label: '修订前备份原稿', name: 'original_backup.txt' },
+      { artifact: 'evaluation' as const, label: '修订前备份评估', name: 'evaluation_backup.json' },
+    ] : []),
+  ] : []
+
   return (
-    <Card padding="lg" as="section" className="mb-6" aria-label="评估后修订">
+    <Card padding="lg" as="section" className="mb-6" aria-label="全书修订（先出候选稿）">
       <CardHeader
-        title="评估后修订"
+        title="全书修订（先出候选稿）"
         icon={<GitBranch />}
         description={run ? (
-          <span>{run.chapterCount} 章{run.volumes.length > 0 && ' · ' + run.volumes.length + ' 卷'}{run.ledgerVersion && ' · 台账 v' + run.ledgerVersion}{run.isMock && ' · 模拟运行'}</span>
-        ) : '按评估报告修订，审校通过后可将候选稿写回正文。'}
+          <span>{run.chapterCount} 章{run.volumes.length > 0 && ' · ' + run.volumes.length + ' 卷'}{run.ledgerVersion && ' · 设定清单第 ' + run.ledgerVersion + ' 版'}{run.isMock && ' · 模拟运行'}</span>
+        ) : '按评估报告分卷系统修订，先生成独立候选稿，审校通过后由你确认再写回正文。'}
         actions={status && <Badge tone={status.tone} dot live={running}>{status.label}</Badge>}
       />
       <RevisionFlow run={run} finished={Boolean(hasCandidate && run?.stage === 'finish')} />
@@ -312,7 +373,7 @@ export default function RevisionPanel({
         </div>
       )}
       {run?.error && <Alert tone={run.status === 'error' ? 'danger' : 'warning'} className="mt-3">{run.error}</Alert>}
-      {run?.status === 'error' && !run.isMock && <p className="mt-2 text-caption text-muted">修订报错会自动交给总编，可在「问总编」查看诊断。</p>}
+      {run?.status === 'error' && !run.isMock && <p className="mt-2 text-caption text-muted">修订已停在断点，可打开右侧「问总编」手动发起排查与恢复。</p>}
       {error && <Alert tone="danger" className="mt-3" onClose={() => setError(null)}>{error}</Alert>}
 
       {showStart && (
@@ -344,18 +405,76 @@ export default function RevisionPanel({
           )}
           {interrupted && !run.isMock && <Button variant="secondary" icon={<Settings2 size={15} />} disabled={pending !== null} onClick={() => setShowModels(true)}>切换模型</Button>}
           {waiting && <Button variant="primary" onClick={() => setShowAuthorInput(true)}>{run.status === 'waiting_author' ? '确认关键口径' : '补充可靠原文'}</Button>}
-          {(interrupted || reviewable || waiting) && <Button variant="ghost" icon={<Archive size={15} />} disabled={pending !== null} onClick={() => void act('archive')}>结束本轮</Button>}
+          {(interrupted || reviewable || waiting) && (
+            <Button variant="ghost" icon={<Archive size={15} />} disabled={pending !== null}
+              title="仅结束当前修订轮次并保留备份，不会修改当前正文"
+              onClick={() => void act('archive')}>放弃本轮（不写回）</Button>
+          )}
           {hasCandidate && <>
-            <a className="inline-flex items-center gap-1.5 rounded-lg px-2.5 py-2 text-caption font-medium text-primary hover:bg-primary-soft" href={api.revisionExportUrl(job.id, run.id, 'candidate')} download><Download size={14} />候选稿</a>
-            <a className="inline-flex items-center gap-1.5 rounded-lg px-2.5 py-2 text-caption font-medium text-primary hover:bg-primary-soft" href={api.revisionExportUrl(job.id, run.id, 'report')} download><Download size={14} />改稿记录</a>
+            <Button
+              size="sm"
+              variant="secondary"
+              loading={downloadingKey === `${run.id}:candidate`}
+              disabled={downloadingKey !== null && downloadingKey !== `${run.id}:candidate`}
+              icon={<Download className="size-3.5" />}
+              onClick={() => void exportRevisionFile(run.id, 'candidate', '候选稿', `${job.title || 'candidate'}_候选稿.txt`)}
+            >
+              下载候选稿
+            </Button>
+            <Button
+              size="sm"
+              variant="ghost"
+              loading={downloadingKey === `${run.id}:report`}
+              disabled={downloadingKey !== null && downloadingKey !== `${run.id}:report`}
+              icon={<Download className="size-3.5" />}
+              onClick={() => void exportRevisionFile(run.id, 'report', '改稿记录', `${job.title || 'revision'}_改稿记录.md`)}
+            >
+              改稿记录
+            </Button>
           </>}
-          {run.hasLedger && <a className="rounded-lg px-2.5 py-2 text-caption font-medium text-primary hover:bg-primary-soft" href={api.revisionExportUrl(job.id, run.id, 'ledger')} download>锁定台账</a>}
-          {run.hasLedger && run.workflowVersion === 2 && <a className="rounded-lg px-2.5 py-2 text-caption font-medium text-primary hover:bg-primary-soft" href={api.revisionExportUrl(job.id, run.id, 'decisions')} download>评估裁决</a>}
-          {(hasCandidate || run.status === 'archived') && <>
-            <a className="rounded-lg px-2.5 py-2 text-caption text-muted hover:bg-surface-2" href={api.revisionExportUrl(job.id, run.id, 'original')} download>备份原稿</a>
-            <a className="rounded-lg px-2.5 py-2 text-caption text-muted hover:bg-surface-2" href={api.revisionExportUrl(job.id, run.id, 'evaluation')} download>备份评估</a>
-          </>}
-          {run.status === 'ready' && run.changedCount > 0 && !run.isMock && <Button variant="primary" onClick={() => setConfirmApply(true)} disabled={pending !== null}>写回正文</Button>}
+          {archiveFiles.length > 0 && (
+            <div ref={archiveMenuRef} className="relative">
+              <Button
+                size="sm"
+                variant="ghost"
+                aria-expanded={archiveMenuOpen}
+                aria-haspopup="menu"
+                iconRight={<ChevronDown className={cn('size-3.5 transition-transform duration-200 ease-[var(--ease-emphasized)]', archiveMenuOpen && 'rotate-180')} />}
+                onClick={() => setArchiveMenuOpen((v) => !v)}
+              >
+                修订档案
+              </Button>
+              <PopoverSurface
+                open={archiveMenuOpen}
+                origin="top-left"
+                role="menu"
+                className="absolute left-0 top-full z-30 mt-1.5 w-48 overflow-hidden rounded-xl border border-line bg-surface p-1.5 shadow-float"
+              >
+                {archiveFiles.map((item) => (
+                  <button
+                    key={item.artifact}
+                    type="button"
+                    role="menuitem"
+                    disabled={downloadingKey !== null}
+                    onClick={() => void exportRevisionFile(run.id, item.artifact, item.label, item.name)}
+                    className="flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-left text-caption text-body transition-[color,background-color,transform] duration-150 hover:bg-surface-2 hover:text-ink active:scale-[.98] disabled:opacity-50"
+                  >
+                    <Download className="size-3.5 shrink-0 text-muted" />
+                    <span>{item.label}</span>
+                  </button>
+                ))}
+              </PopoverSurface>
+            </div>
+          )}
+          {canApply && (
+            <Button
+              variant={run.status === 'archived' ? 'secondary' : 'primary'}
+              onClick={() => setConfirmApply(true)}
+              disabled={pending !== null}
+            >
+              {run.status === 'archived' ? '恢复并写回正文' : run.status === 'needs_review' ? '仍写回正文' : '写回正文'}
+            </Button>
+          )}
         </div>
       )}
       {(interrupted || running) && !run?.isMock && resumeEditor && resumeVerifier && (
@@ -376,8 +495,10 @@ export default function RevisionPanel({
               {run.candidateHistory?.map(turn => (
                 <li key={turn} className="flex flex-wrap items-center gap-3">
                   <span>第 {turn + 1} 版候选稿</span>
-                  <a className="text-primary hover:underline" href={api.revisionExportUrl(job.id, run.id, 'candidate-' + turn as `candidate-${number}`)} download>正文</a>
-                  <a className="text-primary hover:underline" href={api.revisionExportUrl(job.id, run.id, 'report-' + turn as `report-${number}`)} download>改稿记录</a>
+                  <button type="button" className="text-primary hover:underline disabled:opacity-50" disabled={downloadingKey !== null}
+                    onClick={() => void exportRevisionFile(run.id, `candidate-${turn}`, `第 ${turn + 1} 版候选稿`, `candidate_v${turn + 1}.txt`)}>正文</button>
+                  <button type="button" className="text-primary hover:underline disabled:opacity-50" disabled={downloadingKey !== null}
+                    onClick={() => void exportRevisionFile(run.id, `report-${turn}`, `第 ${turn + 1} 版改稿记录`, `report_v${turn + 1}.md`)}>改稿记录</button>
                 </li>
               ))}
             </ul>
@@ -405,12 +526,18 @@ export default function RevisionPanel({
                   同步更新台账
                 </label>
               )}
-              {amendment && ([['before', '当前口径'], ['after', '新口径'], ['evidence', '依据及影响范围']] as const).map(([field, label]) => (
-                <Field key={field} label={label}>
-                  {(id) => <Textarea id={id} rows={2} maxLength={1200} value={amendment[field]}
-                    onChange={event => setAmendment({ ...amendment, [field]: event.target.value })} />}
-                </Field>
-              ))}
+              <AnimatePresence initial={false}>
+                {amendment && (
+                  <motion.div {...COLLAPSE_MOTION} className="grid gap-2.5 overflow-hidden">
+                    {([['before', '当前口径'], ['after', '新口径'], ['evidence', '依据及影响范围']] as const).map(([field, label]) => (
+                      <Field key={field} label={label}>
+                        {(id) => <Textarea id={id} rows={2} maxLength={1200} value={amendment[field]}
+                          onChange={event => setAmendment({ ...amendment, [field]: event.target.value })} />}
+                      </Field>
+                    ))}
+                  </motion.div>
+                )}
+              </AnimatePresence>
               <Button className="justify-self-start" variant="tonal" loading={pending === 'repair'}
                 disabled={pending !== null || !targetChapters.trim() || !feedback.trim() || Boolean(amendment && Object.values(amendment).some(value => !value.trim()))}
                 onClick={() => void act('repair')}>返修指定章节</Button>
@@ -422,16 +549,21 @@ export default function RevisionPanel({
         onClose={() => setShowAuthorInput(false)} onSubmit={(action, payload) => void act(action, payload)} />}
       {legacy && (
         <div className="mt-4 border-t border-line pt-4">
-          <Disclosure title="v1 历史修订">
+          <Disclosure title="早期修订归档（只读）">
             <div className="flex flex-wrap items-center gap-x-4 gap-y-2 text-caption">
               <Badge tone="neutral">只读</Badge>
               {(legacy.hasCandidate || ['ready', 'needs_review', 'applied'].includes(legacy.status)) && <>
-                <a className="text-primary hover:underline" href={api.revisionExportUrl(job.id, legacy.id, 'candidate')} download>旧候选稿</a>
-                <a className="text-primary hover:underline" href={api.revisionExportUrl(job.id, legacy.id, 'report')} download>旧改稿记录</a>
+                <button type="button" className="text-primary hover:underline disabled:opacity-50" disabled={downloadingKey !== null}
+                  onClick={() => void exportRevisionFile(legacy.id, 'candidate', '早期候选稿', 'legacy_candidate.txt')}>旧候选稿</button>
+                <button type="button" className="text-primary hover:underline disabled:opacity-50" disabled={downloadingKey !== null}
+                  onClick={() => void exportRevisionFile(legacy.id, 'report', '早期改稿记录', 'legacy_report.md')}>旧改稿记录</button>
               </>}
-              {legacy.hasLedger && <a className="text-primary hover:underline" href={api.revisionExportUrl(job.id, legacy.id, 'ledger')} download>旧台账</a>}
-              <a className="text-primary hover:underline" href={api.revisionExportUrl(job.id, legacy.id, 'original')} download>修订前原稿</a>
-              <a className="text-primary hover:underline" href={api.revisionExportUrl(job.id, legacy.id, 'evaluation')} download>修订前评估</a>
+              {legacy.hasLedger && <button type="button" className="text-primary hover:underline disabled:opacity-50" disabled={downloadingKey !== null}
+                onClick={() => void exportRevisionFile(legacy.id, 'ledger', '早期设定清单', 'legacy_ledger.json')}>旧设定清单</button>}
+              <button type="button" className="text-primary hover:underline disabled:opacity-50" disabled={downloadingKey !== null}
+                onClick={() => void exportRevisionFile(legacy.id, 'original', '修订前原稿', 'legacy_original.txt')}>修订前原稿</button>
+              <button type="button" className="text-primary hover:underline disabled:opacity-50" disabled={downloadingKey !== null}
+                onClick={() => void exportRevisionFile(legacy.id, 'evaluation', '修订前评估', 'legacy_evaluation.json')}>修订前评估</button>
             </div>
           </Disclosure>
         </div>
@@ -446,9 +578,21 @@ export default function RevisionPanel({
           </div>
         )}
       </Drawer>
-      <Dialog open={confirmApply} onClose={() => setConfirmApply(false)} title="将候选稿写回正文" description="写回后需要重新评估。原稿与本轮使用的评估可从修订记录区域下载。"
-        footer={<><Button variant="ghost" onClick={() => setConfirmApply(false)}>取消</Button><Button variant="primary" loading={pending === 'apply'} onClick={() => void act('apply')}>确认写回</Button></>}>
+      <Dialog open={confirmApply} onClose={() => setConfirmApply(false)}
+        title={run?.status === 'archived' ? '恢复已归档候选稿并写回正文' : '将候选稿写回正文'}
+        description="写回后需要重新评估。原稿与本轮使用的评估可从修订记录区域下载。"
+        footer={<><Button variant="ghost" onClick={() => setConfirmApply(false)}>取消</Button><Button variant="primary" loading={pending === 'apply'} onClick={() => void act('apply', needsAuthorForce ? { force: true } : undefined)}>确认写回</Button></>}>
         {error && <Alert tone="danger">{error}</Alert>}
+        {run?.status === 'needs_review' && (
+          <Alert tone="warning" className="mb-3" title="本轮尚有待核实提醒">
+            审校仍保留了 {run.blockingCount || run.blockers?.length || 0} 条待核实项（常见于跨章复核提醒）。如果你或总编已确认改后正文符合预期，可直接由你拍板写回正文。
+          </Alert>
+        )}
+        {run?.status === 'archived' && (
+          <Alert tone="warning" className="mb-3" title="恢复此前已结束的修订版">
+            本轮修订此前点击了归档结束，尚未写回正文。确认后将把保存的这版候选稿正式写回当前正文，旧原稿仍会保留备份。
+          </Alert>
+        )}
         <p className="text-body text-muted">本次将更新 {run?.changedCount ?? 0} 章。</p>
         {run?.remainingIssueCounts && run.remainingIssueCounts.P1 + run.remainingIssueCounts.P2 > 0 && (
           <p className="mt-2 text-body text-muted">仍有 {run.remainingIssueCounts.P1} 项 P1 和 {run.remainingIssueCounts.P2} 项 P2，可在改稿记录中核对。</p>

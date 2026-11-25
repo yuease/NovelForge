@@ -1,9 +1,11 @@
 import { useId, useRef, useState } from 'react'
 import type { ChangeEvent, FormEvent } from 'react'
+import { AnimatePresence, motion } from 'motion/react'
 import { FileUp } from 'lucide-react'
 import { api } from '../lib/api'
 import type { ManuscriptImportInput, ManuscriptImportResult, ManuscriptSplitMode } from '../lib/api'
 import { messageOf } from '../lib/format'
+import { COLLAPSE_MOTION } from '../lib/motion'
 import { Alert, Button, Drawer, Field, Input, Select, Textarea } from './ui'
 
 const MAX_REQUEST_BYTES = 5 * 1024 * 1024
@@ -157,12 +159,22 @@ export default function ImportManuscriptDrawer({
             </Select>
           )}
         </Field>
-        {splitMode === 'chunk' && (
-          <Field label="每章目标字数">
-            {(id) => <Input id={id} type="number" min={1} step={1} required value={chunkWords} disabled={busy} onChange={(event) => setChunkWords(event.target.value)} />}
-          </Field>
-        )}
-        {error && <Alert tone="danger" onClose={() => setError(null)}>{error}</Alert>}
+        <AnimatePresence initial={false}>
+          {splitMode === 'chunk' && (
+            <motion.div {...COLLAPSE_MOTION} className="overflow-hidden">
+              <Field label="每章目标字数">
+                {(id) => <Input id={id} type="number" min={1} step={1} required value={chunkWords} disabled={busy} onChange={(event) => setChunkWords(event.target.value)} />}
+              </Field>
+            </motion.div>
+          )}
+        </AnimatePresence>
+        <AnimatePresence initial={false}>
+          {error && (
+            <motion.div {...COLLAPSE_MOTION} className="overflow-hidden">
+              <Alert tone="danger" onClose={() => setError(null)}>{error}</Alert>
+            </motion.div>
+          )}
+        </AnimatePresence>
       </form>
     </Drawer>
   )

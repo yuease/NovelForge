@@ -20,9 +20,11 @@ from .editor_desk import EditorDesk
 from .evaluator import EvaluationError, de_ai_rewrite_chapters, is_book_evaluation_running, recover_interrupted_evaluations, start_book_evaluation
 from .hotspots import generate_concept
 from .llm import LLMError, test_connection
+from .openai_siwc import OpenAISiwc, SiwcError
 from .pipeline import PipelineError, PipelineRuntime, _write
 from .providers import ProviderCatalogError, list_model_catalog, sync_provider_models, update_model_settings
 from .storage import StorageError, Store, claim_data_dir, public_job
+from .siwc_routes import siwc_router
 from .txt_import import parse_txt_manuscript
 from .verifier import recheck_downstream_chapters, verify_chapter
 from .revision_v2 import RevisionWorkflowV2
@@ -100,13 +102,13 @@ def create_app(data_dir: Path | None = None, *, client=None):
     async def lifespan(app: FastAPI):
         with claim_data_dir(directory):
             store = app.state.store = Store(directory)
+            store.openai_siwc = OpenAISiwc(directory, client)
             pipeline = app.state.pipeline = PipelineRuntime(store, client=client)
             worker = app.state.worker = Worker(pipeline)
             async with AsyncSqliteSaver.from_conn_string(str(directory / "workflow.sqlite3")) as saver:
                 worker.graph = build_graph(worker, saver)
                 revisions = app.state.revisions = RevisionWorkflowV2(directory, store, worker, saver)
                 editor_desk = app.state.editor_desk = EditorDesk(store, revisions, worker)
-                revisions.on_failure = editor_desk.schedule_failures
                 candidate_rounds = app.state.candidate_rounds = CandidateRounds(revisions, worker)
                 background = app.state.background = set()
                 app.state.de_ai_jobs = worker.de_ai_jobs
@@ -136,6 +138,7 @@ def create_app(data_dir: Path | None = None, *, client=None):
                     await worker.close()
 
     app = FastAPI(title="Novel Forge", lifespan=lifespan)
+    app.include_router(siwc_router(job_payload))
     app.add_middleware(
         CORSMiddleware,
         allow_origin_regex=_LOCAL_ORIGIN.pattern,
@@ -168,7 +171,7 @@ def create_app(data_dir: Path | None = None, *, client=None):
     async def service_error(_request: Request, exc):
         return JSONResponse({"error": str(exc), "code": exc.code}, status_code=exc.status)
 
-    for error_type in (WorkerError, PipelineError, LLMError, StorageError, EvaluationError, ProviderCatalogError):
+    for error_type in (WorkerError, PipelineError, LLMError, StorageError, EvaluationError, ProviderCatalogError, SiwcError):
         app.add_exception_handler(error_type, service_error)
 
     @app.get("/api/health")
@@ -602,9 +605,7 @@ def create_app(data_dir: Path | None = None, *, client=None):
     async def editor_preferences(job_id: str, request: Request):
         payload = await job_payload(request)
         editor_desk = request.app.state.editor_desk
-        settings = await asyncio.to_thread(editor_desk.preferences, job_id, payload)
-        editor_desk.schedule_failures(job_id)
-        return settings
+        return await asyncio.to_thread(editor_desk.preferences, job_id, payload)
 
     @app.post("/api/jobs/{job_id}/editor-desk/chat")
     async def editor_chat(job_id: str, request: Request):
@@ -619,6 +620,11 @@ def create_app(data_dir: Path | None = None, *, client=None):
     async def editor_dispatch(job_id: str, request: Request):
         payload = await job_payload(request)
         return {"revision": await request.app.state.editor_desk.dispatch(job_id, payload.get("token"))}
+
+    @app.post("/api/jobs/{job_id}/editor-desk/recover", status_code=202)
+    async def editor_recover(job_id: str, request: Request):
+        payload = await job_payload(request)
+        return {"revision": await request.app.state.editor_desk.dispatch_recovery(job_id, payload.get("token"))}
 
     @app.api_route("/api/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"],
                    include_in_schema=False)

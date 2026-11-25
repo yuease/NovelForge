@@ -1,20 +1,20 @@
 import { useEffect, useState } from 'react'
-import { BarChart3, Pause, Play, RefreshCw } from 'lucide-react'
+import { AnimatePresence, motion } from 'motion/react'
+import { BarChart3, Download, Pause, Play, RefreshCw } from 'lucide-react'
 import { api } from '../lib/api'
-import { formatDateTime, messageOf } from '../lib/format'
+import { downloadFile } from '../lib/download'
+import { formatDateTime, messageOf, PRIORITY_META, READINESS_META } from '../lib/format'
+import { COLLAPSE_MOTION, TAB_MOTION } from '../lib/motion'
 import type { BookEvaluationReport, CandidateEvaluationRound, EvaluationRoundSummary, RevisionRun, RevisionSelection } from '../lib/types'
-import { Alert, Badge, Button, Disclosure, Progress, Thinking } from '../components/ui'
+import { Alert, Badge, Button, Disclosure, Progress, Thinking, useToast } from '../components/ui'
 
 const dimensions: Array<[keyof EvaluationRoundSummary['scores'], string]> = [
   ['sellingPointAndOpening', '卖点与开篇'], ['worldSettingAndCausality', '设定与因果'],
   ['characterAndChoices', '人物与选择'], ['plotAndPacing', '主线与节奏'],
   ['foreshadowingAndEnding', '伏笔与结局'], ['styleAndReadability', '文风与阅读'],
 ]
-const levels = [['P0', '严重问题'], ['P1', '建议优先改'], ['P2', '可再打磨']] as const
+const levels = [['P0', PRIORITY_META.P0.label], ['P1', PRIORITY_META.P1.label], ['P2', PRIORITY_META.P2.label]] as const
 const turnLabel = (turn: number) => '第 ' + (turn + 1) + ' 版候选稿'
-const readiness: Record<string, string> = {
-  ready_to_submit: '可准备投稿', revise_recommended: '建议再精修', major_rework: '建议先调整结构',
-}
 
 function RoundComparison({ from, fromLabel, to }: { from?: EvaluationRoundSummary | null; fromLabel: string; to: EvaluationRoundSummary }) {
   const different = from && (from.models?.flash !== to.models?.flash || from.models?.pro !== to.models?.pro || from.mode !== to.mode)
@@ -33,8 +33,9 @@ function RoundComparison({ from, fromLabel, to }: { from?: EvaluationRoundSummar
 }
 
 function RoundReport({ report }: { report: BookEvaluationReport }) {
+  const readyMeta = report.readiness ? READINESS_META[report.readiness] : undefined
   return <div className="grid gap-3">
-    {report.readiness && readiness[report.readiness] && <div><Badge tone="primary">{readiness[report.readiness]}</Badge></div>}
+    {readyMeta && <div><Badge tone={readyMeta.tone}>{readyMeta.label}</Badge></div>}
     {report.overallSummary && <p className="whitespace-pre-wrap text-body text-ink">{report.overallSummary}</p>}
     {Boolean(report.rewritePlan?.length) && <Disclosure title="下一轮可以怎么改">
       <ol className="list-decimal space-y-2 pl-5 text-body text-ink">
@@ -57,6 +58,8 @@ export default function CandidateRoundsPanel({ run, flash, pro, modelReady, revi
   run: RevisionRun; flash: RevisionSelection; pro: RevisionSelection; modelReady: boolean
   revisionBusy: boolean; onContinue: (turn: number) => Promise<void>
 }) {
+  const toast = useToast()
+  const [downloading, setDownloading] = useState(false)
   const [history, setHistory] = useState<CandidateEvaluationRound[]>([])
   const [baseline, setBaseline] = useState<EvaluationRoundSummary | null>(null)
   const [selected, setSelected] = useState<number | null>(null)
@@ -148,22 +151,50 @@ export default function CandidateRoundsPanel({ run, flash, pro, modelReady, revi
           loading={pending === 'restart'} onClick={() => void evaluate('restart')}>从头评估这版</Button>}
       </div>
     </Alert>}
-    {error && <Alert tone="danger" onClose={() => setError(null)}>{error}</Alert>}
+    <AnimatePresence initial={false}>
+      {error && (
+        <motion.div {...COLLAPSE_MOTION} className="overflow-hidden">
+          <Alert tone="danger" onClose={() => setError(null)}>{error}</Alert>
+        </motion.div>
+      )}
+    </AnimatePresence>
     {history.some((item) => item.status === 'completed') && <div className="flex flex-wrap gap-2" aria-label="已完成的候选稿评估">
       {history.filter((item) => item.status === 'completed').map((item) =>
         <Button key={item.turn} variant={item.turn === selected ? 'tonal' : 'ghost'}
           aria-pressed={item.turn === selected} onClick={() => setSelected(item.turn)}>{turnLabel(item.turn)}</Button>)}
     </div>}
-    {selectedRound?.summary && <div className="grid gap-3 rounded-lg border border-line px-4 py-3">
-      <div className="flex flex-wrap items-baseline justify-between gap-2">
-        <p className="text-body font-medium text-ink">{turnLabel(selectedRound.turn)} · 评估结果</p>
-        {selectedRound.summary.evaluatedAt && <span className="text-caption text-muted">{formatDateTime(selectedRound.summary.evaluatedAt)}</span>}
-      </div>
-      <RoundComparison from={previous?.summary ?? baseline} fromLabel={previous ? turnLabel(previous.turn) : '修订前原稿'}
-        to={selectedRound.summary} />
-      {report?.turn === selectedRound.turn && report.report && <RoundReport report={report.report} />}
-      <a className="justify-self-start text-caption text-primary hover:underline"
-        href={api.revisionExportUrl(run.jobId, run.id, `candidate-${selectedRound.turn}`)} download>下载这版候选稿</a>
-    </div>}
+    <AnimatePresence mode="wait" initial={false}>
+      {selectedRound?.summary && (
+        <motion.div key={selectedRound.turn} {...TAB_MOTION} className="grid gap-3 rounded-lg border border-line px-4 py-3">
+          <div className="flex flex-wrap items-baseline justify-between gap-2">
+            <p className="text-body font-medium text-ink">{turnLabel(selectedRound.turn)} · 评估结果</p>
+            {selectedRound.summary.evaluatedAt && <span className="text-caption text-muted">{formatDateTime(selectedRound.summary.evaluatedAt)}</span>}
+          </div>
+          <RoundComparison from={previous?.summary ?? baseline} fromLabel={previous ? turnLabel(previous.turn) : '修订前原稿'}
+            to={selectedRound.summary} />
+          {report?.turn === selectedRound.turn && report.report && <RoundReport report={report.report} />}
+          <Button
+            size="sm"
+            variant="ghost"
+            className="justify-self-start"
+            loading={downloading}
+            icon={<Download className="size-3.5" />}
+            onClick={async () => {
+              setDownloading(true)
+              try {
+                await downloadFile(api.revisionExportUrl(run.jobId, run.id, `candidate-${selectedRound.turn}`), `candidate_v${selectedRound.turn + 1}.txt`)
+                toast(`已下载${turnLabel(selectedRound.turn)}`, 'success')
+              } catch (err) {
+                toast(messageOf(err, '下载候选稿失败'), 'danger')
+              } finally {
+                setDownloading(false)
+              }
+            }}
+          >
+            下载这版候选稿
+          </Button>
+        </motion.div>
+      )}
+    </AnimatePresence>
   </section>
 }

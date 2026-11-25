@@ -719,3 +719,257 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
                 actual = await llm.call_llm(system=case["system"], prompt=case["prompt"], test_scenario=case.get("testScenario"))
                 self.assertEqual(sha256(actual["text"].encode()).hexdigest(), expected["textSha256"])
                 self.assertEqual(actual["usage"], expected["usage"])
+
+    async def test_unexpected_tool_call_retries_cleanly_without_tripping_circuit(self):
+        attempts = {"openai": 0, "gemini": 0}
+
+        def handle(request):
+            if request.url.path.endswith("/chat/completions"):
+                attempts["openai"] += 1
+                if attempts["openai"] == 1:
+                    return httpx.Response(200, json={
+                        "choices": [{
+                            "message": {
+                                "role": "assistant", "content": "partial junk",
+                                "tool_calls": [
+                                    {"id": "bogus_1", "type": "function", "function": {"name": "search", "arguments": "{}"}},
+                                    {"id": "bogus_2", "type": "function", "function": {"name": "read", "arguments": "{}"}},
+                                ],
+                            },
+                            "finish_reason": "unexpected_tool_call",
+                        }],
+                    })
+                return chat("正常回复", usage={
+                    "prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120,
+                    "prompt_tokens_details": {"cached_tokens": 64},
+                    "completion_tokens_details": {"reasoning_tokens": 9},
+                })
+            attempts["gemini"] += 1
+            if attempts["gemini"] == 1:
+                return google("半截垃圾", finish_reason="UNEXPECTED_TOOL_CALL")
+            return httpx.Response(200, json={
+                "candidates": [{"content": {"parts": [{"text": "Gemini 正常回复"}]}, "finishReason": "STOP"}],
+                "usageMetadata": {"promptTokenCount": 80, "candidatesTokenCount": 12,
+                                  "cachedContentTokenCount": 40, "totalTokenCount": 92},
+            })
+
+        client = await self.client(handle)
+        res_oa = await llm.call_llm(provider="openai-compatible", base_url=LOCAL + "/v1", model="gemini-4-hydrogen",
+                                    system="规则", prompt="内容", retries=2, client=client)
+        self.assertEqual(res_oa["text"], "正常回复")
+        self.assertEqual(res_oa["cacheHitTokens"], 64)
+        self.assertEqual(res_oa["usage"]["thoughtsTokens"], 9)
+        self.assertEqual(attempts["openai"], 2)
+
+        res_gem = await llm.call_llm(provider="gemini", base_url=LOCAL, api_key="k", model="gemini-2.5-pro",
+                                     system="规则", prompt="内容", retries=2, client=client)
+        self.assertEqual(res_gem["text"], "Gemini 正常回复")
+        self.assertEqual(res_gem["cacheHitTokens"], 40)
+        self.assertEqual(attempts["gemini"], 2)
+
+    async def test_native_tools_and_multiturn_across_openai_anthropic_gemini(self):
+        tool_spec = [{
+            "name": "search",
+            "description": "Search book.",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+        }]
+        seen = []
+
+        def handle(request):
+            body = json.loads(request.content)
+            seen.append((request.url.path, body))
+            if request.url.path.endswith("/reject/chat/completions"):
+                return httpx.Response(400, text='{"error":{"message":"tools parameter is not supported"}}')
+            if request.url.path.endswith("/chat/completions"):
+                if len(body["messages"]) == 2:
+                    return httpx.Response(200, json={
+                        "choices": [{
+                            "message": {
+                                "role": "assistant", "content": None, "reasoning_content": "先搜关键词",
+                                "tool_calls": [{
+                                    "id": "tc_1", "type": "function",
+                                    "function": {"name": "search", "arguments": '{"query":"银钥匙"}'},
+                                    "extra_content": {"google": {"thought_signature": "sig-xyz"}},
+                                }],
+                            },
+                            "finish_reason": "tool_calls",
+                        }],
+                        "usage": {"prompt_tokens": 50, "completion_tokens": 10, "total_tokens": 60},
+                    })
+                return chat("找到了银钥匙。")
+            if request.url.path.endswith("/messages"):
+                if len(body["messages"]) == 1:
+                    return httpx.Response(200, json={
+                        "content": [
+                            {"type": "thinking", "thinking": "check", "signature": "anth-sig"},
+                            {"type": "tool_use", "id": "tu_1", "name": "search", "input": {"query": "银钥匙"}},
+                        ],
+                        "stop_reason": "tool_use",
+                        "usage": {"input_tokens": 40, "output_tokens": 12, "cache_read_input_tokens": 20},
+                    })
+                return httpx.Response(200, json={
+                    "content": [{"type": "text", "text": "Claude 找到银钥匙。"}],
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 60, "output_tokens": 10, "cache_read_input_tokens": 35},
+                })
+            if len(body["contents"]) == 1:
+                return httpx.Response(200, json={
+                    "candidates": [{"content": {"parts": [
+                        {"text": "先查一下", "thought": True, "thoughtSignature": "gem-sig"},
+                        {"functionCall": {"name": "search", "args": {"query": "银钥匙"}}},
+                    ]}, "finishReason": "STOP"}],
+                    "usageMetadata": {"promptTokenCount": 30, "candidatesTokenCount": 8, "totalTokenCount": 38},
+                })
+            return google("Gemini 找到银钥匙。")
+
+        client = await self.client(handle)
+
+        # 1. OpenAI-compatible multi-turn + thought_signature / reasoning_content replay
+        msgs = [{"role": "user", "content": "查银钥匙"}]
+        r1 = await llm.call_llm(provider="openai-compatible", base_url=LOCAL + "/v1", model="proxy-model",
+                                system="总编", messages=msgs, tools=tool_spec, client=client)
+        self.assertEqual(r1["toolCalls"][0]["name"], "search")
+        msgs.append(r1["assistantMessage"])
+        msgs.append({"role": "tool", "toolCallId": "tc_1", "name": "search", "content": '{"hits":1}'})
+        r2 = await llm.call_llm(provider="openai-compatible", base_url=LOCAL + "/v1", model="proxy-model",
+                                system="总编", messages=msgs, tools=tool_spec, client=client)
+        self.assertEqual(r2["text"], "找到了银钥匙。")
+        replayed_assistant = seen[1][1]["messages"][2]
+        self.assertEqual(replayed_assistant["reasoning_content"], "先搜关键词")
+        self.assertEqual(replayed_assistant["tool_calls"][0]["extra_content"]["google"]["thought_signature"], "sig-xyz")
+
+        # 2. Anthropic multi-turn + tool_result grouping + cache_read_input_tokens
+        amsgs = [{"role": "user", "content": "查银钥匙"}]
+        a1 = await llm.call_llm(provider="anthropic", base_url=LOCAL, api_key="k", model="claude-sonnet-4-6",
+                                system="总编", messages=amsgs, tools=tool_spec, client=client)
+        self.assertEqual(a1["cacheHitTokens"], 20)
+        self.assertEqual(a1["toolCalls"][0]["id"], "tu_1")
+        amsgs.append(a1["assistantMessage"])
+        amsgs.append({"role": "tool", "toolCallId": "tu_1", "name": "search", "content": '{"hits":1}'})
+        a2 = await llm.call_llm(provider="anthropic", base_url=LOCAL, api_key="k", model="claude-sonnet-4-6",
+                                system="总编", messages=amsgs, tools=tool_spec, client=client)
+        self.assertEqual(a2["text"], "Claude 找到银钥匙。")
+        self.assertEqual(a2["cacheHitTokens"], 35)
+        self.assertEqual(seen[3][1]["messages"][1]["content"][0]["signature"], "anth-sig")
+        self.assertEqual(seen[3][1]["messages"][2]["content"][0]["type"], "tool_result")
+
+        # 3. Gemini native tools strip additionalProperties & preserve thoughtSignature
+        gmsgs = [{"role": "user", "content": "查银钥匙"}]
+        g1 = await llm.call_llm(provider="gemini", base_url=LOCAL, api_key="k", model="gemini-2.5-pro",
+                                system="总编", messages=gmsgs, tools=tool_spec, client=client)
+        decl = seen[4][1]["tools"][0]["functionDeclarations"][0]
+        self.assertNotIn("additionalProperties", decl["parameters"])
+        self.assertEqual(g1["toolCalls"][0]["name"], "search")
+        gmsgs.append(g1["assistantMessage"])
+        gmsgs.append({"role": "tool", "toolCallId": g1["toolCalls"][0]["id"], "name": "search", "content": '{"hits":1}'})
+        g2 = await llm.call_llm(provider="gemini", base_url=LOCAL, api_key="k", model="gemini-2.5-pro",
+                                system="总编", messages=gmsgs, tools=tool_spec, client=client)
+        self.assertEqual(g2["text"], "Gemini 找到银钥匙。")
+        self.assertEqual(seen[5][1]["contents"][1]["parts"][0]["thoughtSignature"], "gem-sig")
+
+        # 4. Unsupported tools HTTP 400 raises TOOLS_UNSUPPORTED cleanly
+        with self.assertRaises(llm.LLMError) as caught:
+            await llm.call_llm(provider="openai-compatible", base_url=LOCAL + "/reject", model="legacy",
+                               messages=[{"role": "user", "content": "hi"}], tools=tool_spec, retries=2, client=client)
+        self.assertEqual(caught.exception.code, "TOOLS_UNSUPPORTED")
+
+    async def test_content_filter_blocks_fail_fast_without_tripping_circuit(self):
+        attempts = {"proxy": 0, "openai_200": 0, "gemini_200": 0}
+
+        def handle(request):
+            if request.url.path.endswith("/proxy/chat/completions"):
+                attempts["proxy"] += 1
+                if attempts["proxy"] <= 4:
+                    return httpx.Response(502, json={
+                        "error": {
+                            "message": (
+                                "AI Studio 因内容策略结束生成: OTHER: This request was blocked by Gemini's filters. "
+                                "They can occasionally trigger by mistake on safe coding, security, or biology-related queries."
+                            ),
+                        },
+                    })
+                return chat("正常恢复")
+            if request.url.path.endswith("/oa200/chat/completions"):
+                attempts["openai_200"] += 1
+                return httpx.Response(200, json={
+                    "choices": [{"message": {"role": "assistant", "content": ""}, "finish_reason": "content_filter"}],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 0, "total_tokens": 10},
+                })
+            attempts["gemini_200"] += 1
+            return httpx.Response(200, json={
+                "promptFeedback": {"blockReason": "PROHIBITED_CONTENT"},
+                "candidates": [],
+                "usageMetadata": {"promptTokenCount": 10, "totalTokenCount": 10},
+            })
+
+        client = await self.client(handle)
+        with patch.dict(os.environ, {"NOVEL_FORGE_PROVIDER_CIRCUIT": "1"}):
+            # 4 consecutive 502 content blocks must never retry and must never open the circuit
+            for _ in range(4):
+                with self.assertRaises(llm.LLMError) as caught:
+                    await llm.call_llm(provider="openai-compatible", base_url=LOCAL + "/proxy", model="gemini-4-argon",
+                                       system="规则", prompt="内容", retries=3, client=client)
+                self.assertEqual(caught.exception.code, "CONTENT_BLOCKED")
+                self.assertFalse(caught.exception.retryable)
+                self.assertIsNone(caught.exception.circuit_retry_at)
+            self.assertEqual(attempts["proxy"], 4)
+
+            # Subsequent normal request succeeds immediately (circuit stayed closed)
+            ok = await llm.call_llm(provider="openai-compatible", base_url=LOCAL + "/proxy", model="gemini-4-argon",
+                                    system="规则", prompt="正常内容", retries=1, client=client)
+            self.assertEqual(ok["text"], "正常恢复")
+            self.assertEqual(attempts["proxy"], 5)
+
+            # HTTP 200 finish_reason=content_filter fails fast as CONTENT_BLOCKED
+            with self.assertRaises(llm.LLMError) as caught_oa:
+                await llm.call_llm(provider="openai-compatible", base_url=LOCAL + "/oa200", model="m",
+                                   system="规则", prompt="内容", retries=2, client=client)
+            self.assertEqual(caught_oa.exception.code, "CONTENT_BLOCKED")
+            self.assertFalse(caught_oa.exception.retryable)
+            self.assertEqual(attempts["openai_200"], 1)
+
+            # Gemini promptFeedback.blockReason fails fast as CONTENT_BLOCKED
+            with self.assertRaises(llm.LLMError) as caught_gem:
+                await llm.call_llm(provider="gemini", base_url=LOCAL, api_key="k", model="gemini-2.5-pro",
+                                   system="规则", prompt="内容", retries=2, client=client)
+            self.assertEqual(caught_gem.exception.code, "CONTENT_BLOCKED")
+            self.assertFalse(caught_gem.exception.retryable)
+            self.assertEqual(attempts["gemini_200"], 1)
+
+    async def test_long_cooldown_429_classified_as_quota_exceeded(self):
+        calls = 0
+
+        def handle(request):
+            nonlocal calls
+            calls += 1
+            if request.url.path.endswith("/long/chat/completions"):
+                return httpx.Response(429, json={
+                    "error": {
+                        "message": (
+                            "You've reached your usage limit for this model (resets in 15 hours, 3 minutes). "
+                            "Please try again in 54179s."
+                        ),
+                    },
+                })
+            return httpx.Response(429, json={
+                "error": {"message": "Rate limit reached (RPM). Please try again in 20s."},
+            })
+
+        client = await self.client(handle)
+        with self.assertRaises(llm.LLMError) as long_err:
+            await llm.call_llm(provider="openai-compatible", base_url=LOCAL + "/long", model="gemini-4-argon",
+                               system="规则", prompt="内容", retries=3, client=client)
+        self.assertEqual(long_err.exception.code, "QUOTA_EXCEEDED")
+        self.assertFalse(long_err.exception.retryable)
+        self.assertEqual(calls, 1)
+
+        with self.assertRaises(llm.LLMError) as short_err:
+            await llm.call_llm(provider="openai-compatible", base_url=LOCAL + "/short", model="gemini-4-argon",
+                               system="规则", prompt="内容", retries=0, client=client)
+        self.assertEqual(short_err.exception.code, "HTTP_429")
+        self.assertTrue(short_err.exception.retryable)

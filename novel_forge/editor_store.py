@@ -108,3 +108,10 @@ class EditorStore:
                 WHERE job_id = ? AND request_id = ? AND json_type(answer, '$.plan') = 'object'
                 """, (job_id, request_id))
 
+    def mark_recovery_dispatched(self, job_id, request_id):
+        with closing(self.connect()) as db, db:
+            db.execute("""
+                UPDATE editor_turns SET answer = json_set(answer, '$.recoveryPlan.dispatched', json('true'))
+                WHERE job_id = ? AND request_id = ? AND json_type(answer, '$.recoveryPlan') = 'object'
+                """, (job_id, request_id))
+

@@ -6,7 +6,9 @@ import {
   Lock, MapPin, Package, ShieldAlert, ShieldCheck, Sparkles, Tag as TagIcon, Users, Wrench,
 } from 'lucide-react'
 import { cn } from '../lib/cn'
+import { FORESHADOW_STATUS_LABEL, issueTypeLabel } from '../lib/format'
 import type { Tone } from '../lib/format'
+import { EASE_OUT, TAB_MOTION, boundedDelay } from '../lib/motion'
 import { navigate } from '../lib/router'
 import type {
   ArcPlan,
@@ -63,9 +65,9 @@ const SEVERITY_LABEL: Record<string, string> = {
 function FastItem({ index, children }: { index: number; children: ReactNode }) {
   return (
     <motion.div
-      initial={{ opacity: 0, y: 8 }}
+      initial={{ opacity: 0, y: 7 }}
       animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.24, delay: Math.min(index * 0.022, 0.32), ease: [0.2, 0, 0, 1] }}
+      transition={{ duration: 0.22, delay: boundedDelay(index), ease: EASE_OUT }}
     >
       {children}
     </motion.div>
@@ -229,7 +231,7 @@ export default function FactsPage() {
       <PageHeader
         eyebrow={title ? `《${title}》` : undefined}
         title="跨章事实"
-        description="锁定核心口径、随章追踪时钟余额与人物认知；越权知情、数值冲突或伤势矛盾会触发自动修复。"
+        description="锁定全书硬设定、剧情时钟与人物认知；越权知情、数值冲突或伤势矛盾会自动触发修复。"
       />
 
       <div className={cn('mb-6 grid grid-cols-2 gap-3', hasLedgerSection ? 'md:grid-cols-3 lg:grid-cols-5' : 'md:grid-cols-4')}>
@@ -249,8 +251,8 @@ export default function FactsPage() {
 
       <Segmented size="sm" value={tab} onChange={setSelectedTab} options={tabs} className="mb-5" ariaLabel="事实分类" />
 
-      <AnimatePresence mode="wait">
-        <motion.div key={tab} initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -8 }} transition={{ duration: 0.2 }}>
+      <AnimatePresence mode="wait" initial={false}>
+        <motion.div key={tab} {...TAB_MOTION}>
           <Card padding="lg">
             {tab === 'ledger' && (
               hasLedgerSection ? (
@@ -436,9 +438,9 @@ export default function FactsPage() {
                   {[...timeline, ...locations].map(({ key, entry }, i) => (
                     <motion.li
                       key={`${key}-${i}`}
-                      initial={{ opacity: 0, x: -10 }}
+                      initial={{ opacity: 0, x: -8 }}
                       animate={{ opacity: 1, x: 0 }}
-                      transition={{ delay: Math.min(i * 0.04, 0.6), duration: 0.3 }}
+                      transition={{ delay: boundedDelay(i, 0.02, 0.18), duration: 0.22, ease: EASE_OUT }}
                       className="relative pb-6 pl-6 last:pb-0"
                     >
                       <span className={cn('absolute -left-[7px] top-1.5 size-3 rounded-full ring-4 ring-surface', i < timeline.length ? 'bg-g-blue' : 'bg-g-green')} />
@@ -460,11 +462,11 @@ export default function FactsPage() {
 
             {tab === 'foreshadowing' && (
               foreshadowing.length ? (
-                <Stagger className="grid gap-3">
-                  {foreshadowing.map(({ key, entry }) => {
+                <div className="grid gap-3">
+                  {foreshadowing.map(({ key, entry }, idx) => {
                     const paid = entry.status === 'paid_off'
                     return (
-                      <StaggerItem key={key}>
+                      <StaggerItem key={key} index={idx}>
                         <div className="flex gap-4 rounded-md bg-surface-2 p-4">
                           <span className={cn('mt-0.5 grid size-8 shrink-0 place-items-center rounded-full', paid ? 'bg-success-soft text-success' : 'bg-primary-soft text-primary')}>
                             <Sparkles className="size-4" />
@@ -473,7 +475,13 @@ export default function FactsPage() {
                             <div className="flex flex-wrap items-start justify-between gap-2">
                               <div className="text-body font-medium text-ink">{text(entry.clue || entry.name || key)}</div>
                               <div className="flex items-center gap-2">
-                                {entry.status && <Badge tone={paid ? 'success' : 'warning'}>{paid ? `已回收 · 第 ${text(entry.payoffChapter) || '?'} 章` : text(entry.status)}</Badge>}
+                                {entry.status && (
+                                  <Badge tone={paid ? 'success' : 'warning'}>
+                                    {paid
+                                      ? `已回收 · 第 ${text(entry.payoffChapter) || '?'} 章`
+                                      : FORESHADOW_STATUS_LABEL[text(entry.status).toLowerCase()] ?? text(entry.status)}
+                                  </Badge>
+                                )}
                                 <Citation entry={entry} />
                               </div>
                             </div>
@@ -483,7 +491,7 @@ export default function FactsPage() {
                       </StaggerItem>
                     )
                   })}
-                </Stagger>
+                </div>
               ) : <Empty>暂无长线伏笔记录</Empty>
             )}
 
@@ -540,12 +548,12 @@ function LedgerAndArcsView({
         <motion.section
           initial={{ opacity: 0, y: 6 }}
           animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.25 }}
+          transition={{ duration: 0.22, ease: EASE_OUT }}
         >
           <SectionLabel
             actions={<Badge tone="primary" icon={<Lock />}>不可变硬基准</Badge>}
           >
-            核心口径锁
+            全书硬设定
           </SectionLabel>
           <div className="rounded-md border border-primary/15 bg-[image:var(--nf-gradient-soft)] p-5">
             <div className="grid gap-4 md:grid-cols-2">
@@ -674,10 +682,10 @@ function LedgerAndArcsView({
       {arcRecords.length > 0 && (
         <section>
           <SectionLabel actions={<span className="text-caption tabular-nums text-muted">共 {arcRecords.length} 个剧情单元</span>}>
-            滚动单元与归档快检
+            剧情单元记录
           </SectionLabel>
-          <Stagger className="grid gap-4">
-            {arcRecords.map(({ index, plan, summary }) => {
+          <div className="grid gap-4">
+            {arcRecords.map(({ index, plan, summary }, idx) => {
               const start = plan?.startChapter ?? summary?.startChapter ?? 1
               const end = plan?.endChapter ?? summary?.endChapter ?? start
               const driftChecks = summary?.driftChecks ?? []
@@ -687,7 +695,7 @@ function LedgerAndArcsView({
               const needsReview = summary?.needsReviewChapters ?? []
 
               return (
-                <StaggerItem key={index}>
+                <StaggerItem key={index} index={idx}>
                   <div className="rounded-md bg-surface-2 p-5 transition-colors hover:bg-surface-3/70">
                     <div className="flex flex-wrap items-start justify-between gap-2">
                       <div className="min-w-0">
@@ -800,7 +808,7 @@ function LedgerAndArcsView({
                       <div className="mt-4 rounded-md border border-warning/30 bg-warning-soft/75 p-3.5">
                         <div className="mb-2 flex items-center gap-1.5 text-caption font-medium text-warning">
                           <AlertTriangle className="size-3.5" />
-                          单元一致性快检（已注入下一单元滚纲）
+                          单元自检提醒（已自动带入下一单元规划）
                         </div>
                         <ul className="grid gap-2">
                           {driftChecks.map((dc, i) => (
@@ -822,7 +830,7 @@ function LedgerAndArcsView({
                 </StaggerItem>
               )
             })}
-          </Stagger>
+          </div>
         </section>
       )}
 
@@ -832,9 +840,9 @@ function LedgerAndArcsView({
           <SectionLabel actions={<span className="text-caption tabular-nums text-muted">共 {volumeSummaries.length} 卷</span>}>
             卷摘要归档
           </SectionLabel>
-          <Stagger className="grid gap-3">
+          <div className="grid gap-3">
             {volumeSummaries.map((vol, idx) => (
-              <StaggerItem key={vol.volume ?? idx}>
+              <StaggerItem key={vol.volume ?? idx} index={idx}>
                 <div className="rounded-md bg-surface-2 p-4">
                   <div className="flex flex-wrap items-center gap-2">
                     <span className="text-body font-medium text-ink">第 {vol.volume ?? idx + 1} 卷</span>
@@ -857,7 +865,7 @@ function LedgerAndArcsView({
                 </div>
               </StaggerItem>
             ))}
-          </Stagger>
+          </div>
         </section>
       )}
     </div>
@@ -866,11 +874,11 @@ function LedgerAndArcsView({
 
 function RepairList({ logs }: { logs: RepairLogEntry[] }) {
   return (
-    <Stagger className="grid gap-3">
+    <div className="grid gap-3">
       {logs.map((log, idx) => {
         const ts = log.ts || log.timestamp
         return (
-          <StaggerItem key={log.id ?? idx}>
+          <StaggerItem key={log.id ?? idx} index={idx}>
             <div className="rounded-md bg-surface-2 p-4">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <div className="flex flex-wrap items-center gap-2">
@@ -890,7 +898,7 @@ function RepairList({ logs }: { logs: RepairLogEntry[] }) {
                     ) : iss && typeof iss === 'object' ? (
                       <li key={i} className="flex items-start gap-2 rounded-sm bg-surface px-3 py-2 text-caption">
                         <Badge tone={iss.severity === 'warning' ? 'warning' : 'danger'} className="shrink-0">
-                          {text(iss.type || 'issue')}{iss.sourceChapter ? ` · 第${iss.sourceChapter}章` : ''}
+                          {issueTypeLabel(text(iss.type || 'issue'))}{iss.sourceChapter ? ` · 第${iss.sourceChapter}章` : ''}
                         </Badge>
                         <span className="pt-0.5 text-body">{text(iss.message || iss)}</span>
                       </li>
@@ -902,7 +910,7 @@ function RepairList({ logs }: { logs: RepairLogEntry[] }) {
           </StaggerItem>
         )
       })}
-    </Stagger>
+    </div>
   )
 }
 

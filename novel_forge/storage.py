@@ -16,6 +16,7 @@ from tempfile import NamedTemporaryFile
 
 from .arc_planning import legacy_outline_placeholder, prior_arc_summaries, saved_arc_plans
 from .long_memory import empty_long_memory, normalize_arc_summary, normalize_memory_delta, normalize_volume_summary, replay_long_memory
+from .openai_siwc import PROVIDER as SIWC, RESOURCE as SIWC_RESOURCE
 from .providers import (
     PROVIDERS, ProviderCatalogError, get_provider_definition, is_masked_api_key, mask_api_key,
     normalize_model_ids, provider_requires_key, same_endpoint_origin,
@@ -355,11 +356,23 @@ class Store:
                 "configs": {provider: _provider_config(saved, provider) for provider in PROVIDERS}}
 
     def get_public_provider_config(self, provider=None):
+        if provider == SIWC:
+            return self._public_siwc_config()
         return _public_provider(self.get_provider_config(provider))
+
+    def _public_siwc_config(self):
+        service = getattr(self, "openai_siwc", None)
+        status = service.catalog() if service else {}
+        return {"provider": SIWC, "baseUrl": SIWC_RESOURCE, "model": status.get("selectedModel", ""),
+                "hasKey": False, "maskedKey": "", "thinkingMode": "disabled",
+                "configured": status.get("configured", False), "oauthState": status.get("state", "disabled")}
 
     def get_all_public_provider_configs(self):
         saved = self._read_config()
-        providers = {key: _public_provider(_provider_config(saved, key)) for key in PROVIDERS if key != "mock"}
+        providers = {key: _public_provider(_provider_config(saved, key)) for key in PROVIDERS if key not in ("mock", SIWC)}
+        service = getattr(self, "openai_siwc", None)
+        if service and service.status()["enabled"]:
+            providers[SIWC] = self._public_siwc_config()
         return {"activeProvider": saved.get("activeProvider") or ("deepseek" if providers["deepseek"]["hasKey"] else "mock"),
                 "map": providers}
 
@@ -368,6 +381,8 @@ class Store:
         with self._config_lock:
             store = self._read_config()
             provider = str(patch.get("provider") or store.get("activeProvider") or "deepseek").lower()
+            if provider == SIWC:
+                raise ProviderCatalogError("ChatGPT 连接只能通过登录管理。", 400, "SIWC_OAUTH_ONLY")
             providers = _dict(store.get("providers"))
             if provider == "mock":
                 updated = {**store, "activeProvider": "mock", "providers": providers}

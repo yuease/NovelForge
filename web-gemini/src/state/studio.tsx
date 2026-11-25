@@ -1,6 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { api } from '../lib/api'
+import { jobStatusMeta } from '../lib/format'
 import { navigate } from '../lib/router'
 import type {
   CanonicalFacts,
@@ -110,11 +111,11 @@ const STAGE_LABELS: Record<string, string> = {
 function formatSseMessage(type: string, data: Record<string, unknown>): string {
   if (type === 'snapshot' && data.job && typeof data.job === 'object') {
     const j = data.job as JobRecord
-    return `已同步任务快照：${j.title || j.id}（${j.status}）`
+    return `已同步最新进度：${j.title || j.id}（${jobStatusMeta(j.status).label}）`
   }
   if (type === 'job:log' && data.log && typeof data.log === 'object') {
     const l = data.log as { message?: string; stage?: string }
-    return l.message || `[${l.stage || 'log'}] 事件`
+    return l.message || `${STAGE_LABELS[l.stage || ''] || '工作台'}进度更新`
   }
   if (type === 'chapter:started') return `开始创作第 ${data.chapterNumber}/${data.totalChapters} 章：${data.title || ''}`
   if (type === 'chapter:completed') {

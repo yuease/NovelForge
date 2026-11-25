@@ -51,7 +51,7 @@ _TRANSIENT_ERRORS = {
     "ECONNRESET", "ETIMEDOUT", "UND_ERR_CONNECT_TIMEOUT",
 }
 _MANUAL_RESUME = {"QUOTA_EXCEEDED", "CIRCUIT_OPEN", "OUTPUT_TRUNCATED", "OPENAI_RATE_LIMIT", "OUTLINE_PARSE_FAILED",
-                  "ARC_SUMMARY_INVALID", "ARC_SOURCE_CHANGED"}
+                  "ARC_SUMMARY_INVALID", "ARC_SOURCE_CHANGED", "CONTENT_BLOCKED"}
 _COMEDY = re.compile(r"吐槽|搞笑|反差|打脸|震惊|直播|吃瓜|反转|嘴替|荒诞|尴尬|发疯")
 _PLACEHOLDERS = re.compile(r"【待补充|\[TODO\]|TBD|placeholder", re.I)
 _MARKDOWN_HEADING = re.compile(r"^#{1,6}\s*")
@@ -547,7 +547,11 @@ class PipelineRuntime:
         if max_tokens is not None:
             options["max_tokens"] = max_tokens
         started = time.monotonic()
-        reply = await call_llm(**options, **prompt, temperature=temperature, store=self.store, client=self.client)
+        reply = await call_llm(
+            **options, **prompt, temperature=temperature,
+            cache_key=f"nf-write-{job_id}-{stage}"[:64],
+            store=self.store, client=self.client,
+        )
         await self._record_usage(job_id, stage, reply.get("usage"), reply.get("durationMs") or _elapsed(started),
                                  retries, config.get("model") or config.get("provider"))
         return reply
@@ -826,6 +830,7 @@ class PipelineRuntime:
                                                start=start, total=total, recent_titles=titles)
             except ValueError as issue:
                 error = str(issue)
+                await self._log(job_id, "warn", "chapter_outlines", f"第 {start} 章单元章纲第 {attempt + 1} 次校验未通过：{error}")
                 continue
             next_outline = arc["endChapter"] + 1
             saved = await _write(self.store.save_arc_plan, job_id, arc, batch, total=total, expected_context=source,

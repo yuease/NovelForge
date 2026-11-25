@@ -144,14 +144,25 @@ class RevisionArchiveTest(unittest.TestCase):
         def provider(request):
             self.assertEqual(request.headers["Authorization"], "Bearer fixture-editor-key")
             payload = json.loads(request.content)
-            context = json.loads(payload["messages"][-1]["content"])
-            requests.append(context)
-            if not context["evidence"]:
-                answer = {"tools": [{"kind": "read", "version": "current", "chapter": 1}]}
-            else:
-                self.assertIn("当年丢失的书信终于送到", json.dumps(context["evidence"], ensure_ascii=False))
-                answer = {"reply": "第 1 章交代了书信送达。", "citations": [context["evidence"][0]["id"]]}
-            return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(answer)}, "finish_reason": "stop"}]})
+            self.assertTrue(payload.get("tools"))
+            requests.append(payload)
+            tool_msgs = [m for m in payload["messages"] if m.get("role") == "tool"]
+            if not tool_msgs:
+                return httpx.Response(200, json={"choices": [{
+                    "message": {
+                        "role": "assistant", "content": None,
+                        "tool_calls": [{
+                            "id": "call_read_1", "type": "function",
+                            "function": {"name": "read", "arguments": json.dumps({"version": "current", "chapter": 1})},
+                        }],
+                    },
+                    "finish_reason": "tool_calls",
+                }]})
+            self.assertIn("当年丢失的书信终于送到", tool_msgs[0]["content"])
+            return httpx.Response(200, json={"choices": [{
+                "message": {"role": "assistant", "content": "第 1 章交代了书信送达。（E1）"},
+                "finish_reason": "stop",
+            }]})
 
         with TemporaryDirectory(ignore_cleanup_errors=os.name == "nt") as temp, patch.dict(os.environ, {
             "NOVEL_FORGE_AUTO_RECOVER": "0", "NOVEL_FORGE_BACKGROUND_FEEDS": "0",

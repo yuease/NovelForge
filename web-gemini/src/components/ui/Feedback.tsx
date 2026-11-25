@@ -1,10 +1,11 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useId, useRef } from 'react'
 import type { ReactNode } from 'react'
 import { AlertCircle, AlertTriangle, CheckCircle2, Info, X } from 'lucide-react'
-import { animate, motion, useInView, useMotionValue, useTransform } from 'motion/react'
+import { AnimatePresence, animate, motion, useInView, useMotionValue, useReducedMotion, useTransform } from 'motion/react'
 import { cn } from '../../lib/cn'
 import type { Tone } from '../../lib/format'
 import { jobStatusMeta } from '../../lib/format'
+import { DURATION, EASE_EXIT, EASE_OUT, ERROR_SHAKE_ANIMATE, SPRING_TACTILE } from '../../lib/motion'
 import { GeminiStar } from '../brand/GeminiStar'
 
 /* ---------------- Badge ---------------- */
@@ -28,11 +29,11 @@ export function Badge({
   tone = 'neutral', children, dot, live, icon, className,
 }: { tone?: Tone; children: ReactNode; dot?: boolean; live?: boolean; icon?: ReactNode; className?: string }) {
   return (
-    <span className={cn('inline-flex h-6 shrink-0 items-center gap-1.5 rounded-full px-2.5 text-caption font-medium [&_svg]:size-3.5', toneClass[tone], className)}>
+    <span className={cn('inline-flex h-6 shrink-0 items-center gap-1.5 rounded-full px-2.5 text-caption font-medium transition-colors duration-[180ms] ease-[var(--ease-standard)] [&_svg]:size-3.5', toneClass[tone], className)}>
       {(dot || live) && (
         <span className="relative flex size-2">
-          {live && <span className={cn('absolute inline-flex size-full animate-ping rounded-full opacity-60', dotClass[tone])} />}
-          <span className={cn('relative inline-flex size-2 rounded-full', dotClass[tone])} />
+          {live && <span className={cn('absolute inline-flex size-full animate-ping rounded-full opacity-55', dotClass[tone])} />}
+          <span className={cn('relative inline-flex size-2 rounded-full transition-colors duration-[180ms]', dotClass[tone])} />
         </span>
       )}
       {icon}
@@ -43,11 +44,26 @@ export function Badge({
 
 export function StatusBadge({ status, className }: { status?: string; className?: string }) {
   const meta = jobStatusMeta(status)
-  return <Badge tone={meta.tone} dot live={meta.live} className={className}>{meta.label}</Badge>
+  return (
+    <Badge tone={meta.tone} dot live={meta.live} className={className}>
+      <AnimatePresence mode="wait" initial={false}>
+        <motion.span
+          key={meta.label}
+          initial={{ opacity: 0, y: 3 }}
+          animate={{ opacity: 1, y: 0 }}
+          exit={{ opacity: 0, y: -3 }}
+          transition={{ duration: 0.14, ease: EASE_OUT }}
+          className="inline-block"
+        >
+          {meta.label}
+        </motion.span>
+      </AnimatePresence>
+    </Badge>
+  )
 }
 
 export function Tag({ children, className }: { children: ReactNode; className?: string }) {
-  return <span className={cn('inline-flex h-6 items-center rounded-sm bg-surface-2 px-2 text-caption text-body', className)}>{children}</span>
+  return <span className={cn('inline-flex h-6 items-center rounded-sm bg-surface-2 px-2 text-caption text-body transition-colors duration-[160ms]', className)}>{children}</span>
 }
 
 /* ---------------- Progress ---------------- */
@@ -55,21 +71,21 @@ export function Tag({ children, className }: { children: ReactNode; className?: 
 export function Progress({
   value, max = 100, tone = 'gradient', size = 'md', animated, className, label,
 }: { value: number; max?: number; tone?: 'gradient' | Tone; size?: 'sm' | 'md' | 'lg'; animated?: boolean; className?: string; label?: string }) {
-  const pct = Math.max(0, Math.min(100, (value / (max || 1)) * 100))
+  const ratio = Math.max(0, Math.min(1, value / (max || 1)))
   return (
     <div
       role="progressbar"
-      aria-valuenow={Math.round(pct)}
+      aria-valuenow={Math.round(ratio * 100)}
       aria-valuemin={0}
       aria-valuemax={100}
       aria-label={label}
       className={cn('w-full overflow-hidden rounded-full bg-surface-3', size === 'sm' ? 'h-1' : size === 'lg' ? 'h-2.5' : 'h-1.5', className)}
     >
       <motion.div
-        className={cn('h-full rounded-full', tone === 'gradient' ? cn('nf-gradient-bg', animated && 'is-animated') : dotClass[tone])}
-        initial={{ width: 0 }}
-        animate={{ width: `${pct}%` }}
-        transition={{ duration: 0.8, ease: [0.2, 0, 0, 1] }}
+        className={cn('h-full w-full origin-left rounded-full will-change-transform', tone === 'gradient' ? cn('nf-gradient-bg', animated && 'is-animated') : dotClass[tone])}
+        initial={{ scaleX: 0 }}
+        animate={{ scaleX: ratio }}
+        transition={{ duration: DURATION.data, ease: EASE_OUT }}
       />
     </div>
   )
@@ -77,10 +93,17 @@ export function Progress({
 
 /** Circular progress ring with gradient stroke. */
 export function ProgressRing({ value, size = 64, stroke = 6, children }: { value: number; size?: number; stroke?: number; children?: ReactNode }) {
+  const reduced = useReducedMotion()
+  const drawn = useRef(false)
   const r = (size - stroke) / 2
   const c = 2 * Math.PI * r
   const pct = Math.max(0, Math.min(100, value))
-  const gid = `ring-${size}-${stroke}`
+  const gid = `ring-${useId().replace(/:/g, '')}`
+
+  useEffect(() => {
+    drawn.current = true
+  }, [])
+
   return (
     <div className="relative inline-grid place-items-center" style={{ width: size, height: size }}>
       <svg width={size} height={size} className="-rotate-90">
@@ -101,9 +124,9 @@ export function ProgressRing({ value, size = 64, stroke = 6, children }: { value
           strokeWidth={stroke}
           strokeLinecap="round"
           strokeDasharray={c}
-          initial={{ strokeDashoffset: c }}
+          initial={{ strokeDashoffset: reduced ? c * (1 - pct / 100) : c }}
           animate={{ strokeDashoffset: c * (1 - pct / 100) }}
-          transition={{ duration: 1, ease: [0.2, 0, 0, 1] }}
+          transition={{ duration: reduced ? 0 : drawn.current ? 0.36 : 0.58, ease: EASE_OUT }}
         />
       </svg>
       <div className="absolute inset-0 grid place-items-center">{children}</div>
@@ -120,10 +143,17 @@ export function Skeleton({ className }: { className?: string }) {
 /** Gemini-style "thinking" indicator. */
 export function Thinking({ label = '思考中', className }: { label?: ReactNode; className?: string }) {
   return (
-    <span className={cn('inline-flex items-center gap-2 text-body text-muted', className)} role="status">
+    <motion.span
+      initial={{ opacity: 0, y: 3 }}
+      animate={{ opacity: 1, y: 0 }}
+      exit={{ opacity: 0, y: -3 }}
+      transition={{ duration: 0.16, ease: EASE_OUT }}
+      className={cn('inline-flex items-center gap-2 text-body text-muted', className)}
+      role="status"
+    >
       <GeminiStar size={18} spinning />
       <span className="nf-gradient-text is-animated font-medium">{label}</span>
-    </span>
+    </motion.span>
   )
 }
 
@@ -136,6 +166,7 @@ export function EmptyState({
     <motion.div
       initial={{ opacity: 0, y: 8 }}
       animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: 0.24, ease: EASE_OUT }}
       className={cn('flex flex-col items-center justify-center rounded-lg border border-dashed border-line px-6 py-14 text-center', className)}
     >
       <div className="relative mb-4 grid size-14 place-items-center rounded-full bg-surface-2 text-muted [&_svg]:size-6">
@@ -156,19 +187,27 @@ export function Alert({
   const Icon = alertIcon[tone]
   return (
     <motion.div
-      initial={{ opacity: 0, y: -6 }}
-      animate={{ opacity: 1, y: 0 }}
+      initial={{ opacity: 0, y: -5 }}
+      animate={tone === 'danger' ? ERROR_SHAKE_ANIMATE : { opacity: 1, y: 0, transition: { duration: 0.2, ease: EASE_OUT } }}
+      exit={{ opacity: 0, y: -4, transition: { duration: 0.13, ease: EASE_EXIT } }}
       role={tone === 'danger' ? 'alert' : 'status'}
       className={cn('flex items-start gap-3 rounded-md px-4 py-3', toneClass[tone], className)}
     >
-      <Icon className="mt-0.5 size-[18px] shrink-0" aria-hidden />
+      <motion.span
+        initial={tone === 'success' ? { scale: 0.72, opacity: 0 } : false}
+        animate={{ scale: 1, opacity: 1 }}
+        transition={SPRING_TACTILE}
+        className="mt-0.5 flex shrink-0"
+      >
+        <Icon className="size-[18px]" aria-hidden />
+      </motion.span>
       <div className="min-w-0 flex-1 text-body">
         {title && <div className="font-medium">{title}</div>}
         {children && <div className={cn('break-words', title && 'mt-0.5 opacity-90')}>{children}</div>}
       </div>
       {action && <div className="shrink-0">{action}</div>}
       {onClose && (
-        <button type="button" onClick={onClose} aria-label="关闭" className="shrink-0 rounded-full p-1 opacity-70 hover:bg-black/5 hover:opacity-100">
+        <button type="button" onClick={onClose} aria-label="关闭" className="shrink-0 rounded-full p-1 opacity-70 transition-[opacity,background-color,transform] duration-[140ms] hover:bg-black/5 hover:opacity-100 active:scale-90">
           <X className="size-4" />
         </button>
       )}
@@ -178,17 +217,28 @@ export function Alert({
 
 /* ---------------- Numbers ---------------- */
 
-/** Counts up to `value` when scrolled into view. */
+/** Smoothly interpolates numeric changes: poised on first reveal, brisk on live updates. */
 export function AnimatedNumber({ value, format = (v) => Math.round(v).toLocaleString('zh-CN'), className }: { value: number; format?: (v: number) => string; className?: string }) {
   const ref = useRef<HTMLSpanElement>(null)
   const inView = useInView(ref, { once: true })
-  const mv = useMotionValue(0)
+  const reduced = useReducedMotion()
+  const hasAnimated = useRef(false)
+  const mv = useMotionValue(reduced ? value : 0)
   const text = useTransform(mv, (v) => format(v))
+
   useEffect(() => {
     if (!inView) return
-    const controls = animate(mv, value, { duration: 0.9, ease: [0.2, 0, 0, 1] })
+    if (reduced) {
+      mv.set(value)
+      hasAnimated.current = true
+      return
+    }
+    const duration = hasAnimated.current ? 0.28 : 0.48
+    hasAnimated.current = true
+    const controls = animate(mv, value, { duration, ease: EASE_OUT })
     return () => controls.stop()
-  }, [inView, value, mv])
+  }, [inView, value, mv, reduced])
+
   return <motion.span ref={ref} className={cn('tabular-nums', className)}>{text}</motion.span>
 }
 
@@ -214,7 +264,7 @@ export function KeyValue({ items, className }: { items: Array<{ label: ReactNode
       {items.map((it, i) => (
         <div key={i} className="flex items-baseline justify-between gap-4 text-body">
           <dt className="shrink-0 text-muted">{it.label}</dt>
-          <dd className="min-w-0 truncate text-right text-ink">{it.value}</dd>
+          <dd className="min-w-0 truncate text-right tabular-nums text-ink">{it.value}</dd>
         </div>
       ))}
     </dl>

@@ -640,6 +640,21 @@ class PromptTests(unittest.TestCase):
                 validate_arc_plan(raw, arc_index=1, start=1, total=7)
         with self.assertRaisesRegex(ValueError, "标题.*重复"):
             validate_arc_plan(payload, arc_index=2, start=1, total=7, recent_titles=["第99章 取证路线1"])
+        long_chip = "掌控兵部职方司边镇舆图与木沙盘制作权，用陈年核桃油蜡混塞北黄沙伪造旧沙盘包浆，并将饮马河与百眼井水源坐标向西篡改八十里指向盐碱干涸死地，企图截断五万北伐先锋铁骑补给线"
+        normalized_plan, _ = validate_arc_plan({
+            **payload,
+            "villainChips": [
+                {"villain": "守卫甲（" + "头衔" * 30 + "）", "newChips": [long_chip, "", "第二条筹码", "第三条筹码", "第四条溢出"], "exitPlan": "退场"},
+                {"villain": "守卫乙", "newChips": None, "exitPlan": " BACKGROUND "},
+            ],
+        }, arc_index=2, start=1, total=7)
+        self.assertEqual(len(normalized_plan["villainChips"]), 2)
+        self.assertLessEqual(len(normalized_plan["villainChips"][0]["villain"]), 50)
+        self.assertEqual(len(normalized_plan["villainChips"][0]["newChips"]), 3)
+        self.assertGreater(len(normalized_plan["villainChips"][0]["newChips"][0]), 80)
+        self.assertEqual(normalized_plan["villainChips"][0]["exitPlan"], "exit")
+        self.assertEqual(normalized_plan["villainChips"][1]["newChips"], [])
+        self.assertEqual(normalized_plan["villainChips"][1]["exitPlan"], "background")
 
     def test_canon_locks_use_420_character_budget_without_cutting_rules(self):
         first = "等级上限100级，主角初始46级。"
@@ -755,3 +770,32 @@ class PromptTests(unittest.TestCase):
         result = prompts.build_chapter_write_prompt(prev_chapter_ending=prior)
         self.assertIn("【上一章末尾衔接片段（约800字）】\n" + "甲" * 799, result["prompt"])
         result["prompt"].encode("utf-8")
+
+    def test_static_prefix_precedes_chapter_variables_for_prompt_cache(self):
+        plan, outline, facts = story_fixture()
+        ch5 = prompts.build_chapter_write_prompt(
+            book_plan=plan, outline={**outline, "chapterNumber": 5, "title": "第5章 起风"},
+            canonical_facts=facts, draft_quality=True, total_chapters=40,
+        )
+        ch6 = prompts.build_chapter_write_prompt(
+            book_plan=plan, outline={**outline, "chapterNumber": 6, "title": "第6章 靠岸"},
+            canonical_facts=facts, draft_quality=True, total_chapters=40,
+        )
+        self.assertEqual(ch5["system"], ch6["system"])
+        marker = "\n请撰写第"
+        self.assertIn(marker, ch5["prompt"])
+        prefix5 = ch5["prompt"].split(marker)[0]
+        prefix6 = ch6["prompt"].split(marker)[0]
+        self.assertEqual(prefix5, prefix6)
+        self.assertIn("全书总纲核心锚点", prefix5)
+        self.assertIn("本书风格指南", prefix5)
+
+        o1 = prompts.build_chapter_outlines_prompt(book_plan=plan, start_chapter=11, end_chapter=20)
+        o2 = prompts.build_chapter_outlines_prompt(book_plan=plan, start_chapter=21, end_chapter=30)
+        self.assertEqual(o1["system"], o2["system"])
+        self.assertEqual(o1["prompt"].split("\n请生成连续章纲：")[0], o2["prompt"].split("\n请生成连续章纲：")[0])
+        self.assertIn("【全书总纲】", o1["prompt"].split("\n请生成连续章纲：")[0])
+
+        r5 = prompts.build_repair_prompt(chapter_number=5, chapter_text="甲", outline=outline, issues=[])
+        r6 = prompts.build_repair_prompt(chapter_number=6, chapter_text="乙", outline=outline, issues=[])
+        self.assertEqual(r5["system"], r6["system"])

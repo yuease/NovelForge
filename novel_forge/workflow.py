@@ -11,6 +11,7 @@ from langgraph.runtime import Runtime
 
 from .evaluator import EvaluationError, evaluate_candidate, evaluation_source, is_book_evaluation_running
 from .llm import DEFAULT_MAX_TOKENS, LLMError, call_llm
+from .openai_siwc import PROVIDER as SIWC
 from .pipeline import PipelineRuntime, _write, review_action
 from .storage import StorageError, manuscript_fingerprint, revision_manuscript_state
 from .verifier import _llm_options
@@ -77,6 +78,7 @@ class WorkerError(RuntimeError):
 
 class Worker:
     """Drive the writing graph and serve the revision runtime's local operations."""
+    supports_native_tools = True
 
     def __init__(self, pipeline: PipelineRuntime):
         self.pipeline = pipeline
@@ -151,14 +153,27 @@ class Worker:
             timeout_ms=max(300_000, defaults.get("timeoutMs") or 0),
             max_retries=min(2, 2 if defaults.get("maxRetries") is None else defaults["maxRetries"]),
         )
+        if provider == SIWC:
+            options.update(base_url="", api_key="", siwc_context="chief-editor" if role == "chief-editor" else None,
+                           siwc_profile=data.get("siwcProfileId"))
         # Revision validators consume role-specific objects even in mock mode.
         if provider == "mock" and role in MOCK_REVISION:
             return {"text": json.dumps(MOCK_REVISION[role], ensure_ascii=False)}
+        messages = data.get("messages")
+        tools = data.get("tools")
         result = await call_llm(
             **options, system=data.get("system") or "", prompt=data.get("prompt") or "",
+            messages=messages, tools=tools,
+            reasoning_effort=data.get("reasoningEffort"),
+            cache_key=data.get("cacheKey"),
             store=self.store, client=self.pipeline.client,
         )
-        return {"text": result["text"]}
+        reply = {"text": result["text"]}
+        if messages is not None or tools is not None or result.get("toolCalls"):
+            reply["toolCalls"] = result.get("toolCalls") or []
+            reply["assistantMessage"] = result.get("assistantMessage")
+            reply["usage"] = result.get("usage")
+        return reply
 
     async def advance(self, run_id, phase):
         stages = self.runs[run_id]

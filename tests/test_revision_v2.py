@@ -1008,6 +1008,146 @@ class V2Tests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("仍需核对原始大纲", wf.export("story", self.run, "report")[1])
         await self.start(manuscript, worker, scenario)
 
+    async def test_soft_v2_verifier_uses_readonly_tools_expands_visible_basis_and_preserves_cache_prefix(self):
+        manuscript = Manuscript()
+        # Chapter 1 is outside batch 3 ([7, 8, 9]) and not its neighbor; put an anchor fact in Ch 1.
+        manuscript.rows[0]["content"] = "第一章写明青铜钥匙藏在灯塔顶层。" + manuscript.rows[0]["content"]
+        manuscript.rows[7]["content"] = "第八章误写成青铜钥匙在地下室。" + manuscript.rows[7]["content"]
+
+        class NativeVerifierWorker(Worker):
+            supports_native_tools = True
+
+            def __init__(self, m):
+                super().__init__(m)
+                self.verifier_tool_events = []
+                self.prompt_key_orders = {}
+
+            async def request(self, action, **args):
+                if action != "revision-model":
+                    return await super().request(action, **args)
+                body = args["payload"]
+                role = body["role"]
+                if body.get("messages"):
+                    msgs = body["messages"]
+                    data = json.JSONDecoder().raw_decode(msgs[0]["content"])[0]
+                    self.prompt_key_orders.setdefault(role, list(data.keys()))
+                    tool_msgs = [m for m in msgs if m.get("role") == "tool"]
+                    if role == "verifier" and 8 in data["numbers"] and not data.get("repairChecks") and not tool_msgs:
+                        self.verifier_tool_events.append(("requested_tools", [t["name"] for t in body["tools"]]))
+                        return {
+                            "text": "",
+                            "toolCalls": [{"id": "vc_1", "name": "read_chapter",
+                                           "arguments": {"version": "candidate", "chapter": 1}}],
+                            "assistantMessage": {
+                                "role": "assistant", "content": "",
+                                "toolCalls": [{"id": "vc_1", "name": "read_chapter",
+                                               "arguments": {"version": "candidate", "chapter": 1}}],
+                            },
+                        }
+                    if role == "verifier" and 8 in data["numbers"] and not data.get("repairChecks") and tool_msgs:
+                        self.verifier_tool_events.append(("received_tool_output", tool_msgs[0]["content"]))
+                        # Cite Chapter 1 as repair basis (only valid if read_chapter expanded `visible` with {1}!)
+                        return {"text": json.dumps({
+                            "outcomes": [{"id": item["id"], "status": "not_applicable", "reason": "无关"}
+                                         for item in data["issues"]],
+                            "findings": [{
+                                "chapter": 8, "field": "content", "quote": "第八章误写成青铜钥匙在地下室。",
+                                "priority": "P0", "problem": "青铜钥匙位置与第一章灯塔顶层冲突。",
+                                "fix": "将地下室改为灯塔顶层。", "requiresDecision": False,
+                                "affectedChapters": [8, 1],
+                                "basis": [{"chapter": 1, "field": "content", "quote": "第一章写明青铜钥匙藏在灯塔顶层。"}],
+                            }],
+                        }, ensure_ascii=False)}
+                    if role == "verifier" and data.get("repairChecks"):
+                        return {"text": json.dumps({
+                            "outcomes": [{"id": item["id"], "status": "not_applicable", "reason": "无关"}
+                                         for item in data["issues"]],
+                            "findings": [],
+                            "repairChecks": [{"id": item["repair"]["id"], "status": "open", "reason": "需人工复核"}
+                                             for item in data["repairChecks"]],
+                        }, ensure_ascii=False)}
+                    # Otherwise run default Worker response using msgs[0]["content"]
+                    patched = {**body, "prompt": msgs[0]["content"]}
+                    return await super().request(action, **{**args, "payload": patched})
+                data = json.JSONDecoder().raw_decode(body["prompt"])[0]
+                self.prompt_key_orders.setdefault(role, list(data.keys()))
+                return await super().request(action, **args)
+
+        worker = NativeVerifierWorker(manuscript)
+
+        async def scenario(_, __):
+            wf = self.workflow
+            record = await self.settled()
+            self.assertIn(record["status"], ("ready", "needs_review"), record)
+            # Confirm verifier used read_chapter on Chapter 1 and received its actual text
+            self.assertEqual(worker.verifier_tool_events[0][0], "requested_tools")
+            self.assertIn("read_chapter", worker.verifier_tool_events[0][1])
+            self.assertIn("青铜钥匙藏在灯塔顶层", worker.verifier_tool_events[1][1])
+            # Confirm the cross-chapter basis (chapter 1) passed verified_repair and drove automatic repair + recheck!
+            repaired_items = record["work"].get("repairChecks") or []
+            self.assertTrue(repaired_items)
+            self.assertEqual(repaired_items[0]["repair"]["basis"][0]["chapter"], 1)
+            # Confirm prefix-stable key order (static fields before dynamic batch fields)
+            self.assertLess(worker.prompt_key_orders["editor"].index("ledger"),
+                            worker.prompt_key_orders["editor"].index("chapters"))
+            self.assertLess(worker.prompt_key_orders["verifier"].index("ledger"),
+                            worker.prompt_key_orders["verifier"].index("candidate"))
+        await self.start(manuscript, worker, scenario)
+
+    async def test_soft_v2_verifier_falls_back_cleanly_on_tools_unsupported(self):
+        manuscript = Manuscript()
+
+        class UnsupportedToolWorker(Worker):
+            supports_native_tools = True
+
+            def __init__(self, m):
+                super().__init__(m)
+                self.tool_flags = []
+
+            async def request(self, action, **args):
+                if action != "revision-model":
+                    return await super().request(action, **args)
+                body = args["payload"]
+                if body["role"] in ("verifier", "final"):
+                    has_tools = bool(body.get("tools"))
+                    self.tool_flags.append(has_tools)
+                    if has_tools:
+                        raise WorkerError("不支持原生工具", 400, "TOOLS_UNSUPPORTED")
+                return await super().request(action, **args)
+
+        worker = UnsupportedToolWorker(manuscript)
+
+        async def scenario(_, __):
+            record = await self.settled()
+            self.assertEqual(record["status"], "ready", record)
+            # First verifier batch hit TOOLS_UNSUPPORTED once; all subsequent batches skipped tools cleanly!
+            self.assertEqual(worker.tool_flags[0], True)
+            self.assertTrue(all(flag is False for flag in worker.tool_flags[1:]))
+        await self.start(manuscript, worker, scenario)
+
+    async def test_force_apply_allows_needs_review_and_archived_candidates_only_with_explicit_override(self):
+        manuscript = Manuscript()
+        worker = Worker(manuscript)
+        worker.break_unit = True
+
+        async def scenario(_, __):
+            wf = self.workflow
+            record = await self.settled()
+            self.assertEqual(record["status"], "needs_review", record)
+            # Without explicit force=True, both needs_review and archived reject apply.
+            with self.assertRaises(WorkerError):
+                await wf.action("story", self.run, "apply", {})
+            archived = await wf.action("story", self.run, "archive", {})
+            self.assertEqual(archived["status"], "archived")
+            with self.assertRaises(WorkerError):
+                await wf.action("story", self.run, "apply", {})
+            # With explicit force=True author override, archived candidate applies cleanly.
+            applied = await wf.action("story", self.run, "apply", {"force": True})
+            self.assertEqual(applied["status"], "applied")
+            self.assertEqual(len(worker.applied), 1)
+            self.assertIn(NEW, worker.applied[0]["changes"][0]["content"])
+        await self.start(manuscript, worker, scenario)
+
 
 class V2ValidationTest(unittest.TestCase):
     def test_anchor_mapping_counts_and_nearby_text(self):

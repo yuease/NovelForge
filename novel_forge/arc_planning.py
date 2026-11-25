@@ -8,8 +8,33 @@ CANON_LOCKS_MARKER = "[BOOK_PLAN_CANON_LOCKS]"
 _CHAPTER_TITLE = re.compile(r"^(?:#{1,6}\s*)?第\s*\d+\s*章[\s:：—-]*")
 
 
+_EXIT_PLANS = {
+    "retain": "retain",
+    "keep": "retain",
+    "保留": "retain",
+    "留存": "retain",
+    "继续": "retain",
+    "exit": "exit",
+    "退场": "exit",
+    "下线": "exit",
+    "败亡": "exit",
+    "清除": "exit",
+    "background": "background",
+    "转幕后": "background",
+    "幕后": "background",
+    "潜伏": "background",
+}
+
+
 def _text(value):
     return " ".join(value.split()) if isinstance(value, str) else ""
+
+
+def _clip(value, limit):
+    text = _text(value)
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip("，,、；;：:（(")
 
 
 def _key(value):
@@ -98,22 +123,34 @@ def _title_key(title):
 def validate_arc_plan(raw, *, arc_index, start, total, recent_titles=()):
     if not isinstance(raw, dict):
         raise ValueError("需要包含单元元信息和 chapters 的完整 JSON 对象。")
-    title, goal = _text(raw.get("arcTitle")), _text(raw.get("arcGoal"))
-    if not title or not goal or len(title) > 80 or len(goal) > 240:
+    title, goal = _clip(raw.get("arcTitle"), 80), _clip(raw.get("arcGoal"), 240)
+    if not title or not goal:
         raise ValueError("arcTitle 和 arcGoal 必须非空，分别不超过 80 字和 240 字。")
     chips = raw.get("villainChips")
-    if not isinstance(chips, list) or len(chips) > 4:
-        raise ValueError("villainChips 应为至多四条的数组，无反派时用空数组。")
+    if chips is None:
+        chips = []
+    if not isinstance(chips, list):
+        raise ValueError("villainChips 应为数组，无反派时用空数组 []。")
     villains = []
-    for row in chips:
-        name = _text(row.get("villain")) if isinstance(row, dict) else ""
-        new = row.get("newChips") if name else None
-        exit_plan = row.get("exitPlan") if name else None
-        if (not name or len(name) > 50 or not isinstance(new, list) or len(new) > 3
-                or any(not _text(value) or len(_text(value)) > 80 for value in new)
-                or exit_plan not in ("retain", "exit", "background")):
-            raise ValueError("villainChips 条目须含 villain、至多三条 newChips 和有效 exitPlan。")
-        villains.append({"villain": name, "newChips": [_text(value) for value in new], "exitPlan": exit_plan})
+    for row in chips[:4]:
+        if not isinstance(row, dict):
+            raise ValueError("villainChips 条目须为包含 villain、newChips、exitPlan 的对象。")
+        name = _clip(row.get("villain"), 50)
+        if not name:
+            raise ValueError("villainChips 条目缺少非空 villain 名称。")
+        raw_new = row.get("newChips")
+        if raw_new is None:
+            raw_new = []
+        elif isinstance(raw_new, str):
+            raw_new = [raw_new]
+        if not isinstance(raw_new, list):
+            raise ValueError(f"villainChips 条目「{name}」的 newChips 须为字符串数组。")
+        new_chips = [_clip(value, 160) for value in raw_new if _text(value)][:3]
+        raw_exit = _text(row.get("exitPlan"))
+        exit_plan = _EXIT_PLANS.get(raw_exit.lower())
+        if exit_plan is None:
+            raise ValueError(f"villainChips 条目「{name}」的 exitPlan={raw_exit!r} 无效，须为 retain、exit 或 background。")
+        villains.append({"villain": name, "newChips": new_chips, "exitPlan": exit_plan})
 
     minimum, maximum = arc_chapter_span(start, total)
     chapters = raw.get("chapters")

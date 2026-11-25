@@ -1,11 +1,12 @@
 import { forwardRef, useId } from 'react'
 import type { InputHTMLAttributes, ReactNode, SelectHTMLAttributes, TextareaHTMLAttributes } from 'react'
 import { ChevronDown } from 'lucide-react'
-import { motion } from 'motion/react'
+import { AnimatePresence, motion } from 'motion/react'
 import { cn } from '../../lib/cn'
+import { EASE_EXIT, EASE_OUT, SPRING_INDICATOR, SPRING_TACTILE } from '../../lib/motion'
 
 const control =
-  'w-full rounded-md border border-line bg-surface px-3.5 text-body text-ink transition-[border-color,box-shadow,background-color] duration-200 ' +
+  'w-full rounded-md border border-line bg-surface px-3.5 text-body text-ink transition-[border-color,box-shadow,background-color] duration-[160ms] ease-[var(--ease-standard)] ' +
   'hover:border-line-strong focus:border-primary focus:outline-none focus:ring-4 focus:ring-primary/12 ' +
   'disabled:cursor-not-allowed disabled:bg-surface-2 disabled:text-muted'
 
@@ -31,11 +32,31 @@ export function Field({ label, hint, error, aside, children, className }: FieldP
         </div>
       )}
       {children(id)}
-      {error ? (
-        <p className="text-caption text-danger">{error}</p>
-      ) : hint ? (
-        <p className="text-caption text-muted">{hint}</p>
-      ) : null}
+      <AnimatePresence mode="wait" initial={false}>
+        {error ? (
+          <motion.p
+            key="error"
+            initial={{ opacity: 0, y: -3 }}
+            animate={{ opacity: 1, y: 0, x: [0, -3, 3, -1.5, 0] }}
+            exit={{ opacity: 0, y: -2, transition: { duration: 0.11, ease: EASE_EXIT } }}
+            transition={{ duration: 0.24, ease: EASE_OUT }}
+            className="text-caption text-danger"
+          >
+            {error}
+          </motion.p>
+        ) : hint ? (
+          <motion.p
+            key="hint"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            transition={{ duration: 0.14, ease: EASE_OUT }}
+            className="text-caption text-muted"
+          >
+            {hint}
+          </motion.p>
+        ) : null}
+      </AnimatePresence>
     </div>
   )
 }
@@ -63,7 +84,7 @@ export const Select = forwardRef<HTMLSelectElement, SelectHTMLAttributes<HTMLSel
   function Select({ className, children, ...rest }, ref) {
     return (
       <div className="relative">
-        <select ref={ref} className={cn(control, 'h-10 appearance-none pr-9', className)} {...rest}>
+        <select ref={ref} className={cn(control, 'h-10 appearance-none [-webkit-appearance:none] bg-none pr-9', className)} {...rest}>
           {children}
         </select>
         <ChevronDown className="pointer-events-none absolute right-3 top-1/2 size-4 -translate-y-1/2 text-muted" aria-hidden />
@@ -76,7 +97,7 @@ export function Checkbox({
   checked, onChange, label, description, disabled, className,
 }: { checked: boolean; onChange: (v: boolean) => void; label: ReactNode; description?: ReactNode; disabled?: boolean; className?: string }) {
   return (
-    <label className={cn('group flex cursor-pointer items-start gap-3', disabled && 'cursor-not-allowed opacity-50', className)}>
+    <label className={cn('group flex cursor-pointer select-none items-start gap-3', disabled && 'cursor-not-allowed opacity-50', className)}>
       <input
         type="checkbox"
         className="peer sr-only"
@@ -84,11 +105,13 @@ export function Checkbox({
         disabled={disabled}
         onChange={(e) => onChange(e.target.checked)}
       />
-      <span
+      <motion.span
         aria-hidden
+        animate={{ scale: checked ? [1, 0.9, 1.04, 1] : 1 }}
+        transition={{ duration: 0.22, ease: EASE_OUT }}
         className={cn(
-          'mt-0.5 grid size-[18px] shrink-0 place-items-center rounded-[5px] border-2 transition-all duration-200',
-          'peer-focus-visible:ring-4 peer-focus-visible:ring-primary/20',
+          'mt-0.5 grid size-[18px] shrink-0 place-items-center rounded-[5px] border-2 transition-[background-color,border-color,box-shadow] duration-[160ms] ease-[var(--ease-standard)]',
+          'peer-focus-visible:ring-4 peer-focus-visible:ring-primary/20 group-active:scale-90',
           checked ? 'border-primary bg-primary' : 'border-line-strong bg-surface group-hover:border-primary/60',
         )}
       >
@@ -101,11 +124,11 @@ export function Checkbox({
             strokeLinecap="round"
             strokeLinejoin="round"
             initial={false}
-            animate={{ pathLength: checked ? 1 : 0 }}
-            transition={{ duration: 0.2 }}
+            animate={{ pathLength: checked ? 1 : 0, opacity: checked ? 1 : 0 }}
+            transition={{ duration: 0.16, ease: EASE_OUT }}
           />
         </svg>
-      </span>
+      </motion.span>
       <span className="min-w-0">
         <span className="block text-body text-ink">{label}</span>
         {description && <span className="mt-0.5 block text-caption text-muted">{description}</span>}
@@ -118,30 +141,32 @@ export function Switch({
   checked, onChange, label, description, disabled, className,
 }: { checked: boolean; onChange: (v: boolean) => void; label?: ReactNode; description?: ReactNode; disabled?: boolean; className?: string }) {
   return (
-    <label className={cn('flex cursor-pointer items-center justify-between gap-4', disabled && 'cursor-not-allowed opacity-50', className)}>
+    <label className={cn('group flex cursor-pointer select-none items-center justify-between gap-4', disabled && 'cursor-not-allowed opacity-50', className)}>
       {(label || description) && (
         <span className="min-w-0">
           {label && <span className="block text-body text-ink">{label}</span>}
           {description && <span className="mt-0.5 block text-caption text-muted">{description}</span>}
         </span>
       )}
-      <button
+      <motion.button
         type="button"
         role="switch"
         aria-checked={checked}
         disabled={disabled}
+        whileTap={disabled ? undefined : { scale: 0.96 }}
+        transition={SPRING_TACTILE}
         onClick={() => onChange(!checked)}
         className={cn(
-          'relative inline-flex h-6 w-11 shrink-0 items-center rounded-full border-2 transition-colors duration-200',
+          'relative inline-flex h-6 w-11 shrink-0 items-center rounded-full border-2 transition-colors duration-[180ms] ease-[var(--ease-standard)]',
           checked ? 'border-primary bg-primary' : 'border-line-strong bg-surface-3',
         )}
       >
         <motion.span
           layout
-          transition={{ type: 'spring', stiffness: 600, damping: 34 }}
-          className={cn('block rounded-full shadow-sm', checked ? 'ml-[22px] size-4 bg-on-primary' : 'ml-1 size-3 bg-muted')}
+          transition={SPRING_INDICATOR}
+          className={cn('block rounded-full shadow-sm transition-colors duration-[180ms]', checked ? 'ml-[22px] size-4 bg-on-primary' : 'ml-1 size-3 bg-muted')}
         />
-      </button>
+      </motion.button>
     </label>
   )
 }

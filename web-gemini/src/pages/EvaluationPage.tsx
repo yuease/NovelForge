@@ -1,17 +1,18 @@
 import { useEffect, useMemo, useState } from 'react'
 import type { ReactNode } from 'react'
-import { AnimatePresence, motion } from 'motion/react'
+import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
 import { CheckCircle2, Eye, FileSearch, FileUp, ListChecks, Play, Quote, Sparkles, Star, ThumbsDown, ThumbsUp, Wand2 } from 'lucide-react'
 import { api, REVISION_DISPATCHED } from '../lib/api'
 import type { ManuscriptImportResult } from '../lib/api'
 import { cn } from '../lib/cn'
+import { COLLAPSE_MOTION, EASE_OUT, TAB_MOTION } from '../lib/motion'
 import { navigate } from '../lib/router'
-import { formatDateTime, formatNumber, messageOf } from '../lib/format'
+import { formatDateTime, formatNumber, messageOf, PRIORITY_META, READINESS_META } from '../lib/format'
 import type { Tone } from '../lib/format'
 import type { AiFlavorIssueItem, BookEvaluationReport, LLMProvider } from '../lib/types'
 import { useStudio } from '../state/studio'
 import {
-  Alert, Badge, Button, Card, CardHeader, Collapsible, Disclosure, EmptyState, PageHeader, Progress, ProgressRing,
+  Alert, Badge, Button, Card, CardHeader, Collapsible, Dialog, Disclosure, EmptyState, PageHeader, Progress, ProgressRing,
   Segmented, Select, Stagger, StaggerItem, Tag, Thinking, useToast,
 } from '../components/ui'
 import { isModelChoiceReady, ModelPicker, resolveSelectedModel, useModelCatalog } from '../components/model/ModelPicker'
@@ -37,24 +38,17 @@ const AI_CATEGORY: Record<string, string> = {
   inconsistent_details: '细节前后打架',
 }
 
-const READINESS: Record<string, { label: string; tone: Tone }> = {
-  ready_to_submit: { label: '可投稿冲刺', tone: 'success' },
-  revise_recommended: { label: '建议单点精修', tone: 'warning' },
-  major_rework: { label: '建议大修结构', tone: 'danger' },
-}
-
-const PRIORITY_TONE: Record<string, Tone> = { P0: 'danger', P1: 'warning', P2: 'neutral' }
-
 type Role = 'flash' | 'review' | 'rewrite'
 type Choice = { provider: LLMProvider; model: string }
 type Mode = 'full' | 'flash_only' | 'pro_only'
 const failedBatch = (batch: { timelineSummary?: string }) => /^JSON\s*解析失败/.test(batch.timelineSummary || '')
 
 export default function EvaluationPage() {
-  const { jobs, activeJob, selectJob, loadJobDetails, onJobCreated } = useStudio()
+  const { jobs, activeJob, loadJobDetails, onJobCreated } = useStudio()
   const toast = useToast()
   const [importOpen, setImportOpen] = useState(false)
   const [importResult, setImportResult] = useState<ManuscriptImportResult | null>(null)
+  const [confirmBatchPolish, setConfirmBatchPolish] = useState(false)
   const [mode, setMode] = useState<Mode>('full')
   const [revisionRefresh, setRevisionRefresh] = useState(0)
   useEffect(() => {
@@ -174,9 +168,9 @@ export default function EvaluationPage() {
         background: true,
       })
       await loadJobDetails(activeJob.id)
-      toast(chapterNumbers?.length ? `已启动第 ${chapterNumbers.join('、')} 章精修` : '已启动 P0 + P1 章节批量精修', 'success')
+      toast(chapterNumbers?.length ? `已启动第 ${chapterNumbers.join('、')} 章原地润色` : '已启动严重/建议问题章节的快速润色', 'success')
     } catch (err) {
-      setError(messageOf(err, '精修任务启动失败'))
+      setError(messageOf(err, '快速润色启动失败'))
     } finally {
       setDeAiBusy(null)
     }
@@ -185,18 +179,10 @@ export default function EvaluationPage() {
   const heading = (
     <>
       <PageHeader
+        eyebrow={activeJob ? `《${activeJob.title || activeJob.bookPlan?.title || '当前作品'}》` : undefined}
         title="作品评估"
-        description="初审分批查找全书问题，精读给出六维评分和开篇反馈。"
-        actions={(
-          <>
-            <Button variant="tonal" icon={<FileUp className="size-4" />} onClick={() => setImportOpen(true)}>导入 TXT</Button>
-            {activeJob && <Select aria-label="选择待评估的作品" value={activeJob.id} onChange={(e) => selectJob(e.target.value)} className="h-10 max-w-xs rounded-full">
-              {jobs.map((j) => (
-                <option key={j.id} value={j.id}>{j.title || j.id}（{j.completedChapters ?? 0}/{j.totalChapters} 章 · {formatNumber(j.totalWords)} 字）</option>
-              ))}
-            </Select>}
-          </>
-        )}
+        description="初审分批查找全书问题，精读给出六维评分与开篇反馈；可在顶栏或左下角随时切换作品。"
+        actions={<Button variant="tonal" icon={<FileUp className="size-4" />} onClick={() => setImportOpen(true)}>导入 TXT</Button>}
       />
       <ImportManuscriptDrawer open={importOpen} onClose={() => setImportOpen(false)} onImported={(result) => {
         onJobCreated(result.job, 'evaluation')
@@ -221,23 +207,27 @@ export default function EvaluationPage() {
   return (
     <>
       {heading}
-      {importResult?.job.id === activeJob.id && (
-        <div className="mb-6 grid gap-2">
-          <Alert tone="success" title={`已导入《${activeJob.title || '导入作品'}》`} onClose={() => setImportResult(null)}>
-            <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
-              <span>{importResult.totalChapters} 章 · {formatNumber(importResult.totalWords)} 字</span>
-              <Button variant="ghost" size="sm" onClick={() => navigate('reader')}>打开成稿与导出</Button>
+      <AnimatePresence initial={false}>
+        {importResult?.job.id === activeJob.id && (
+          <motion.div {...COLLAPSE_MOTION} className="overflow-hidden">
+            <div className="mb-6 grid gap-2">
+              <Alert tone="success" title={`已导入《${activeJob.title || '导入作品'}》`} onClose={() => setImportResult(null)}>
+                <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+                  <span>{importResult.totalChapters} 章 · {formatNumber(importResult.totalWords)} 字</span>
+                  <Button variant="ghost" size="sm" onClick={() => navigate('reader')}>打开成稿与导出</Button>
+                </div>
+              </Alert>
+              {importResult.warnings.length > 0 && (
+                <Alert tone="warning" title="导入提示">
+                  <ul className="ml-4 list-disc space-y-1">
+                    {importResult.warnings.map((warning, index) => <li key={index}>{warning}</li>)}
+                  </ul>
+                </Alert>
+              )}
             </div>
-          </Alert>
-          {importResult.warnings.length > 0 && (
-            <Alert tone="warning" title="导入提示">
-              <ul className="ml-4 list-disc space-y-1">
-                {importResult.warnings.map((warning, index) => <li key={index}>{warning}</li>)}
-              </ul>
-            </Alert>
-          )}
-        </div>
-      )}
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       {/* Run panel */}
       <Card variant={running ? 'glow' : 'default'} padding="lg" className="mb-6">
@@ -252,8 +242,8 @@ export default function EvaluationPage() {
           </div>
           <div className="flex flex-wrap items-center gap-2">
             {allIssues.length > 0 && (
-              <Button variant="tonal" loading={deAiBusy === 'batch'} disabled={!rewriteReady || catalogLoading || running || deAiBusy !== null} icon={<Wand2 className="size-4" />} onClick={() => void deAi()}>
-                直接精修 P0 + P1
+              <Button variant="tonal" loading={deAiBusy === 'batch'} disabled={!rewriteReady || catalogLoading || running || deAiBusy !== null} icon={<Wand2 className="size-4" />} onClick={() => setConfirmBatchPolish(true)}>
+                快速润色（直接改正文）
               </Button>
             )}
             {canResume && !running && (
@@ -277,32 +267,51 @@ export default function EvaluationPage() {
             </p>
           )}
         </div>
-        {checkpoint && (
-          <div className="mt-3 grid gap-2">
-            <div className="flex flex-wrap justify-between gap-x-3 gap-y-1 text-caption text-muted" role="status">
-              <span>{checkpoint.stage === 'pro' ? '初审已完成，续跑从精读开始。' :
-                checkpoint.stage === 'finalizing' ? '模型结果已保存，待汇总报告。' : '续跑会跳过已保存的批次。'}</span>
-              {checkpoint.totalBatches > 0 && (
-                <span className="tabular-nums">已保存初审 {checkpoint.completedBatches}/{checkpoint.totalBatches} 批</span>
-              )}
-            </div>
-            {checkpoint.totalBatches > 0 && (
-              <Progress size="sm" value={checkpoint.completedBatches} max={checkpoint.totalBatches}
-                tone={running ? 'gradient' : 'primary'} animated={running} label="初审批次进度" />
-            )}
-          </div>
-        )}
+        <AnimatePresence initial={false}>
+          {checkpoint && (
+            <motion.div {...COLLAPSE_MOTION} className="overflow-hidden">
+              <div className="mt-3 grid gap-2">
+                <div className="flex flex-wrap justify-between gap-x-3 gap-y-1 text-caption text-muted" role="status">
+                  <span>{checkpoint.stage === 'pro' ? '初审已完成，续跑从精读开始。' :
+                    checkpoint.stage === 'finalizing' ? '模型结果已保存，待汇总报告。' : '续跑会跳过已保存的批次。'}</span>
+                  {checkpoint.totalBatches > 0 && (
+                    <span className="tabular-nums">已保存初审 {checkpoint.completedBatches}/{checkpoint.totalBatches} 批</span>
+                  )}
+                </div>
+                {checkpoint.totalBatches > 0 && (
+                  <Progress size="sm" value={checkpoint.completedBatches} max={checkpoint.totalBatches}
+                    tone={running ? 'gradient' : 'primary'} animated={running} label="初审批次进度" />
+                )}
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
         {repairMode && !running && (
           <div className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-2 text-caption text-muted">
             <Badge tone="warning" dot>初审待补跑</Badge>
             <span>保留已通过的批次{repairMode === 'full' ? '，补齐后重新精读' : ''}。</span>
           </div>
         )}
-        {!resumeReady && !catalogLoading && <Alert tone="warning" className="mt-4">所选评估模型不可用，请在下方模型设置中选择已配置的模型。</Alert>}
-        {error && <Alert tone="danger" className="mt-4" onClose={() => setError(null)}>{error}</Alert>}
+        <AnimatePresence initial={false}>
+          {!resumeReady && !catalogLoading && (
+            <motion.div {...COLLAPSE_MOTION} className="overflow-hidden">
+              <Alert tone="warning" className="mt-4">所选评估模型不可用，请在下方模型设置中选择已配置的模型。</Alert>
+            </motion.div>
+          )}
+        </AnimatePresence>
+        <AnimatePresence initial={false}>
+          {error && (
+            <motion.div {...COLLAPSE_MOTION} className="overflow-hidden">
+              <Alert tone="danger" className="mt-4" onClose={() => setError(null)}>{error}</Alert>
+            </motion.div>
+          )}
+        </AnimatePresence>
 
         <div className="mt-5 border-t border-line pt-4">
           <Disclosure title="模型设置">
+            {running && (
+              <p className="mb-3 text-caption text-muted">评估运行中，等待本轮评估结束后可切换模型。</p>
+            )}
             <div className="grid gap-6 xl:grid-cols-3">
               <ModelPicker label="初审模型" provider={flash.provider} model={flash.model} catalog={catalog} disabled={pickerDisabled} onChange={(p, m) => setModel('flash', p, m)} />
               <ModelPicker label="精读模型" provider={review.provider} model={review.model} catalog={catalog} disabled={pickerDisabled} onChange={(p, m) => setModel('review', p, m)} />
@@ -347,6 +356,23 @@ export default function EvaluationPage() {
           onDeAi={(n) => void deAi([n])}
         />
       )}
+
+      <Dialog
+        open={confirmBatchPolish}
+        onClose={() => setConfirmBatchPolish(false)}
+        title="快速润色（直接改写正文）"
+        description="此操作会针对所有「必须修」与「建议改」问题所在的章节，直接在后台原地润色并更新正文。"
+        footer={(
+          <>
+            <Button variant="ghost" onClick={() => setConfirmBatchPolish(false)}>取消</Button>
+            <Button variant="primary" loading={deAiBusy === 'batch'} onClick={() => { setConfirmBatchPolish(false); void deAi() }}>确认开始润色</Button>
+          </>
+        )}
+      >
+        <p className="text-body text-muted">
+          如果你希望先生成一份独立候选稿、核对后再决定是否写回正文，建议取消本弹窗，改用下方的「全书修订（先出候选稿）」。
+        </p>
+      </Dialog>
     </>
   )
 }
@@ -367,9 +393,10 @@ function Report({
   deAiBusy: number | 'batch' | null
   onDeAi: (chapter: number) => void
 }) {
+  const reducedMotion = useReducedMotion()
   const scores = SIX.map((d) => report.sixDimensions?.[d.key]?.score).filter((s): s is number => typeof s === 'number')
   const avg = scores.length ? scores.reduce((a, b) => a + b, 0) / scores.length : null
-  const readiness = READINESS[report.readiness ?? ''] ?? { label: report.readiness || '待定', tone: 'neutral' as Tone }
+  const readiness = READINESS_META[report.readiness ?? ''] ?? { label: report.readiness || '待定', tone: 'neutral' as Tone }
   const verdicts = report.topVerdicts
     ? [
       { title: '开头想不想追', data: report.topVerdicts.openingHook },
@@ -439,16 +466,19 @@ function Report({
                       <span className="font-display text-title tabular-nums text-ink">{v.score}<span className="text-caption text-muted"> / 5</span></span>
                     </div>
                     <div className="mt-2 flex gap-1">
-                      {[1, 2, 3, 4, 5].map((n) => (
-                        <div key={n} className="h-2 flex-1 overflow-hidden rounded-full bg-surface-3">
-                          <motion.div
-                            className={cn('h-full rounded-full', tone)}
-                            initial={{ width: 0 }}
-                            animate={{ width: v.score >= n ? '100%' : v.score > n - 1 ? `${(v.score - n + 1) * 100}%` : 0 }}
-                            transition={{ delay: 0.15 + i * 0.06 + n * 0.05, duration: 0.35, ease: [0.2, 0, 0, 1] }}
-                          />
-                        </div>
-                      ))}
+                      {[1, 2, 3, 4, 5].map((n) => {
+                        const fill = v.score >= n ? 1 : v.score > n - 1 ? v.score - n + 1 : 0
+                        return (
+                          <div key={n} className="h-2 flex-1 overflow-hidden rounded-full bg-surface-3">
+                            <motion.div
+                              className={cn('h-full w-full origin-left rounded-full', tone)}
+                              initial={reducedMotion ? false : { scaleX: 0 }}
+                              animate={{ scaleX: fill }}
+                              transition={reducedMotion ? { duration: 0 } : { delay: 0.06 + i * 0.03 + n * 0.025, duration: 0.34, ease: EASE_OUT }}
+                            />
+                          </div>
+                        )
+                      })}
                     </div>
                     {v.evidence && (
                       <p className="mt-3 flex gap-2 text-caption text-body">
@@ -485,7 +515,7 @@ function Report({
           <CardHeader
             icon={<Sparkles />}
             title="AI 味清单"
-            description={`共 ${totalIssues} 条命中${p0 ? ` · 当前筛选含 ${p0} 条 P0` : ''}`}
+            description={`共 ${totalIssues} 条命中${p0 ? ` · 当前筛选含 ${p0} 条必须修` : ''}`}
             actions={
               <Select aria-label="AI 味类别" value={category} onChange={(e) => onCategory(e.target.value)} className="h-8 rounded-full text-caption">
                 <option value="all">全部类别</option>
@@ -498,7 +528,12 @@ function Report({
             value={priority}
             onChange={onPriority}
             className="mb-4"
-            options={[{ value: 'all', label: '全部' }, { value: 'P0', label: 'P0' }, { value: 'P1', label: 'P1' }, { value: 'P2', label: 'P2' }]}
+            options={[
+              { value: 'all', label: '全部' },
+              { value: 'P0', label: PRIORITY_META.P0.label },
+              { value: 'P1', label: PRIORITY_META.P1.label },
+              { value: 'P2', label: PRIORITY_META.P2.label },
+            ]}
           />
           {signals && (Object.keys(signals.reactionStats ?? {}).length > 0 || Object.keys(signals.endingHookStats ?? {}).length > 0) && (
             <div className="mb-4 flex flex-wrap gap-2">
@@ -510,39 +545,36 @@ function Report({
               ))}
             </div>
           )}
-          <div className="grid gap-3">
-            <AnimatePresence initial={false} mode="popLayout">
+          <AnimatePresence mode="wait" initial={false}>
+            <motion.div key={`${category}-${priority}`} {...TAB_MOTION} className="grid gap-3">
               {issues.map((it) => (
-                <motion.div
+                <div
                   key={it.id}
-                  layout
-                  initial={{ opacity: 0, y: 8 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0, scale: 0.98 }}
-                  transition={{ duration: 0.2 }}
-                  className={cn('rounded-md p-4', it.resolved ? 'bg-success-soft/60' : 'bg-surface-2')}
+                  className={cn('rounded-md p-4 transition-colors duration-200', it.resolved ? 'bg-success-soft/60' : 'bg-surface-2')}
                 >
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <div className="flex flex-wrap items-center gap-2">
-                      <Badge tone={PRIORITY_TONE[it.priority] ?? 'neutral'}>{it.priority}</Badge>
+                      <Badge tone={PRIORITY_META[it.priority as 'P0' | 'P1' | 'P2']?.tone ?? 'neutral'}>
+                        {PRIORITY_META[it.priority as 'P0' | 'P1' | 'P2']?.label ?? it.priority}
+                      </Badge>
                       <span className="text-body font-medium text-primary">第 {it.chapterNumber} 章</span>
                       <Tag className="bg-surface">{AI_CATEGORY[it.category] || it.category}</Tag>
-                      {it.resolved && <Badge tone="success" icon={<CheckCircle2 />}>已精修</Badge>}
+                      {it.resolved && <Badge tone="success" icon={<CheckCircle2 />}>已润色</Badge>}
                     </div>
                     {!it.resolved && (
-                      <Button size="sm" variant="ghost" loading={deAiBusy === it.chapterNumber} disabled={!canRewrite} icon={<Wand2 className="size-3.5" />} onClick={() => onDeAi(it.chapterNumber)}>
-                        精修本章
+                      <Button size="sm" variant="ghost" loading={deAiBusy === it.chapterNumber} disabled={!canRewrite} icon={<Wand2 className="size-3.5" />} title="直接原地润色本章正文；如需先生成候选稿对比，请使用上方「全书修订」" onClick={() => onDeAi(it.chapterNumber)}>
+                        原地润色本章
                       </Button>
                     )}
                   </div>
                   {it.quote && <p className="mt-3 border-l-2 border-line-strong pl-3 font-serif text-body text-ink">“{it.quote}”</p>}
                   <p className="mt-2 text-body text-muted">影响：{it.impact}</p>
                   {it.suggestion && <p className="mt-1 text-body text-success">建议：{it.suggestion}</p>}
-                </motion.div>
+                </div>
               ))}
-            </AnimatePresence>
-            {issues.length === 0 && <p className="rounded-md bg-surface-2 py-8 text-center text-body text-muted">当前筛选条件下没有条目</p>}
-          </div>
+              {issues.length === 0 && <p className="rounded-md bg-surface-2 py-8 text-center text-body text-muted">当前筛选条件下没有条目</p>}
+            </motion.div>
+          </AnimatePresence>
         </Card>
       </StaggerItem>
 

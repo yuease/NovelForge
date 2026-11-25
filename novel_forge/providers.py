@@ -7,6 +7,8 @@ from typing import Protocol
 
 import httpx
 
+from .openai_siwc import PROVIDER as SIWC, RESOURCE as SIWC_RESOURCE
+
 
 PROVIDERS = {
     "mock": {
@@ -17,6 +19,10 @@ PROVIDERS = {
         "label": "OpenAI", "description": "GPT 系列官方 API。",
         "transport": "openai", "baseUrl": "https://api.openai.com/v1", "env": "OPENAI_API_KEY",
         "models": ["gpt-4o-mini", "gpt-4.1-mini", "gpt-4.1", "gpt-5-mini"],
+    },
+    SIWC: {
+        "label": "ChatGPT 订阅", "description": "使用 ChatGPT 登录并调用获准的订阅模型。",
+        "transport": "openai-responses-siwc", "baseUrl": SIWC_RESOURCE, "models": [], "requiresKey": False,
     },
     "anthropic": {
         "label": "Anthropic", "description": "Claude 系列官方 API。",
@@ -188,6 +194,21 @@ def _configured(provider, config):
         (config["apiKey"] if provider_requires_key(provider) else config["explicitlyConfigured"]))
 
 
+def _siwc_entry(service):
+    status = service.catalog()
+    models = list(status["modelLabels"])
+    preferred = status["selectedModel"]
+    return {
+        "providerId": SIWC, "label": PROVIDERS[SIWC]["label"], "description": PROVIDERS[SIWC]["description"],
+        "authKind": "oauth", "configured": status["configured"], "oauthState": status["state"],
+        "accountLabel": status["accountLabel"], "profileId": status["profileId"],
+        "catalogVersion": status["catalogVersion"], "allStages": status["allStages"],
+        "baseUrl": SIWC_RESOURCE, "defaultBaseUrl": SIWC_RESOURCE, "apiKeyMasked": "", "requiresKey": False,
+        "discoverySupported": True, "modelSource": "discovered", "models": models,
+        "modelLabels": status["modelLabels"], "selectedModel": preferred if preferred in models else next(iter(models), ""),
+    }
+
+
 def _discovery_capability(definition, base_url):
     if definition["transport"] != "vertex":
         return definition["transport"] != "mock" and definition.get("discover") is not False, None, None
@@ -231,7 +252,11 @@ def _public_entry(provider, definition, config):
 
 async def list_model_catalog(store: ProviderConfigStore):
     snapshot = await asyncio.to_thread(store.get_model_catalog_configs)
-    entries = [_public_entry(key, definition, snapshot["configs"][key]) for key, definition in PROVIDERS.items()]
+    entries = [_public_entry(key, definition, snapshot["configs"][key])
+               for key, definition in PROVIDERS.items() if key != SIWC]
+    service = getattr(store, "openai_siwc", None)
+    if service is not None and service.status()["enabled"]:
+        entries.insert(2, _siwc_entry(service))
     active = next((entry["providerId"] for entry in entries if entry["providerId"] == snapshot["activeProvider"]
                    and entry["configured"] and entry["models"]), "mock")
     return {"activeProvider": active, "providers": entries}
@@ -272,6 +297,14 @@ def _update_model_settings(store, provider, definition, payload):
 
 async def update_model_settings(store: ProviderConfigStore, provider: str, payload=_UNSET):
     definition = _require_provider(provider)
+    if provider == SIWC:
+        service = getattr(store, "openai_siwc", None)
+        if service is None or not isinstance(payload, dict) or set(payload) != {"selectedModel"}:
+            raise ProviderCatalogError("ChatGPT 连接只能通过登录管理。", 400, "SIWC_OAUTH_ONLY")
+        if not isinstance(payload["selectedModel"], str):
+            raise ProviderCatalogError("请从 ChatGPT 的模型目录选择模型。")
+        await service.select_default(payload["selectedModel"])
+        return _siwc_entry(service)
     return await asyncio.to_thread(_update_model_settings, store, provider, definition, {} if payload is _UNSET else payload)
 
 
@@ -395,6 +428,12 @@ async def _fetch_models(provider, definition, config, endpoint, client):
 
 async def sync_provider_models(store: ProviderConfigStore, provider: str, *, client: httpx.AsyncClient | None = None):
     definition = _require_provider(provider)
+    if provider == SIWC:
+        service = getattr(store, "openai_siwc", None)
+        if service is None:
+            raise ProviderCatalogError("当前工作台未启用本机 ChatGPT 登录。", 403, "SIWC_DISABLED")
+        await service.discover()
+        return _siwc_entry(service)
     config = await asyncio.to_thread(store.get_provider_config, provider)
     supported, endpoint, block = _discovery_capability(definition, config["baseUrl"])
     if not supported:

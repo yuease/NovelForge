@@ -6,3 +6,5 @@ __pycache__/
 *.tsbuildinfo
 /web-gemini/dist/
 /logs/
+/rewrites/
+/*.zip

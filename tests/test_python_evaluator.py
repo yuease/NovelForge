@@ -310,6 +310,80 @@ class EvaluationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("严禁凑条数" in system and "不跨章漏修" in system for span, system in seen_systems if span != "pro"))
         self.assertTrue(any("ready_to_submit" in system and "不跨章合并" in system for span, system in seen_systems if span == "pro"))
 
+    async def test_evaluator_readonly_tools_verify_cross_chapter_and_fallback_when_unsupported(self):
+        # 14 chapters with batch_size=4 -> both Flash batches and Pro review have unread chapters outside their prompt.
+        job_id = self.book(14)
+        self.store.save_chapter(job_id, 1, {"title": "第1章 线索", "content": "林默在第一章把银色旧怀表交给了苏红。" + _CHAPTER * 10})
+        self.store.save_chapter(job_id, 12, {"title": "第12章 伏笔", "content": "第十二章苏红拿出那块银色旧怀表。" + _CHAPTER * 10})
+        seen_tool_calls = []
+
+        def handle_with_tools(request):
+            body = json.loads(request.content)
+            msgs = body["messages"]
+            first_user = msgs[1]["content"]
+            found = re.search(r"请审读第\s+(\d+)~(\d+)\s+章全文", first_user)
+            span = f"{found[1]}-{found[2]}" if found else "pro"
+            tool_msgs = [m for m in msgs if m.get("role") == "tool"]
+            self.assertTrue(body.get("tools"))
+            if span == "5-8" and not tool_msgs:
+                return httpx.Response(200, json={"choices": [{
+                    "message": {
+                        "role": "assistant", "content": None,
+                        "tool_calls": [
+                            {"id": "ev_c1", "type": "function",
+                             "function": {"name": "search_manuscript", "arguments": json.dumps({"query": "银色旧怀表"})}},
+                            {"id": "ev_c2", "type": "function",
+                             "function": {"name": "read_chapter", "arguments": json.dumps({"chapter": 1})}},
+                        ],
+                    },
+                    "finish_reason": "tool_calls",
+                }]})
+            if span == "5-8" and tool_msgs:
+                seen_tool_calls.append(("5-8", tool_msgs))
+                self.assertIn("银色旧怀表", tool_msgs[0]["content"])
+                self.assertIn("第1章 线索", tool_msgs[1]["content"])
+                return reply(_batch(span, []))
+            if span == "pro" and not tool_msgs:
+                return httpx.Response(200, json={"choices": [{
+                    "message": {
+                        "role": "assistant", "content": None,
+                        "tool_calls": [{
+                            "id": "ev_pro1", "type": "function",
+                            "function": {"name": "read_chapters_batch", "arguments": json.dumps({"chapters": [11, 12], "query": "旧怀表"})},
+                        }],
+                    },
+                    "finish_reason": "tool_calls",
+                }]})
+            if span == "pro" and tool_msgs:
+                seen_tool_calls.append(("pro", tool_msgs))
+                self.assertIn("拿出那块银色旧怀表", tool_msgs[0]["content"])
+                return reply(_verdict())
+            return reply(_batch(span, []))
+
+        result = await evaluator.evaluate_book(self.store, job_id, batch_size=4, flash_model="f", pro_model="p",
+                                               client=await self.client(handle_with_tools))
+        self.assertEqual([tag for tag, _ in seen_tool_calls], ["5-8", "pro"])
+        self.assertEqual(result["evaluationReport"]["totalChapters"], 14)
+
+        # Verify TOOLS_UNSUPPORTED falls back cleanly on batch 1 and caches disabled status for subsequent batches.
+        fallback_job = self.book(8)
+        sent_tools_flags = []
+
+        def handle_reject_tools(request):
+            body = json.loads(request.content)
+            has_tools = bool(body.get("tools"))
+            sent_tools_flags.append(has_tools)
+            if has_tools:
+                return httpx.Response(400, text='{"error":{"message":"tools parameter not supported"}}')
+            _, _, span, _, _ = _request(request)
+            return reply(_batch(span, []))
+
+        res_fb = await evaluator.evaluate_book(self.store, fallback_job, mode="flash_only", batch_size=4,
+                                               flash_model="legacy-flash", client=await self.client(handle_reject_tools))
+        self.assertEqual(len(res_fb["evaluationReport"]["batchSummaries"]), 2)
+        # Batch 1 tried with tools (400) -> retried without tools -> Batch 2 skipped tools immediately!
+        self.assertEqual(sent_tools_flags, [True, False, False])
+
 
 class EvaluationCompatibilityTests(unittest.TestCase):
     def test_json_fingerprint_and_signals_match_legacy_reports(self):

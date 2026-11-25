@@ -5,6 +5,7 @@ import type {
   ChapterRecord,
   CreateJobInput,
   EvaluationRoundSummary,
+  EditorModelSelection,
   GeneratedConcept,
   HotspotFeedMeta,
   HotspotTrope,
@@ -22,6 +23,7 @@ import type {
   RevisionActionPayload,
   RevisionRun,
   RevisionSelection,
+  SiwcStatus,
   ThinkingMode,
 } from './types'
 
@@ -31,6 +33,7 @@ const roundsPath = (jobId: string, runId: string) =>
 
 export type EditorEvidence = { id: string; label: string; data: Record<string, unknown> }
 export type EditorPlan = {
+  mode?: 'repair' | 'targeted'
   chapters: number[]
   reviewChapters: number[]
   note: string
@@ -39,21 +42,41 @@ export type EditorPlan = {
   expiresAt: number
   dispatched?: boolean
 }
+export type EditorRecoveryPlan = {
+  stage: string
+  stageLabel: string
+  note: string
+  token: string
+  expiresAt: number
+  dispatched?: boolean
+}
+export type EditorPendingFailure = {
+  revisionId: string
+  stage: string
+  stageLabel: string
+  message: string
+  done: number
+  total: number
+  occurredAt?: string
+}
 export type EditorAnswer = {
   reply: string
   evidence: EditorEvidence[]
   plan: EditorPlan | null
+  recoveryPlan?: EditorRecoveryPlan | null
   revisionId: string | null
   candidateTurn: number | null
   source?: 'revision-failure'
   recoveryStatus?: string
 }
 export type EditorTurn = { id: number; question: string; answer: EditorAnswer; createdAt: string }
-export type EditorSettings = { model: RevisionSelection | null }
+export type EditorSettings = { model: EditorModelSelection | null }
 export type EditorSession = EditorSettings & {
   turns: EditorTurn[]
   hasOlder: boolean
   replying: boolean
+  statusMessage?: string | null
+  pendingFailure?: EditorPendingFailure | null
   failureWaitingForModel: boolean
 }
 export type ManuscriptSplitMode = 'auto' | 'single' | 'chunk'
@@ -74,6 +97,15 @@ export type ManuscriptImportResult = {
 export const REVISION_DISPATCHED = 'novelforge:revision-dispatched'
 const editorPath = (jobId: string) => '/jobs/' + encodeURIComponent(jobId) + '/editor-desk'
 
+export class ApiError extends Error {
+  readonly code?: string
+
+  constructor(message: string, code?: string) {
+    super(message)
+    this.code = code
+  }
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, {
     headers: {
@@ -84,20 +116,29 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   })
   if (!res.ok) {
     let errMsg = `请求失败 (${res.status})`
+    let code: string | undefined
     try {
       const data = await res.json()
       if (data?.error) errMsg = data.error
       else if (data?.message) errMsg = data.message
+      if (typeof data?.code === 'string') code = data.code
     } catch {
       const text = await res.text().catch(() => '')
       if (text) errMsg = text
     }
-    throw new Error(errMsg)
+    throw new ApiError(errMsg, code)
   }
   return res.json() as Promise<T>
 }
 
 export const api = {
+  siwcStatus: () => request<SiwcStatus>('/auth/openai-siwc/status'),
+  startSiwc: (mode: 'login' | 'consent' | 'switch') => request<{ url: string }>('/auth/openai-siwc/start', {
+    method: 'POST', body: JSON.stringify({ mode, returnOrigin: window.location.origin }),
+  }),
+  signOutSiwc: () => request<SiwcStatus & { revocationConfirmed: boolean }>('/auth/openai-siwc/sign-out', {
+    method: 'POST',
+  }),
   async getModelCatalog(): Promise<ModelCatalog> {
     return request('/model-catalog')
   },
@@ -288,7 +329,7 @@ export const api = {
     return request(editorPath(jobId) + (before === undefined ? '' : '?before=' + before))
   },
 
-  saveEditorModel(jobId: string, model: RevisionSelection): Promise<EditorSettings> {
+  saveEditorModel(jobId: string, model: EditorModelSelection): Promise<EditorSettings> {
     return request(editorPath(jobId) + '/settings', { method: 'PUT', body: JSON.stringify({ model }) })
   },
 
@@ -302,6 +343,10 @@ export const api = {
 
   dispatchEditorPlan(jobId: string, token: string): Promise<{ revision: RevisionRun }> {
     return request(editorPath(jobId) + '/dispatch', { method: 'POST', body: JSON.stringify({ token }) })
+  },
+
+  dispatchEditorRecovery(jobId: string, token: string): Promise<{ revision: RevisionRun }> {
+    return request(editorPath(jobId) + '/recover', { method: 'POST', body: JSON.stringify({ token }) })
   },
 
   candidateRounds(jobId: string, runId: string): Promise<{ rounds: CandidateEvaluationRound[]; baseline: EvaluationRoundSummary | null }> {
