@@ -352,6 +352,15 @@ def create_app(data_dir: Path | None = None, *, client=None):
         detail = app.state.store.job_detail(job_id)
         return detail if detail else error_response("Job not found", 404)
 
+    @app.patch("/api/jobs/{job_id}/drifts/{drift_id}")
+    async def update_drift(job_id: str, drift_id: str, request: Request):
+        payload = await job_payload(request)
+        status, reason = payload.get("status"), payload.get("reason", "human")
+        if status not in ("dismissed", "deferred") or not isinstance(reason, str) or not reason.strip():
+            return error_response("Expected status dismissed or deferred and a non-empty reason", 400)
+        entry = await asyncio.to_thread(app.state.store.set_drift_status, job_id, drift_id, status, reason.strip())
+        return entry if entry is not None else error_response("Job or drift not found", 404)
+
     @app.get("/api/jobs/{job_id}/workflow")
     async def workflow_snapshot(job_id: str):
         frame = await app.state.worker.read_progress(job_id)

@@ -15,12 +15,13 @@ from .book_plan import (
     volume_ladder_text, volumes_for_range,
 )
 from .draft_quality import STYLE_BIBLE_MARKER, compact_style_bible
+from .drift_repair import quote_span
 from .entity_salience import _mentions, active_subplots_view, entity_index, ranked_entities, retired_character_status, retired_roster
 from .ledger_checks import numeric_claims
 from .llm import STORY_LEDGER_MARKER
 from .long_memory import (
     STORY_CHARACTER_FIELDS, active_memory_items, protagonist_name, relevant_memory_characters,
-    story_ledger_events, story_ledger_view,
+    story_ledger_events, story_ledger_view, unresolved_drifts,
 )
 from .prompt_budget import ARC_PROMPT_BUDGET_EXCEEDED, fit_chapter_prompt, fit_prompt, read_chapter_input_budget
 from .text_evidence import normalize_quote
@@ -857,11 +858,17 @@ def build_arc_outlines_prompt(*, book_plan, canonical_facts, start_chapter, tota
             selected["coreCharacterNames"] = core_names
         system += (_STORY_LEDGER_WRITE +
                    "新配角须避开 coreCharacterNames 中的已有全名，也不要与主角、核心反派高度撞名。"
-                   "previousArcDriftChecks 是上一单元纠偏建议，以当前台账和正文为准，不改写已提交章节。")
-    corrections = []
-    if near and near[0]["endChapter"] == start_chapter - 1:
-        corrections = [{key: row[key] for key in ("chapter", "kind", "issue", "fixHint") if key in row}
-                       for row in _records(near[0].get("driftChecks")) if story_ledger or v2 and row.get("kind") == "canon"][:4]
+                   "previousArcDriftChecks 是尚待处理的纠偏建议，以当前台账和正文为准，不改写已提交章节。")
+    corrections = [row for row in unresolved_drifts(facts, before_chapter=start_chapter)
+                   if facts.get("driftLedger") or story_ledger or v2 and row.get("kind") == "canon"]
+    recent_arcs = {row.get("arc") for row in near}
+    context_terms = _review_terms(context)
+    corrections.sort(key=lambda row: (
+        not context_terms.intersection(_review_terms(f"{row['issue']} {row.get('fixHint', '')}")),
+        row.get("arc") not in recent_arcs,
+    ))
+    corrections = [{key: row[key] for key in ("chapter", "kind", "issue", "fixHint") if key in row}
+                   for row in corrections[:6]]
     if v2:
         system += "\n按各章所属卷执行对应阶梯，允许跨卷的单元须保留跃迁条件；已核实的边界变更自标明章号生效。"
         if not story_ledger and corrections:
@@ -1804,6 +1811,33 @@ def build_fact_extraction_prompt(*, chapter_number, chapter_text, existing_facts
         memory_instructions=memory_instructions,
         memory_spec=memory_spec,
     )
+    return {"system": system, "prompt": prompt}
+
+
+def build_drift_patch_prompt(*, chapter, drifts, book_plan=None, ledger_view=None, boundary_state=()):
+    text = chapter.get("content") or ""
+    windows = []
+    for drift in drifts[:3]:
+        if span := quote_span(drift.get("quote"), text):
+            start, end = span
+            windows.append({**{key: drift[key] for key in ("id", "kind", "issue", "fixHint", "quote")},
+                            "window": text[max(0, start - 600):end + 600]})
+    locks = canon_locks_text(_dict(book_plan).get("canonLocks"), boundary_state=boundary_state)
+    baseline = _dict(ledger_view)
+    context = " ".join(window["window"] for window in windows)
+    balances = _records(baseline.get("ledgerBalances"))
+    balances = _pick_relevant(balances, context, 6, lambda row: row.get("label") or "")
+    material = {"ledgerBalances": [{key: row[key] for key in ("label", "value", "updatedAtChapter") if key in row}
+                                   for row in balances], "storyClock": _dict(baseline.get("storyClock"))}
+    system = (
+        "[TASK:DRIFT_PATCH]\n你负责在给定原文窗口内核实并局部修正单元归档发现的偏差。"
+        "每条偏差最多一个补丁。只有问题有正文和口径依据且可局部修正时填 confirmed 为 true，否则填 false。"
+        "find 必须逐字引用唯一原文并包含给定引句，至多200字。只改必要字词，保留段落、文风和章末钩子。"
+        "不要更动与该偏差无关的事实。仅返回严格 JSON，reason 不超过40字。"
+    )
+    schema = '{"patches":[{"driftId":"...","confirmed":true,"find":"包含引句的原文","replace":"局部修正","reason":"修正依据"}]}'
+    prompt = (f"第{chapter['chapterNumber']}章局部纠偏\n{locks}\n【章前台账】{_json(material)}\n"
+              f"【偏差与局部窗口】{_json(windows)}\n【输出】{schema}")
     return {"system": system, "prompt": prompt}
 
 

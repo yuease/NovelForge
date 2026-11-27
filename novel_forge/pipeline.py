@@ -7,6 +7,7 @@ import random
 import re
 import unicodedata
 import time
+from collections import Counter
 from contextlib import aclosing
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
@@ -19,14 +20,16 @@ from .book_plan import (
     PLAN_VERSION_V2, BookPlanValidationError, collect_boundary_state, is_v2_book_plan, validate_book_plan, volume_for_chapter,
     verified_boundary_changes,
 )
-from .chapter_style import can_save_unverified_draft, normalize_mock_chapter_prose, reaction_counts
+from .chapter_style import can_save_unverified_draft, normalize_mock_chapter_prose, reaction_counts, run_deterministic_checks
 from .chapter_title import clean_retitle, local_retitle, strip_conflicting_number, title_body_conflicts
 from .docx_export import DOCX_CONTENT_TYPE, FANQIE_SIZE_LIMIT, build_fanqie_docx, format_fanqie_chapter_title, split_fanqie_paragraphs
 from .draft_quality import clean_chapter_draft, normalize_style_bible, strip_draft_headings
+from .drift_repair import apply_text_patches, classify_drifts, downstream_light_check, identity_alias_conflicts, touches_fact_evidence
 from .evaluator import evaluate_book
 from .hotspots import HotspotsFeed, select_or_generate_concept
+from .ledger_checks import assess_ledger_delta
 from .llm import DEFAULT_MAX_TOKENS, LLMError, build_mock_volume_summary, call_llm, output_was_truncated, protected_output_budget
-from .long_memory import normalize_volume_summary
+from .long_memory import drift_ledger, normalize_memory_delta, normalize_volume_summary, story_ledger_view
 from .memes import MemeStore
 from .prompt_budget import ARC_PROMPT_BUDGET_EXCEEDED, DEFAULT_ARC_INPUT_BUDGET, read_arc_input_budget, read_review_input_budget
 from .prompts import (
@@ -36,6 +39,7 @@ from .prompts import (
     build_book_plan_prompt,
     build_chapter_outlines_prompt,
     build_chapter_write_prompt,
+    build_drift_patch_prompt,
     build_fact_extraction_prompt,
     build_full_book_audit_prompt,
     build_retitle_prompt,
@@ -45,7 +49,7 @@ from .prompts import (
     read_writing_options as read_prompt_writing_options,
 )
 from .providers import get_provider_definition, is_masked_api_key, same_endpoint_origin, thinking_capability
-from .storage import _is_committed, arc_context_version, count_chinese_words, public_job, volume_source_hash
+from .storage import _archive_touches, _is_committed, arc_context_version, count_chinese_words, public_job, replace_drift_fact_deltas, volume_source_hash
 from .thinking_policy import resolve_writing_thinking, writing_profile
 from .verifier import (
     _llm_options, parse_json_from_llm, recheck_downstream_chapters,
@@ -137,6 +141,18 @@ def _summary(outline, chapter_text):
     tail = " ... " + _excerpt(clean, 70, tail=True) if _utf16_length(clean) > 180 else ""
     base = str(_dict(outline).get("summary") or "").strip()
     return f"{base} [正文节选: {head}{tail}]".strip()
+
+
+def _drift_repair_enabled():
+    return os.environ.get("NOVEL_FORGE_DRIFT_REPAIR", "1").strip() != "0"
+
+
+def _new_hard_conflicts(before, after):
+    def keys(issues):
+        return Counter(tuple(issue.get(field) for field in ("type", "rule", "chapter", "message", "scope", "alias", "character", "quote"))
+                       for issue in issues if issue.get("severity") == "error")
+
+    return bool(keys(after) - keys(before))
 
 
 def _plan_audit_evidence(plan, chapters):
@@ -552,6 +568,8 @@ class PipelineRuntime:
                 await self._patch_llm(job, _dict(llm_config))
             checkpoint = {"stage": "chapter_outlines", "nextOutlineChapter": previous + 1, "nextChapter": previous + 1,
                           "completedChapter": _number(job.get("completedChapters")), "savedAt": _now()}
+            if draft := _dict(job.get("checkpoint")).get("driftRepairDraft"):
+                checkpoint["driftRepairDraft"] = draft
             patch = {
                 "stage": "chapter_outlines", "totalChapters": total, "targetWords": total_words, "bookPlan": plan,
                 "continuationDirection": direction or job.get("continuationDirection") or "", "extendedFromChapter": previous,
@@ -937,13 +955,14 @@ class PipelineRuntime:
         return saved
 
     async def _plan_arc(self, job, arcs, outlines, start, config, archive_config, *, story_ledger=False,
-                        long_memory=False, arc_input_budget=DEFAULT_ARC_INPUT_BUDGET):
+                        long_memory=False, arc_input_budget=DEFAULT_ARC_INPUT_BUDGET, committed=None):
         job_id, total = job["id"], job["totalChapters"]
         checkpoint = {"stage": "chapter_outlines", "nextChapter": start, "nextOutlineChapter": start,
                       "completedChapter": start - 1}
         await self._checkpoint(job_id, **checkpoint)
-        await self._refresh_arc_archives(job_id, arcs, start, archive_config,
-                                         story_ledger=story_ledger, book_plan=job.get("bookPlan"))
+        repaired = await self._refresh_arc_archives(job_id, arcs, start, archive_config,
+                                                   story_ledger=story_ledger, book_plan=job.get("bookPlan"),
+                                                   committed=committed, outlines=outlines)
         plan = job["bookPlan"]
         preceding = await asyncio.to_thread(self.store.get_chapters, job_id, end_chapter=start - 1)
         preceding = [row for row in preceding if _is_committed(row)]
@@ -998,7 +1017,7 @@ class PipelineRuntime:
             arcs.append(arc)
             outlines.update((row["chapterNumber"], row) for row in batch)
             await self._log(job_id, "info", "chapter_outlines", f"已锁定第 {start}–{arc['endChapter']} 章单元「{arc['arcTitle']}」。")
-            return
+            return repaired
         raise LLMError(f"第 {start} 章起的单元章纲未通过校验：{error} 已保存断点，可继续补齐。",
                        code="OUTLINE_PARSE_FAILED", status=502, retryable=True)
 
@@ -1045,6 +1064,13 @@ class PipelineRuntime:
         }
         reaction_cache = {number: reaction_counts(chapter.get("content") or "") for number, chapter in committed.items()}
         running_words = sum(_word_count(chapter) for chapter in committed.values())
+
+        def remember_repairs(repaired):
+            nonlocal running_words
+            if repaired:
+                reaction_cache.update((row["chapterNumber"], reaction_counts(row["content"])) for row in repaired)
+                running_words = sum(_word_count(chapter) for chapter in committed.values())
+
         first_missing = next((number for number in range(1, total + 1) if number not in committed), total + 1)
         profile = job.get("writingProfile")
         if thinking_warnings is None:
@@ -1081,7 +1107,8 @@ class PipelineRuntime:
                 n not in existing or (legacy_outline_placeholder(existing[n], n) and n not in committed)
                 for n in range(1, historical_tail + 1)
             ))
-            pending_archives = await self._pending_arc_archives(job_id, arcs, first_missing) if first_missing <= total else []
+            pending_archives = await self._pending_arc_archives(job_id, arcs, first_missing,
+                                                               pending_only=first_missing > total)
             in_outlines = False
             if need_historical:
                 yield {"phase": "outlines"}
@@ -1092,12 +1119,15 @@ class PipelineRuntime:
             if pending_archives:
                 yield {"phase": "archive", "chapter": pending_archives[-1]["endChapter"]}
                 in_outlines = False
-                await self._refresh_arc_archives(job_id, arcs, first_missing, archive_config,
-                                                 story_ledger=story_ledger, book_plan=job.get("bookPlan"))
+                remember_repairs(await self._refresh_arc_archives(
+                    job_id, pending_archives, first_missing, archive_config, story_ledger=story_ledger,
+                    book_plan=plan, committed=committed, outlines=outlines,
+                ))
             if first_missing <= total and first_missing not in outlines:
                 if not in_outlines:
                     yield {"phase": "outlines", **({"chapter": first_missing} if first_missing > 1 else {})}
-                await self._plan_arc(job, arcs, outlines, first_missing, config, archive_config, **arc_options)
+                remember_repairs(await self._plan_arc(job, arcs, outlines, first_missing, config, archive_config,
+                                                      committed=committed, **arc_options))
             elif not in_outlines and not pending_archives:
                 yield {"phase": "outlines"}
             job = await self._set_stage(job_id, "chapter_writing", 15 if _number(job.get("progress")) < 15 else None)
@@ -1107,7 +1137,8 @@ class PipelineRuntime:
                 continue
             if rolling and number not in outlines:
                 yield {"phase": "outlines", "chapter": number}
-                await self._plan_arc(job, arcs, outlines, number, config, archive_config, **arc_options)
+                remember_repairs(await self._plan_arc(job, arcs, outlines, number, config, archive_config,
+                                                      committed=committed, **arc_options))
                 await self._set_stage(job_id, "chapter_writing")
             outline = outlines[number]
             next_outline = max(outlines) + 1 if rolling else None
@@ -1261,7 +1292,8 @@ class PipelineRuntime:
             if archive_arc or archive_volume:
                 yield {"phase": "archive", "chapter": number if archive_arc else volume_end}
             if archive_arc:
-                await self._archive_arc(job_id, arc, archive_config, story_ledger=story_ledger, book_plan=job.get("bookPlan"))
+                remember_repairs(await self._archive_arc(job_id, arc, archive_config, story_ledger=story_ledger,
+                                                         book_plan=plan, committed=committed, outlines=outlines))
             if options["long_memory"]:
                 await self._catch_up_volumes(job_id, volume_end if archive_volume else number, committed, auxiliary)
             if (archive_arc or archive_volume) and number < total and number + 1 in outlines:
@@ -1291,13 +1323,14 @@ class PipelineRuntime:
         yield {"phase": "finish"}
         await self._finish(job, config, report, gate)
 
-    async def _reconcile_title(self, job_id, number, planned_title, body, recent_titles, auxiliary) -> tuple[str, dict | None]:
+    async def _reconcile_title(self, job_id, number, planned_title, body, recent_titles, auxiliary, *,
+                               allow_llm=True) -> tuple[str, dict | None]:
         conflicts = title_body_conflicts(planned_title, body)
         if not conflicts:
             return planned_title, None
         fixed = local_retitle(planned_title, conflicts, body)
         method = "local"
-        if fixed is None:
+        if fixed is None and allow_llm:
             request = build_retitle_prompt(planned_title=planned_title, conflicts=conflicts, chapter_text=body,
                                            recent_titles=recent_titles)
             try:
@@ -1309,8 +1342,8 @@ class PipelineRuntime:
             if (2 <= len(candidate) <= 30 and _title_key(candidate) not in normalized_recent
                     and not output_was_truncated(reply.get("finishReason")) and not title_body_conflicts(candidate, body)):
                 fixed, method = candidate, "llm"
-            elif (candidate := strip_conflicting_number(planned_title, conflicts)) and not title_body_conflicts(candidate, body):
-                fixed, method = candidate, "strip"
+        if fixed is None and (candidate := strip_conflicting_number(planned_title, conflicts)) and not title_body_conflicts(candidate, body):
+            fixed, method = candidate, "strip"
         if fixed is None:
             await self._log(job_id, "warn", "chapter_writing", f"第{number}章章名数值与正文冲突，已保留原章名。")
             return planned_title, None
@@ -1367,14 +1400,21 @@ class PipelineRuntime:
             tokenUsage=job.get("tokenUsage"), stageStats=job.get("stageStats"))
         return chapter
 
-    async def _pending_arc_archives(self, job_id, arcs, before):
+    async def _pending_arc_archives(self, job_id, arcs, before, *, pending_only=False):
         preceding = [arc for arc in arcs if arc["endChapter"] < before]
         if not preceding:
             return []
         facts = await asyncio.to_thread(self.store.get_canonical_facts, job_id)
-        archived = {(row.get("arc"), row["startChapter"], row["endChapter"]) for row in prior_arc_summaries(facts, before)
-                    if row.get("sourceHash")}
-        return [arc for arc in preceding if (arc["arcIndex"], arc["startChapter"], arc["endChapter"]) not in archived]
+        archived = {(row.get("arc"), row["startChapter"], row["endChapter"]): row
+                    for row in prior_arc_summaries(facts, before) if row.get("sourceHash")}
+        pending = []
+        for arc in preceding:
+            summary = archived.get((arc["arcIndex"], arc["startChapter"], arc["endChapter"]))
+            if summary is None and not pending_only or (
+                summary and _drift_repair_enabled() and _dict(summary.get("driftRepair")).get("state") == "pending"
+            ):
+                pending.append(arc)
+        return pending
 
     async def _needs_volume_archive(self, job_id, start, end, chapters):
         source_hash = volume_source_hash(chapters)
@@ -1390,11 +1430,15 @@ class PipelineRuntime:
             if len(volume) == 10 and await self._needs_volume_archive(job_id, start, end, volume):
                 await self._archive(job_id, start, end, volume, config)
 
-    async def _refresh_arc_archives(self, job_id, arcs, before, config, *, story_ledger=False, book_plan=None):
+    async def _refresh_arc_archives(self, job_id, arcs, before, config, *, story_ledger=False, book_plan=None,
+                                    committed=None, outlines=None):
+        repaired = []
         for arc in await self._pending_arc_archives(job_id, arcs, before):
-            await self._archive_arc(job_id, arc, config, story_ledger=story_ledger, book_plan=book_plan)
+            repaired.extend(await self._archive_arc(job_id, arc, config, story_ledger=story_ledger, book_plan=book_plan,
+                                                    committed=committed, outlines=outlines))
+        return repaired
 
-    async def _archive_arc(self, job_id, arc, config, *, story_ledger=False, book_plan=None):
+    async def _archive_arc(self, job_id, arc, config, *, story_ledger=False, book_plan=None, committed=None, outlines=None):
         start, end = arc["startChapter"], arc["endChapter"]
         source_error = f"第 {start}–{end} 章正文未齐或在归档期间发生变化，请从断点继续。"
         chapters = await asyncio.to_thread(self.store.get_chapters, job_id, start_chapter=start, end_chapter=end)
@@ -1406,7 +1450,8 @@ class PipelineRuntime:
         if any(row.get("arc") == arc["arcIndex"] and row.get("sourceHash") == source_hash
                and row["startChapter"] == start and row["endChapter"] == end
                for row in prior_arc_summaries(facts, end + 1)):
-            return
+            return await self._repair_arc_drifts(job_id, arc, config, story_ledger=story_ledger, book_plan=book_plan,
+                                                 committed=committed, outlines=outlines)
         await self._set_stage(job_id, "arc_archive")
         arc_label = f"「{arc['arcTitle']}」" if arc.get("arcTitle") else ""
         await self._log(job_id, "info", "arc_archive", f"正在归档第 {start}–{end} 章剧情单元{arc_label}...")
@@ -1426,6 +1471,212 @@ class PipelineRuntime:
                             story_ledger=story_ledger, plan_canon=plan_canon):
             raise LLMError(source_error, code="ARC_SOURCE_CHANGED", status=409, retryable=True)
         await self._log(job_id, "info", "arc_archive", f"已完成第 {start}–{end} 章单元归档。")
+        return await self._repair_arc_drifts(job_id, arc, config, story_ledger=story_ledger, book_plan=book_plan,
+                                             committed=committed, outlines=outlines)
+
+    async def _repair_arc_drifts(self, job_id, arc, config, *, story_ledger=False, book_plan=None,
+                                 committed=None, outlines=None) -> list[dict]:
+        if not _drift_repair_enabled():
+            return []
+        job = await asyncio.to_thread(self.store.get_job_record, job_id)
+        facts = _dict(job.get("canonicalFacts"))
+        archive = next((row for row in prior_arc_summaries(facts, arc["endChapter"] + 1)
+                        if (row.get("arc"), row["startChapter"], row["endChapter"]) == (
+                            arc["arcIndex"], arc["startChapter"], arc["endChapter"]
+                        ) and _dict(row.get("driftRepair")).get("state") == "pending"), None)
+        if archive is None:
+            return []
+        source_hash = archive["sourceHash"]
+        saved = {row["chapterNumber"]: row for row in await asyncio.to_thread(self.store.get_chapters, job_id) if _is_committed(row)}
+        chapters = [row for n, row in saved.items() if arc["startChapter"] <= n <= arc["endChapter"]]
+
+        async def source_changed():
+            await self._log(job_id, "info", "arc_archive", "纠偏期间正文或归档状态发生变化，已保留当前稿。",
+                            {"arc": arc["arcIndex"], "reason": "source_changed"})
+            return []
+
+        if volume_source_hash(chapters) != source_hash:
+            return await source_changed()
+        book_plan = book_plan if book_plan is not None else job.get("bookPlan")
+        options = read_writing_options(job)
+        ledger = drift_ledger(facts)
+        queue, deferred = classify_drifts(archive, chapters, facts=facts, book_plan=book_plan,
+                                          latest_committed=max(saved, default=None), ledger=ledger,
+                                          total_chapters=job["totalChapters"])
+        by_arc = _dict(_dict(job.get("checkpoint")).get("driftRepairDraft"))
+        cache = _dict(_dict(by_arc.get(str(arc["arcIndex"]))).get(source_hash))
+        tries = archive["driftRepair"].get("tries", 0)
+        retry_config = {**config, "retries": 0}
+
+        async def save(patches, deltas, updates, state):
+            return await _write(self.store.apply_arc_drift_repairs, job_id, arc, expected_source_hash=source_hash,
+                                patched_chapters=patches, updated_facts_deltas=deltas, ledger_updates=updates,
+                                drift_repair_state=state)
+
+        while True:
+            try:
+                patches, deltas, updates = await self._draft_arc_drift_repairs(
+                    job, arc, source_hash, queue, cache, saved, facts, retry_config, book_plan=book_plan,
+                    story_ledger=story_ledger, long_memory=options["long_memory"], outlines=outlines or _saved_outlines(job),
+                    verify_input_budget=options["verify_input_budget"],
+                )
+                break
+            except LLMError as error:
+                if error.code == "DRIFT_SOURCE_CHANGED":
+                    return await source_changed()
+                tries += 1
+                if not error.retryable or tries >= 2:
+                    patches, deltas = [], {}
+                    updates = [{"id": row["id"], "status": "deferred", "reason": "repair_unavailable", "autoRepairAttempts": 1}
+                               for group in queue for row in group["drifts"]]
+                    break
+                if await save([], {}, [], {"state": "pending", "tries": tries}) is None:
+                    return await source_changed()
+
+        numbers = {row["chapterNumber"] for row in patches}
+        state = {"state": "done", "tries": tries, "round": 1, "chapters": sorted(numbers), "at": _now()}
+        result = await save(patches, deltas, [*deferred, *updates], state)
+        if result is None:
+            return await source_changed()
+        repaired = [row for row in result["chapters"] if row["chapterNumber"] in numbers]
+        saved.update((row["chapterNumber"], row) for row in repaired)
+        if committed is not None:
+            committed.update((row["chapterNumber"], row) for row in repaired)
+        self._publish(job_id, "facts:updated", chapterNumber=arc["endChapter"], canonicalFacts=result["canonicalFacts"])
+        if numbers and any(_archive_touches(volume, numbers) for volume in _list(facts.get("volumeSummaries"))):
+            llm = _dict(job.get("llmConfig"))
+            volume_config = {**config, "model": llm.get("lightModel") or llm.get("model") or config.get("model")}
+            await self._catch_up_volumes(job_id, max(saved), saved, volume_config)
+        return repaired
+
+    async def _draft_arc_drift_repairs(self, job, arc, source_hash, queue, cache, chapters, facts, config, *,
+                                       book_plan, story_ledger, long_memory, outlines, verify_input_budget):
+        job_id = job["id"]
+        previous_deltas = {row["chapter"]: _dict(row.get("delta")) for row in _list(facts.get("factHistory"))}
+        patches, deltas, updates = [], {}, []
+        candidate_facts = facts
+        for group in sorted(queue, key=lambda row: row["chapter"]):
+            number, drifts = group["chapter"], group["drifts"]
+            chapter = chapters[number]
+            key = str(number)
+            record = cache.setdefault(key, {})
+            view = story_ledger_view(candidate_facts, chapter_number=number, book_plan=book_plan)
+            if "patches" not in record:
+                boundary_state = collect_boundary_state(chapters.values(), before_chapter=number, book_plan=book_plan)
+                prompt = build_drift_patch_prompt(chapter=chapter, drifts=drifts, book_plan=book_plan,
+                                                 ledger_view=view, boundary_state=boundary_state)
+                started = time.monotonic()
+                reply = await self._request_drift_patch(job_id, config, prompt)
+                raw = None if output_was_truncated(reply.get("finishReason")) else parse_json_from_llm(reply.get("text"))
+                await self._save_drift_draft(job_id, arc, source_hash, number, record, {"patches": _list(_dict(raw).get("patches"))})
+                await self._record_usage(job_id, "drift_patch", reply.get("usage"), reply.get("durationMs") or _elapsed(started),
+                                         model=config.get("model") or config.get("provider"))
+
+            text = chapter["content"]
+            body, accepted, rejected = apply_text_patches(text, record["patches"], {row["id"]: row for row in drifts},
+                                                         chapter_number=number, book_plan=book_plan)
+            outcomes = {row["id"]: {"id": row["id"], "status": "deferred", "reason": "patch_regressed",
+                                    "autoRepairAttempts": 1} for row in drifts}
+            for row in rejected:
+                identifier = row.get("driftId")
+                if isinstance(identifier, str) and identifier in outcomes:
+                    outcomes[identifier]["reason"] = row["reason"]
+            updates.extend(outcomes.values())
+            if not accepted:
+                continue
+            for row in accepted:
+                outcomes[row["driftId"]]["reason"] = "patch_regressed"
+
+            check_args = {"chapter_number": number, "canonical_facts": candidate_facts, "pov": job.get("pov") or "第三人称限知",
+                          "min_words": 0, "book_plan": book_plan}
+            before = run_deterministic_checks(chapter_text=text, **check_args)["issues"]
+            after = run_deterministic_checks(chapter_text=body, **check_args)["issues"]
+            before += identity_alias_conflicts(text, candidate_facts, book_plan, chapter_number=number)
+            after += identity_alias_conflicts(body, candidate_facts, book_plan, chapter_number=number)
+            if _new_hard_conflicts(before, after):
+                continue
+
+            old_delta = previous_deltas.get(number, {})
+            delta = old_delta
+            refresh_delta = touches_fact_evidence(text, accepted, old_delta)
+            if refresh_delta:
+                delta = await self._extract_drift_facts(
+                    job_id, arc, source_hash, number, record, body, candidate_facts, config,
+                    book_plan=book_plan, outline=outlines.get(number), story_ledger=story_ledger,
+                    long_memory=long_memory, input_budget=verify_input_budget,
+                )
+            before = assess_ledger_delta(old_delta, text, view, book_plan=book_plan)
+            after = assess_ledger_delta(delta, body, view, book_plan=book_plan)
+            if _new_hard_conflicts(before["issues"], after["issues"]):
+                continue
+
+            next_facts = candidate_facts
+            if refresh_delta:
+                delta = {key: value for key, value in after["cleanedDelta"].items() if key != "memory"}
+                memory = normalize_memory_delta(after["cleanedDelta"].get("memory"), number, body, story_ledger=story_ledger,
+                                                long_memory=long_memory, book_plan=book_plan,
+                                                history=candidate_facts.get("factHistory") or [])
+                if memory:
+                    delta["memory"] = memory
+                next_facts = replace_drift_fact_deltas(candidate_facts, {number: delta}, timestamp=_now(), book_plan=book_plan)
+            following = [chapters[n] for n in range(number + 1, arc["endChapter"] + 1)]
+            if _new_hard_conflicts(downstream_light_check(following, candidate_facts, book_plan),
+                                   downstream_light_check(following, next_facts, book_plan)):
+                for row in accepted:
+                    outcomes[row["driftId"]]["reason"] = "cascade"
+                continue
+
+            title, check = chapter["title"], chapter.get("titleCheck")
+            if title_body_conflicts(title, body) != title_body_conflicts(title, text):
+                title, check = await self._reconcile_title(job_id, number, title, body,
+                                                           _recent_titles(chapters.values(), number), config, allow_llm=False)
+            verification = chapter.get("verification")
+            if isinstance(verification, dict):
+                verification = {**verification, "wordCount": count_chinese_words(body)}
+                if "boundaryChanges" in verification:
+                    verification["boundaryChanges"] = verified_boundary_changes(verification["boundaryChanges"],
+                                                                                 book_plan=book_plan, chapter_text=body)
+            outline = outlines.get(number) or {"summary": (chapter.get("summary") or "").partition(" [正文节选:")[0]}
+            patch = {"chapterNumber": number, "title": title, "content": body, "summary": _summary(outline, body),
+                     "verification": verification}
+            if check is not None or "titleCheck" in chapter:
+                patch["titleCheck"] = check
+            patches.append(patch)
+            candidate_facts = next_facts
+            if refresh_delta:
+                deltas[number] = delta
+            for row in accepted:
+                outcomes[row["driftId"]].update(status="repaired", reason="auto_repair",
+                                                resolution={"by": "auto", "at": _now(), "patchReason": str(row.get("reason") or "")[:40]})
+        return patches, deltas, updates
+
+    async def _request_drift_patch(self, job_id, config, prompt):
+        options = {**_llm_options(config), "retries": 0, "max_tokens": 2400, "apply_output_floor": False}
+        return await call_llm(**options, **prompt, temperature=0.1, cache_key=f"nf-drift-{job_id}"[:64],
+                              store=self.store, client=self.client)
+
+    async def _save_drift_draft(self, job_id, arc, source_hash, number, record, draft):
+        saved = await _write(self.store.save_drift_repair_draft, job_id, arc, source_hash, number, draft)
+        if saved is None:
+            raise LLMError("纠偏期间归档已变化。", code="DRIFT_SOURCE_CHANGED", status=409)
+        record.update(saved)
+
+    async def _extract_drift_facts(self, job_id, arc, source_hash, number, record, body, facts, config, *,
+                                   book_plan, outline, story_ledger, long_memory, input_budget):
+        body_hash = volume_source_hash([{"chapterNumber": number, "content": body}])
+        if record.get("factsSourceHash") == body_hash and isinstance(record.get("factsDelta"), dict):
+            return record["factsDelta"]
+        prompt = build_fact_extraction_prompt(
+            chapter_number=number, chapter_text=body, outline=outline, canonical_facts=facts, story_ledger=story_ledger,
+            long_memory=long_memory, book_plan=book_plan, input_budget=input_budget,
+        )
+        reply = await self._llm(job_id, "fact_extraction", config, prompt, 0.2)
+        delta = None if output_was_truncated(reply.get("finishReason")) else parse_json_from_llm(reply.get("text"))
+        if not isinstance(delta, dict):
+            raise LLMError("局部纠偏后的事实提取无效。", code="DRIFT_FACTS_INVALID", status=502, retryable=True)
+        await self._save_drift_draft(job_id, arc, source_hash, number, record,
+                                    {"factsSourceHash": body_hash, "factsDelta": delta})
+        return record["factsDelta"]
 
     async def _archive(self, job_id, start, end, volume, config):
         source_hash = volume_source_hash(volume)

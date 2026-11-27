@@ -121,7 +121,8 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
                 calls.clear()
                 job_id = self.book(8, provider="deepseek")
                 env = {"NOVEL_FORGE_ROLLING_ARC_OUTLINES": "1", "NOVEL_FORGE_LONG_MEMORY": "0",
-                       "NOVEL_FORGE_STORY_LEDGER": enabled, "NOVEL_FORGE_ARC_REVIEW_MODEL": "  strong-arc-model  "}
+                       "NOVEL_FORGE_STORY_LEDGER": enabled, "NOVEL_FORGE_ARC_REVIEW_MODEL": "  strong-arc-model  ",
+                       "NOVEL_FORGE_DRIFT_REPAIR": "0"}
                 with patch.dict(os.environ, env):
                     await self.walk(job_id, runtime)
                 job = self.saved_job(job_id)

@@ -16,12 +16,16 @@ from tempfile import NamedTemporaryFile
 
 from .arc_planning import legacy_outline_placeholder, prior_arc_summaries, saved_arc_plans
 from .book_plan import collect_boundary_state
-from .long_memory import empty_long_memory, normalize_arc_summary, normalize_memory_delta, normalize_volume_summary, replay_long_memory
+from .long_memory import (
+    drift_ledger, empty_long_memory, merge_drift_entries, normalize_arc_summary, normalize_memory_delta,
+    normalize_volume_summary, replay_long_memory, unresolved_drifts,
+)
 from .openai_siwc import PROVIDER as SIWC, RESOURCE as SIWC_RESOURCE
 from .providers import (
     PROVIDERS, ProviderCatalogError, get_provider_definition, is_masked_api_key, mask_api_key,
     normalize_model_ids, provider_requires_key, same_endpoint_origin,
 )
+from .text_evidence import locate_quote, normalize_quote
 
 log = logging.getLogger(__name__)
 
@@ -177,6 +181,7 @@ def arc_context_version(facts, preceding, before, *, boundary_state=()):
               if isinstance(row, dict) and _number(row.get("endChapter"), math.inf) < before),
         volume_source_hash(preceding[-5:]),
         *([_json(list(boundary_state))] if boundary_state else []),
+        _json(unresolved_drifts(facts, before_chapter=before)),
     )
 
 
@@ -204,6 +209,19 @@ def _invalidate_archives(facts, chapters):
         **facts, **{kind: [row for row in _list(facts.get(kind)) if not _archive_touches(row, chapters)]
                    for kind in ("volumeSummaries", "arcSummaries") if kind in facts},
     }
+
+
+def _refresh_drift_ledger(facts, changed_chapters_map):
+    ledger = drift_ledger(facts)
+    if not ledger:
+        return facts
+    sources = {number: normalize_quote(chapter["content"]) for number, chapter in changed_chapters_map.items()}
+    return {**facts, "driftLedger": [
+        {**row, "status": "dismissed", "reason": "source_changed"}
+        if row["status"] in ("open", "deferred") and row["chapter"] in sources
+        and not (isinstance(row.get("quote"), str) and locate_quote(row["quote"], sources[row["chapter"]])) else row
+        for row in ledger
+    ]}
 
 
 def _job_record(data, config, now):
@@ -584,12 +602,16 @@ class Store:
                                                                long_memory, chapter["content"], now, story_ledger=story_ledger,
                                                                book_plan=job.get("bookPlan"))
             current = _dict(job.get("canonicalFacts"))
+            content_changed = previous and previous.get("content") != chapter["content"]
+            if content_changed and drift_ledger(current):
+                updated["canonicalFacts"] = _refresh_drift_ledger(updated["canonicalFacts"], {number: chapter})
             archives = [*_list(current.get("volumeSummaries")), *_list(current.get("arcSummaries"))]
             if any(_archive_touches(archive, [number]) for archive in archives):
                 if (any(previous.get(key) != chapter[key] for key in ("title", "content", "summary"))
                         or (previous.get("status") == "needs_review") != (chapter["status"] == "needs_review")
                         or (_is_committed(previous) and not _is_committed(chapter))):
-                    updated["canonicalFacts"] = _invalidate_archives(_dict(updated.get("canonicalFacts")), [number])
+                    facts = _refresh_drift_ledger(_dict(updated.get("canonicalFacts")), {})
+                    updated["canonicalFacts"] = _invalidate_archives(facts, [number])
             self._write_chapter(db, job_id, chapter)
             self._write_job(db, updated)
         return chapter, _canonical_facts(updated.get("canonicalFacts"))
@@ -663,7 +685,7 @@ class Store:
     def save_checkpoint(self, job_id, checkpoint, *, outlines=None):
         with self._write() as db:
             job = self._get_job(db, job_id, required=True)
-            saved = {**checkpoint, "savedAt": _now()}
+            saved = _checkpoint_with_drift_draft(job, checkpoint, _now())
             if outlines is not None:
                 job["outlines"] = outlines
             self._write_job(db, {**job, "checkpoint": saved, "updatedAt": saved["savedAt"]})
@@ -703,7 +725,7 @@ class Store:
             previous.update((row["chapterNumber"], row) for row in outlines)
             now = _now()
             self._write_job(db, {**job, "arcPlans": [*plans, arc], "outlines": [previous[n] for n in sorted(previous)],
-                                 "checkpoint": {**checkpoint, "savedAt": now}, "updatedAt": now})
+                                 "checkpoint": _checkpoint_with_drift_draft(job, checkpoint, now), "updatedAt": now})
             return True
 
     def save_arc_summary(self, job_id, arc, source_hash, summary, *, story_ledger=False, plan_canon=False):
@@ -728,12 +750,129 @@ class Store:
             if normalized is None:
                 return False
             review = [row["chapterNumber"] for row in chapters if row.get("status") == "needs_review"]
+            drifts = normalized.get("driftChecks", [])
+            now = _now()
+            facts["driftLedger"] = merge_drift_entries(drift_ledger(facts), arc_index=index, drifts=drifts,
+                                                        source_hash=source_hash, timestamp=now)
             record = {"arc": index, "startChapter": start, "endChapter": end, "sourceHash": source_hash, **normalized,
+                      "driftRepair": {"state": "pending" if drifts else "done", "tries": 0},
                       **({"needsReviewChapters": review} if review else {})}
             facts["arcSummaries"] = sorted([row for row in archives if isinstance(row, dict) and row.get("arc") != index] + [record],
                                            key=lambda row: _number(row.get("endChapter")))
-            self._write_job(db, {**job, "canonicalFacts": facts, "updatedAt": _now()})
+            checkpoint = _dict(job.get("checkpoint"))
+            if str(index) in _dict(checkpoint.get("driftRepairDraft")):
+                _clear_drift_draft(checkpoint, index)
+            self._write_job(db, {**job, "canonicalFacts": facts, "updatedAt": now})
             return True
+
+    @staticmethod
+    def _pending_drift_archive(facts, arc, source_hash):
+        return next((row for row in facts["arcSummaries"]
+                     if (row.get("arc"), row.get("startChapter"), row.get("endChapter"), row.get("sourceHash")) == (
+                         arc["arcIndex"], arc["startChapter"], arc["endChapter"], source_hash
+                     ) and _dict(row.get("driftRepair")).get("state") == "pending"), None)
+
+    def save_drift_repair_draft(self, job_id, arc, source_hash, chapter, draft):
+        with self._write() as db:
+            job = self._get_job(db, job_id, required=True)
+            facts = _canonical_facts(job.get("canonicalFacts"))
+            if self._pending_drift_archive(facts, arc, source_hash) is None:
+                return None
+            checkpoint = _dict(job.get("checkpoint")).copy()
+            cache = checkpoint.setdefault("driftRepairDraft", {})
+            chapters = cache.setdefault(str(arc["arcIndex"]), {}).setdefault(source_hash, {})
+            saved = chapters.setdefault(str(chapter), {})
+            saved.update(draft)
+            checkpoint["savedAt"] = now = _now()
+            self._write_job(db, {**job, "checkpoint": checkpoint, "updatedAt": now})
+            return saved
+
+    def apply_arc_drift_repairs(self, job_id, arc, *, expected_source_hash, patched_chapters, updated_facts_deltas,
+                                ledger_updates, drift_repair_state) -> dict | None:
+        start, end, arc_index = arc["startChapter"], arc["endChapter"], arc["arcIndex"]
+        with self._write() as db:
+            job = self._get_job(db, job_id, required=True)
+            all_chapters = self._get_chapters(db, job_id)
+            chapters = [row for row in all_chapters if start <= row["chapterNumber"] <= end]
+            if ([row["chapterNumber"] for row in chapters] != list(range(start, end + 1))
+                    or not all(_is_committed(row) for row in chapters)
+                    or volume_source_hash(chapters) != expected_source_hash):
+                return None
+            facts = _canonical_facts(job.get("canonicalFacts"))
+            archive = self._pending_drift_archive(facts, arc, expected_source_hash)
+            if archive is None:
+                return None
+            prior_state = archive["driftRepair"]
+            if drift_repair_state.get("tries", 0) < prior_state.get("tries", 0):
+                return None
+
+            updates = {row["id"]: row for row in ledger_updates}
+            ledger = drift_ledger(facts)
+            human = {row["id"] for row in ledger if row["status"] in ("dismissed", "repaired")
+                     or _dict(row.get("resolution")).get("by") == "human"}
+            patches = {row["chapterNumber"]: row for row in patched_chapters}
+            if patches and (any(row.get("authorEdited") for row in chapters)
+                            or any(_is_committed(row) and row["chapterNumber"] > end for row in all_chapters)
+                            or any(updates[key].get("status") == "repaired" for key in human.intersection(updates))
+                            or any(not start <= n <= end for n in patches)
+                            or any(row["chapterNumber"] in patches and row["status"] == "needs_review" for row in chapters)):
+                return None
+
+            now = _now()
+            index = _dict(job.get("chapterIndex")).copy()
+            changed = {}
+            for chapter in chapters:
+                number = chapter["chapterNumber"]
+                if number in patches:
+                    updated = {**chapter, **patches[number], "updatedAt": now}
+                    updated["wordCount"] = count_chinese_words(updated["content"])
+                    self._write_chapter(db, job_id, updated)
+                    index[str(number)] = _chapter_index_entry(updated)
+                    changed[number] = updated
+            if changed:
+                deltas = {n: delta for n, delta in updated_facts_deltas.items() if n in changed}
+                if deltas:
+                    facts = replace_drift_fact_deltas(facts, deltas, timestamp=now, book_plan=job.get("bookPlan"))
+                chapters = [changed.get(row["chapterNumber"], row) for row in chapters]
+                sources = {row["chapterNumber"]: normalize_quote(row["content"]) for row in chapters}
+                for field in ("usedBeats", "usedHooks", "driftChecks"):
+                    if field in archive:
+                        archive[field] = [row for row in archive[field]
+                                          if locate_quote(row["quote"], sources.get(row["chapter"], ""))]
+                archive["sourceHash"] = volume_source_hash(chapters)
+                facts["volumeSummaries"] = [row for row in facts["volumeSummaries"] if not _archive_touches(row, changed)]
+                facts = _refresh_drift_ledger(facts, changed)
+            archive["driftRepair"] = dict(drift_repair_state)
+            if updates:
+                facts["driftLedger"] = [
+                    {**row, **updates[row["id"]]} if row["id"] in updates and row["id"] not in human else row
+                    for row in drift_ledger(facts)
+                ]
+            checkpoint = _dict(job.get("checkpoint")).copy()
+            if drift_repair_state["state"] == "done":
+                _clear_drift_draft(checkpoint, arc_index)
+            total_words = sum(_number(row.get("wordCount")) for row in index.values())
+            self._write_job(db, {**job, "canonicalFacts": facts, "checkpoint": checkpoint, "chapterIndex": index,
+                                 "totalWords": total_words, "updatedAt": now})
+            return {"chapters": chapters, "canonicalFacts": facts, "totalWords": total_words}
+
+    def set_drift_status(self, job_id, drift_id, status, reason="human") -> dict | None:
+        if status not in ("dismissed", "deferred"):
+            raise ValueError("Invalid drift status")
+        with self._write() as db:
+            job = self._get_job(db, job_id)
+            if job is None:
+                return None
+            facts = _canonical_facts(job.get("canonicalFacts"))
+            ledger = drift_ledger(facts)
+            for index, row in enumerate(ledger):
+                if row["id"] == drift_id:
+                    now = _now()
+                    entry = {**row, "status": status, "reason": reason, "resolution": {"by": "human", "at": now}}
+                    facts["driftLedger"] = [*ledger[:index], entry, *ledger[index + 1:]]
+                    self._write_job(db, {**job, "canonicalFacts": facts, "updatedAt": now})
+                    return entry
+            return None
 
     def append_job_log(self, job_id, entry):
         with self._write() as db:
@@ -782,7 +921,7 @@ class Store:
             prior = {chapter["chapterNumber"]: chapter for chapter in chapters}
             index = dict(_dict(job.get("chapterIndex")))
             now = _now()
-            changed, seen = [], set()
+            changed, seen = {}, set()
             for edit in revision["changes"]:
                 number = _dict(edit).get("chapterNumber")
                 title, content = _dict(edit).get("title"), _dict(edit).get("content")
@@ -803,7 +942,8 @@ class Store:
                     "chapterNumber", "title", "wordCount", "status", "updatedAt",
                 )}, "repairCount": _first_non_null(chapter.get("repairCount"), 0)}
                 if previous.get("title") != title or previous.get("content") != content:
-                    changed.append(number)
+                    changed[number] = chapter
+                    chapter["authorEdited"] = True
                     chapter.pop("titleCheck", None)
                 self._write_chapter(db, job_id, chapter)
             updated = {
@@ -813,11 +953,15 @@ class Store:
                 "evaluationProgress": "已应用修订稿，可以重新评估。",
             }
             if job.get("canonicalFacts") is not None and changed:
-                updated["canonicalFacts"] = _invalidate_archives(job["canonicalFacts"], changed)
+                facts = _refresh_drift_ledger(job["canonicalFacts"], changed)
+                updated["canonicalFacts"] = _invalidate_archives(facts, changed)
             self._write_job(db, updated)
 
 
 def public_job(job: dict):
+    facts = _dict(job.get("canonicalFacts"))
+    if not facts.get("driftLedger") and (ledger := drift_ledger(facts)):
+        job = {**job, "canonicalFacts": {**facts, "driftLedger": ledger}}
     config = job.get("llmConfig") or {}
     key = config.get("apiKey")
     if isinstance(key, str) and key:
@@ -847,12 +991,24 @@ def _empty_facts():
     return {
         "characters": {}, "injuries": [], "timeline": [], "items": {}, "secrets": [],
         "locations": {}, "foreshadowing": [], "relations": [], "factHistory": [],
-        **empty_long_memory(), "volumeSummaries": [], "arcSummaries": [],
+        **empty_long_memory(), "volumeSummaries": [], "arcSummaries": [], "driftLedger": [],
     }
 
 
 def _canonical_facts(saved):
     return {**_empty_facts(), **_dict(saved)}
+
+
+def _checkpoint_with_drift_draft(job, checkpoint, now):
+    draft = _dict(job.get("checkpoint")).get("driftRepairDraft")
+    return {**({"driftRepairDraft": draft} if draft else {}), **checkpoint, "savedAt": now}
+
+
+def _clear_drift_draft(checkpoint, arc_index):
+    cache = _dict(checkpoint.get("driftRepairDraft"))
+    cache.pop(str(arc_index), None)
+    if not cache:
+        checkpoint.pop("driftRepairDraft", None)
 
 
 def _unique_strings(values):
@@ -941,8 +1097,7 @@ def _replay_injuries(base, history):
     return injuries
 
 
-def _merge_chapter_facts(saved, number, delta, long_memory, chapter_text, timestamp, *, story_ledger=False, book_plan=None):
-    facts = _canonical_facts(saved)
+def _fold_chapter_facts(facts, number, delta, long_memory):
     for name, info in _named_entries(delta.get("characters"), "name"):
         if not name:
             continue
@@ -954,11 +1109,6 @@ def _merge_chapter_facts(saved, number, delta, long_memory, chapter_text, timest
             "knownSecrets": _unique_strings([*_list(previous.get("knownSecrets")), *_list(info.get("knownSecrets"))]),
             "sourceChapter": _first_non_null(previous.get("sourceChapter"), number), "updatedAtChapter": number,
         }
-
-    has_injury_changes = bool(_list(delta.get("injuries")))
-    if has_injury_changes and "injuryReplayBase" not in facts:
-        # Old books may have verified injuries without matching history entries.
-        facts["injuryReplayBase"] = [dict(entry) for entry in _list(facts["injuries"]) if isinstance(entry, dict)]
 
     if isinstance(delta.get("timeline"), list):
         facts["timeline"] = [item for item in facts["timeline"] if _number(item.get("sourceChapter")) != number]
@@ -1040,6 +1190,13 @@ def _merge_chapter_facts(saved, number, delta, long_memory, chapter_text, timest
         else:
             facts["relations"].append(record)
 
+def _merge_chapter_facts(saved, number, delta, long_memory, chapter_text, timestamp, *, story_ledger=False, book_plan=None):
+    facts = _canonical_facts(saved)
+    _fold_chapter_facts(facts, number, delta, long_memory)
+    has_injury_changes = bool(_list(delta.get("injuries")))
+    if has_injury_changes and "injuryReplayBase" not in facts:
+        # Old books may have verified injuries without matching history entries.
+        facts["injuryReplayBase"] = [dict(entry) for entry in _list(facts["injuries"]) if isinstance(entry, dict)]
     history = [item for item in _list(facts["factHistory"]) if _number(_dict(item).get("chapter")) != number]
     memory = normalize_memory_delta(
         delta.get("memory"), number, chapter_text, story_ledger=story_ledger, long_memory=long_memory,
@@ -1057,6 +1214,60 @@ def _merge_chapter_facts(saved, number, delta, long_memory, chapter_text, timest
         facts.pop(key, None)
     facts.update(replay_long_memory(history, book_plan=book_plan))
     return facts
+
+
+def rebuild_canonical_facts(facts, fact_history, *, book_plan=None):
+    """Rebuild materialized facts from the journal when it covers the whole prefix."""
+    history = sorted((row for row in _list(fact_history) if type(_dict(row).get("chapter")) is int),
+                     key=lambda row: row["chapter"])
+    rebuilt = _canonical_facts(facts)
+    collections = ("characters", "items", "timeline", "secrets", "injuries", "locations", "foreshadowing", "relations")
+    complete = bool(history) and [row["chapter"] for row in history] == list(range(1, len(history) + 1))
+    # Known unjournaled facts past the journal prefix require a legacy merge.
+    complete = complete and not any(
+        _number(_dict(entry).get(field)) > len(history)
+        for key in collections for entry in (rebuilt[key].values() if isinstance(rebuilt[key], dict) else _list(rebuilt[key]))
+        for field in ("sourceChapter", "updatedAtChapter")
+    )
+    if complete:
+        empty = _empty_facts()
+        for key in collections:
+            rebuilt[key] = empty[key]
+        rebuilt.pop("injuryReplayBase", None)
+        for index, row in enumerate(history):
+            delta = _dict(row.get("delta"))
+            _fold_chapter_facts(rebuilt, row["chapter"], delta, bool(delta.get("memory")))
+            if _list(delta.get("injuries")):
+                _apply_injuries(rebuilt["injuries"], delta["injuries"], row["chapter"])
+                rebuilt["injuryReplayBase"] = []
+                history[index] = {**row, "injuryMergeVersion": 1}
+    else:
+        prior = {row.get("chapter"): row.get("delta") for row in _list(rebuilt["factHistory"]) if isinstance(row, dict)}
+        changed = [row for row in history if row.get("delta") != prior.get(row["chapter"])]
+        if changed:
+            for key in collections:
+                rebuilt[key] = rebuilt[key].copy()
+            for row in changed:
+                delta = _dict(row.get("delta"))
+                _fold_chapter_facts(rebuilt, row["chapter"], delta, bool(delta.get("memory")))
+            if "injuryReplayBase" not in rebuilt and any(row.get("injuryMergeVersion") == 1 for row in changed):
+                rebuilt["injuryReplayBase"] = rebuilt["injuries"]
+        if "injuryReplayBase" in rebuilt:
+            rebuilt["injuries"] = _replay_injuries(rebuilt["injuryReplayBase"], history)
+    rebuilt["factHistory"] = history
+    for key in ("storyClock", "ledgerBalances"):
+        rebuilt.pop(key, None)
+    rebuilt.update(replay_long_memory(history, book_plan=book_plan))
+    return rebuilt
+
+
+def replace_drift_fact_deltas(facts, deltas, *, timestamp, book_plan=None):
+    """Replace already grounded chapter deltas and project the candidate facts."""
+    history = {row["chapter"]: row for row in _list(facts.get("factHistory")) if type(_dict(row).get("chapter")) is int}
+    for number, delta in deltas.items():
+        history[number] = {"chapter": number, "delta": delta, "timestamp": timestamp,
+                           **({"injuryMergeVersion": 1} if _list(delta.get("injuries")) else {})}
+    return rebuild_canonical_facts(facts, list(history.values()), book_plan=book_plan)
 
 
 def _rollback_facts(saved, from_chapter, *, book_plan=None):
@@ -1086,4 +1297,5 @@ def _rollback_facts(saved, from_chapter, *, book_plan=None):
                                  if _number(volume.get("endChapter"), math.inf) < from_chapter]
     result["arcSummaries"] = [arc for arc in _list(previous["arcSummaries"])
                               if _number(_dict(arc).get("endChapter"), math.inf) < from_chapter]
+    result["driftLedger"] = [row for row in drift_ledger(previous) if row["chapter"] < from_chapter]
     return result

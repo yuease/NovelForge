@@ -74,9 +74,10 @@
 
 ## 五、单元归档（`arc_archive`）
 
-- [ ] **WF-14 `[P0]` `driftChecks` 只记笔记、不回头修章、过一单元即丢弃**
+- [x] **WF-14 `[P0]` `driftChecks` 只记笔记、不回头修章、过一单元即丢弃**
   - **现象**：`arc_archive` 实测精准抓出 **83 条硬伤**（含第 1 章金重算错、第 5 章霍去病/捕鱼儿海早逝早发、第 9/17 章李世民 ID 串号、第 12 章秦无“钱”等），但工作流禁止回修已提交章且下单元仅传 4 条，导致坏正文留在库里持续向后传染。
   - **代码位置**：`novel_forge/prompts.py`（`previousArcDriftChecks`）、`novel_forge/pipeline.py`（`_archive_arc`）。
+  - **已落地**：新增 `novel_forge/drift_repair.py`（五重准入 + `cascade_risk` 事前预判 + 单元 ≤2 章 & 全书 `max(4, total//10)` 硬帽 + 八重局部护栏 + 本地下游冲突校验）与 `canonicalFacts.driftLedger` 持久台账；`storage.py` 实现 `apply_arc_drift_repairs` 原子事务（原地刷新 `sourceHash` 与 `driftRepair.state="done"`，零死循环）与连续历史 `rebuild_canonical_facts`；`pipeline.py` 接入 `_repair_arc_drifts` 与 `driftRepairDraft` 断点幂等缓存；`app.py` 新增 `PATCH /api/jobs/{id}/drifts/{drift_id}`；前端 `FactsPage.tsx` 新增跨章偏差台账与忽略/恢复操作。
 
 ---
 

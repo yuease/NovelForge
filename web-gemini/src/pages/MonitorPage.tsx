@@ -25,7 +25,7 @@ const STAGES: Record<string, string> = {
   topic: '构建选题', topic_selection: '构建选题', topic_lock: '锁定选题', book_plan: '全书规划',
   chapter_outlines: '分章细纲', chapter_writing: '章节撰写', chapter_verification: '章节审校', chapter_verify: '章节审校',
   chapter_repair: '章节返修', fact_extraction: '事实提取',
-  arc_archive: '单元归档', volume_archive: '卷摘要归档',
+  arc_archive: '单元归档', drift_patch: '单元纠偏回修', volume_archive: '卷摘要归档',
   final_audit: '全书终审', evaluation: '成书评估', full_audit: '全书终审',
 }
 

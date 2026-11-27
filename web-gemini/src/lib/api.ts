@@ -4,6 +4,7 @@ import type {
   CandidateEvaluationRound,
   ChapterRecord,
   CreateJobInput,
+  DriftLedgerEntry,
   EvaluationRoundSummary,
   EditorModelSelection,
   GeneratedConcept,
@@ -314,6 +315,18 @@ export const api = {
     return request(`/jobs/${encodeURIComponent(jobId)}/chapters/${chapterNumber}`, {
       method: 'PUT',
       body: JSON.stringify(payload),
+    })
+  },
+
+  async updateDriftStatus(
+    jobId: string,
+    driftId: string,
+    status: 'dismissed' | 'deferred',
+    reason = 'human'
+  ): Promise<DriftLedgerEntry> {
+    return request(`/jobs/${encodeURIComponent(jobId)}/drifts/${encodeURIComponent(driftId)}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ status, reason }),
     })
   },
 

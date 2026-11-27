@@ -1589,10 +1589,27 @@ def _mock_volume_prompt(prompt):
 def _detect_mock_task(text):
     if re.search(r"\[TASK:VOLUME_SUMMARY\]", text, re.I):
         return "volume_summary"
+    if re.search(r"\[TASK:DRIFT_PATCH\]", text, re.I):
+        return "drift_patch"
     for task in _MOCK_MARKERS:
         if re.search(rf"\[TASK:{task}\]", text, re.I):
             return task
     return next((task for task, pattern in _MOCK_TASKS.items() if re.search(pattern, text, re.I)), "generic")
+
+
+def _mock_drift_patch(prompt):
+    material = prompt.partition("【偏差与局部窗口】")[2]
+    try:
+        drifts, _ = json.JSONDecoder().raw_decode(material.lstrip())
+    except ValueError:
+        return {"patches": []}
+    patches = []
+    for drift in drifts:
+        quote = drift["quote"]
+        if quote == _MOCK_UNPOSTED_DRIFT and quote in drift["window"]:
+            patches.append({"driftId": drift["id"], "confirmed": True, "find": quote,
+                            "replace": "账房把尚未到账的款项单列为待到账。", "reason": "待到账款项单列"})
+    return {"patches": patches}
 
 
 async def call_mock_llm(*, system="", prompt="", timeout_ms=DEFAULT_TIMEOUT_MS, test_scenario=None):
@@ -1674,6 +1691,8 @@ async def call_mock_llm(*, system="", prompt="", timeout_ms=DEFAULT_TIMEOUT_MS, 
         text = _mock_json(_mock_full_audit(scenario))
     elif task == "volume_summary":
         text = _mock_json(_mock_volume_prompt(prompt))
+    elif task == "drift_patch":
+        text = _mock_json(_mock_drift_patch(prompt))
     elif prompt.strip() == "回复OK":
         text = "OK"
     else:

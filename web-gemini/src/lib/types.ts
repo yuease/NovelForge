@@ -698,6 +698,36 @@ export interface ArcSubplotClosure {
   quote?: string
 }
 
+export type DriftLedgerStatus = 'open' | 'repaired' | 'deferred' | 'dismissed'
+
+export interface DriftLedgerEntry {
+  id: string
+  arc?: number
+  chapter: number
+  kind: 'value' | 'clock' | 'canon' | 'character_ooc' | string
+  issue: string
+  fixHint?: string
+  quote?: string
+  status: DriftLedgerStatus | string
+  reason?: string
+  autoRepairAttempts?: number
+  detectedSourceHash?: string
+  detectedAt?: string
+  resolution?: {
+    by?: 'auto' | 'human' | string
+    at?: string
+    patchReason?: string
+  } | null
+}
+
+export interface ArcDriftRepairState {
+  state?: 'pending' | 'done' | string
+  tries?: number
+  round?: number
+  chapters?: number[]
+  at?: string
+}
+
 export interface ArcSummary {
   arc?: number
   startChapter: number
@@ -714,6 +744,7 @@ export interface ArcSummary {
   usedHooks?: ArcEvidenceItem[]
   villainStatus?: string
   driftChecks?: ArcDriftCheck[]
+  driftRepair?: ArcDriftRepairState | null
   needsReviewChapters?: number[]
 }
 
@@ -741,6 +772,7 @@ export interface CanonicalFacts {
   characterStates?: Record<string, CharacterStateEntry>
   arcSummaries?: ArcSummary[]
   volumeSummaries?: VolumeSummary[]
+  driftLedger?: DriftLedgerEntry[]
   factHistory?: Array<{
     chapter?: number
     type?: string

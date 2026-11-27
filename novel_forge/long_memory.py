@@ -1,5 +1,6 @@
 """Normalize, replay and select long-term memory without storage side effects."""
 
+import hashlib
 import re
 import unicodedata
 from decimal import Decimal
@@ -645,6 +646,69 @@ def _number(value):
         return float(value or 0)
     except (TypeError, ValueError, OverflowError):
         return 0
+
+
+def drift_id(entry: dict) -> str:
+    identity = f"{entry['chapter']}|{entry['kind']}|{normalize_quote(entry['issue'])}"
+    return "drift-" + hashlib.sha1(identity.encode("utf-8")).hexdigest()[:12]
+
+
+def drift_ledger(facts) -> list[dict]:
+    facts = _record(facts)
+    if ledger := _list(facts.get("driftLedger")):
+        return ledger
+    legacy = {}
+    for arc in _list(facts.get("arcSummaries")):
+        arc = _record(arc)
+        for entry in _list(arc.get("driftChecks")):
+            entry = _record(entry)
+            if (type(entry.get("chapter")) is not int or not isinstance(entry.get("kind"), str)
+                    or not isinstance(entry.get("issue"), str)):
+                continue
+            identifier = drift_id(entry)
+            legacy.setdefault(identifier, {
+                **entry, "id": identifier, "arc": arc.get("arc"), "detectedSourceHash": arc.get("sourceHash"),
+                "detectedAt": arc.get("archivedAt"), "status": "deferred", "reason": "stale_arc", "autoRepairAttempts": 0,
+            })
+    return list(legacy.values())
+
+
+def merge_drift_entries(ledger, *, arc_index, drifts, source_hash, timestamp) -> list[dict]:
+    entries = {row["id"]: dict(row) for row in ledger}
+    for drift in drifts:
+        identifier = drift_id(drift)
+        prior = entries.get(identifier)
+        if prior is None:
+            entries[identifier] = {
+                **{key: drift[key] for key in ("chapter", "kind", "issue", "fixHint", "quote") if key in drift},
+                "id": identifier, "arc": arc_index, "status": "open", "autoRepairAttempts": 0,
+                "detectedSourceHash": source_hash, "detectedAt": timestamp,
+            }
+        elif prior.get("status") in ("open", "deferred"):
+            prior.update(detectedSourceHash=source_hash)
+            for key in ("fixHint", "quote"):
+                if key in drift:
+                    prior[key] = drift[key]
+    return list(entries.values())
+
+
+def unresolved_drifts(facts, *, before_chapter=None, limit=None) -> list[dict]:
+    priority = {"canon": 0, "value": 0, "clock": 1, "character_ooc": 2}
+    rows = [row for row in drift_ledger(facts) if row.get("status") in ("open", "deferred")
+            and (before_chapter is None or row["chapter"] < before_chapter)]
+    rows.sort(key=lambda row: (priority.get(row["kind"], 3), -row["chapter"], row["id"]))
+    return rows[:limit]
+
+
+def drift_stats(facts) -> dict:
+    ledger = drift_ledger(facts)
+    stats = {"total": len(ledger), "open": 0, "repaired": 0, "deferred": 0, "dismissed": 0, "byKind": {}}
+    for row in ledger:
+        if row.get("status") in ("open", "repaired", "deferred", "dismissed"):
+            stats[row["status"]] += 1
+        kind = row["kind"]
+        stats["byKind"][kind] = stats["byKind"].get(kind, 0) + 1
+    return stats
 
 
 def active_memory_items(facts, kind, context="", limit=8):

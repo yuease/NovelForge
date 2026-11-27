@@ -103,6 +103,7 @@ const STAGE_LABELS: Record<string, string> = {
   chapter_repair: '章节返修',
   fact_extraction: '事实提取',
   arc_archive: '单元归档',
+  drift_patch: '单元纠偏回修',
   volume_archive: '卷摘要归档',
   full_audit: '全书终审',
   completed: '已完成',

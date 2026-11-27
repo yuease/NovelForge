@@ -6,8 +6,9 @@ import {
   EyeOff, HeartPulse, Layers, Lock, MapPin, Package, ShieldAlert, ShieldCheck, Sparkles,
   Tag as TagIcon, TrendingUp, Users, Wrench,
 } from 'lucide-react'
+import { api } from '../lib/api'
 import { cn } from '../lib/cn'
-import { FORESHADOW_STATUS_LABEL, SKELETON_CODE_LABEL, issueTypeLabel } from '../lib/format'
+import { FORESHADOW_STATUS_LABEL, SKELETON_CODE_LABEL, issueTypeLabel, messageOf } from '../lib/format'
 import type { Tone } from '../lib/format'
 import { EASE_OUT, TAB_MOTION, boundedDelay } from '../lib/motion'
 import { navigate } from '../lib/router'
@@ -20,6 +21,7 @@ import type {
   ChapterRecord,
   CharacterRelationshipChange,
   CharacterStateEntry,
+  DriftLedgerEntry,
   FactEntry,
   LedgerBalance,
   RepairLogEntry,
@@ -30,7 +32,7 @@ import type {
 import { useStudio } from '../state/studio'
 import {
   AnimatedNumber, Badge, Button, Card, EmptyState, PageHeader, SectionLabel, Segmented,
-  Stagger, StaggerItem, Tag,
+  Stagger, StaggerItem, Tag, useToast,
 } from '../components/ui'
 
 type FactTab = 'ledger' | 'items' | 'secrets' | 'characters' | 'timeline' | 'foreshadowing' | 'repairs'
@@ -48,6 +50,30 @@ const DRIFT_KIND_LABEL: Record<string, string> = {
   clock: '时钟',
   canon: '口径',
   character_ooc: '人设',
+}
+
+const DRIFT_STATUS_META: Record<string, { label: string; tone: Tone }> = {
+  open: { label: '待处理', tone: 'warning' },
+  deferred: { label: '已延后', tone: 'warning' },
+  repaired: { label: '已自动回修', tone: 'success' },
+  dismissed: { label: '已忽略', tone: 'neutral' },
+}
+
+const DRIFT_REASON_LABEL: Record<string, string> = {
+  auto_repair: '已局部精准回修，未影响周边剧情与章末钩子',
+  stale_arc: '历史单元仅留作后续写作参考，不追溯改动旧章',
+  needs_review: '该章仍待人工复核，暂不自动修改',
+  quote_not_unique: '原句在章内不唯一，留待人工核对',
+  attempt_cap: '本章已达自动回修次数上限',
+  ooc_deferred: '人设偏差需结合语境判断，已带入后续规划',
+  cascade_risk: '后续章已沿用该账目或时钟，为防连锁错乱暂不回改',
+  quota: '超出本轮自动回修配额，已带入后续规划',
+  cascade: '试修后影响后续章逻辑，已安全回滚并保留原稿',
+  patch_regressed: '试修未通过正文质检，已保留原稿',
+  unconfirmed: '复核未确认为真实矛盾',
+  repair_unavailable: '自动回修暂不可用，已顺延至后续参考',
+  source_changed: '正文已被修订，原提醒自动失效',
+  human: '作者手动标记',
 }
 
 const EXIT_PLAN_LABEL: Record<string, string> = {
@@ -201,8 +227,10 @@ function isHealedInjury(entry: FactEntry): boolean {
 }
 
 export default function FactsPage() {
-  const { facts, repairLogs, activeJob, chapters } = useStudio()
+  const { facts, repairLogs, activeJob, chapters, loadJobDetails } = useStudio()
+  const toast = useToast()
   const [selectedTab, setSelectedTab] = useState<FactTab | null>(null)
+  const [busyDriftId, setBusyDriftId] = useState<string | null>(null)
 
   const characters = normalize(facts?.characters)
   const injuries = normalize(facts?.injuries)
@@ -227,6 +255,7 @@ export default function FactsPage() {
   const arcPlans = useMemo(() => (Array.isArray(activeJob?.arcPlans) ? [...activeJob.arcPlans].sort((a, b) => a.startChapter - b.startChapter) : []), [activeJob?.arcPlans])
   const arcSummaries = useMemo(() => (Array.isArray(facts?.arcSummaries) ? [...facts.arcSummaries].sort((a, b) => a.endChapter - b.endChapter) : []), [facts?.arcSummaries])
   const volumeSummaries = useMemo(() => (Array.isArray(facts?.volumeSummaries) ? [...facts.volumeSummaries].sort((a, b) => a.endChapter - b.endChapter) : []), [facts?.volumeSummaries])
+  const driftLedger = useMemo(() => (Array.isArray(facts?.driftLedger) ? facts.driftLedger : []), [facts?.driftLedger])
   const characterStates = useMemo(() => (facts?.characterStates && typeof facts.characterStates === 'object' ? facts.characterStates : {}), [facts?.characterStates])
 
   /* Merge base characters with characterStates so Phase 4 locked roles always appear */
@@ -254,6 +283,7 @@ export default function FactsPage() {
     || hasVolumeLadder
     || hasStoryClock(storyClock)
     || ledgerBalances.length > 0
+    || driftLedger.length > 0
     || arcPlans.length > 0
     || arcSummaries.length > 0
     || volumeSummaries.length > 0
@@ -263,8 +293,23 @@ export default function FactsPage() {
     + (hasVolumeLadder ? planVolumes.length : 0)
     + (hasStoryClock(storyClock) ? 1 : 0)
     + ledgerBalances.length
+    + driftLedger.length
     + Math.max(arcPlans.length, arcSummaries.length)
     + volumeSummaries.length
+
+  const handleUpdateDrift = async (driftId: string, status: 'dismissed' | 'deferred') => {
+    if (!activeJob) return
+    setBusyDriftId(driftId)
+    try {
+      await api.updateDriftStatus(activeJob.id, driftId, status, 'human')
+      await loadJobDetails(activeJob.id)
+      toast(status === 'dismissed' ? '已忽略该条偏差，后续规划不再提醒' : '已恢复为待处理，将带入后续规划', 'success')
+    } catch (err) {
+      toast(messageOf(err, '更新偏差状态失败，请重试'), 'danger')
+    } finally {
+      setBusyDriftId(null)
+    }
+  }
 
   const tab: FactTab = selectedTab ?? (hasLedgerSection ? 'ledger' : 'items')
 
@@ -328,6 +373,9 @@ export default function FactsPage() {
                   boundaryStates={boundaryStates}
                   storyClock={storyClock}
                   ledgerBalances={ledgerBalances}
+                  driftLedger={driftLedger}
+                  busyDriftId={busyDriftId}
+                  onUpdateDrift={handleUpdateDrift}
                   arcPlans={arcPlans}
                   arcSummaries={arcSummaries}
                   volumeSummaries={volumeSummaries}
@@ -581,6 +629,9 @@ function LedgerAndArcsView({
   boundaryStates,
   storyClock,
   ledgerBalances,
+  driftLedger,
+  busyDriftId,
+  onUpdateDrift,
   arcPlans,
   arcSummaries,
   volumeSummaries,
@@ -592,12 +643,38 @@ function LedgerAndArcsView({
   boundaryStates: Map<string, VerifiedBoundaryState>
   storyClock: StoryClock | null
   ledgerBalances: LedgerBalance[]
+  driftLedger: DriftLedgerEntry[]
+  busyDriftId: string | null
+  onUpdateDrift: (driftId: string, status: 'dismissed' | 'deferred') => Promise<void>
   arcPlans: ArcPlan[]
   arcSummaries: ArcSummary[]
   volumeSummaries: VolumeSummary[]
 }) {
   const showLocks = hasCanonLocks(canonLocks)
   const showClock = hasStoryClock(storyClock)
+  const [driftFilter, setDriftFilter] = useState<'all' | 'pending' | 'repaired' | 'dismissed'>('all')
+
+  const driftCounts = useMemo(() => {
+    let pending = 0
+    let repaired = 0
+    let dismissed = 0
+    for (const item of driftLedger) {
+      if (item.status === 'repaired') repaired += 1
+      else if (item.status === 'dismissed') dismissed += 1
+      else pending += 1
+    }
+    return { all: driftLedger.length, pending, repaired, dismissed }
+  }, [driftLedger])
+
+  const filteredDrifts = useMemo(() => {
+    return driftLedger
+      .filter((item) => {
+        if (driftFilter === 'all') return true
+        if (driftFilter === 'pending') return item.status === 'open' || item.status === 'deferred'
+        return item.status === driftFilter
+      })
+      .sort((a, b) => b.chapter - a.chapter)
+  }, [driftLedger, driftFilter])
 
   /* Merge arcPlans and arcSummaries chronologically */
   const arcRecords = useMemo(() => {
@@ -945,6 +1022,104 @@ function LedgerAndArcsView({
         </section>
       )}
 
+      {/* 2.8. Persistent Cross-Arc Drift Ledger (Stage 5) */}
+      {driftLedger.length > 0 && (
+        <section>
+          <SectionLabel
+            actions={(
+              <div className="flex flex-wrap items-center gap-1.5">
+                {driftCounts.pending > 0 && <Badge tone="warning">待处理 {driftCounts.pending}</Badge>}
+                {driftCounts.repaired > 0 && <Badge tone="success">已回修 {driftCounts.repaired}</Badge>}
+                {driftCounts.dismissed > 0 && <Badge tone="neutral">已忽略 {driftCounts.dismissed}</Badge>}
+              </div>
+            )}
+          >
+            跨章偏差台账
+          </SectionLabel>
+          <div className="mb-3 flex flex-wrap gap-1.5">
+            {([
+              ['all', `全部 (${driftCounts.all})`],
+              ['pending', `待处理 / 已延后 (${driftCounts.pending})`],
+              ['repaired', `已自动回修 (${driftCounts.repaired})`],
+              ['dismissed', `已忽略 (${driftCounts.dismissed})`],
+            ] as const).map(([key, label]) => (
+              <button
+                key={key}
+                type="button"
+                onClick={() => setDriftFilter(key)}
+                className={cn(
+                  'rounded-full px-2.5 py-1 text-caption transition-colors',
+                  driftFilter === key
+                    ? 'bg-primary text-white'
+                    : 'bg-surface-2 text-muted hover:bg-surface-3 hover:text-ink',
+                )}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          {filteredDrifts.length > 0 ? (
+            <div className="grid gap-2.5">
+              {filteredDrifts.map((item) => {
+                const statusMeta = DRIFT_STATUS_META[item.status] ?? { label: item.status, tone: 'neutral' as Tone }
+                const reasonText = item.reason ? (DRIFT_REASON_LABEL[item.reason] ?? item.reason) : ''
+                const isPending = item.status === 'open' || item.status === 'deferred'
+                const isDismissed = item.status === 'dismissed'
+                return (
+                  <div
+                    key={item.id}
+                    className={cn(
+                      'rounded-md border p-3.5 text-caption transition-colors',
+                      isPending
+                        ? 'border-warning/30 bg-warning-soft/55'
+                        : item.status === 'repaired'
+                          ? 'border-success/25 bg-success-soft/45'
+                          : 'border-line bg-surface-2/80',
+                    )}
+                  >
+                    <div className="flex flex-wrap items-start justify-between gap-2">
+                      <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+                        <Badge tone={statusMeta.tone}>{statusMeta.label}</Badge>
+                        <Badge tone="neutral" className="tabular-nums">
+                          {DRIFT_KIND_LABEL[item.kind] ?? item.kind} · 第 {item.chapter} 章
+                          {item.arc ? `（第 ${item.arc} 单元）` : ''}
+                        </Badge>
+                        <span className="font-medium text-ink">{item.issue}</span>
+                      </div>
+                      {(isPending || isDismissed) && (
+                        <Button
+                          size="sm"
+                          variant="secondary"
+                          loading={busyDriftId === item.id}
+                          disabled={busyDriftId !== null}
+                          onClick={() => void onUpdateDrift(item.id, isPending ? 'dismissed' : 'deferred')}
+                        >
+                          {isPending ? '忽略' : '恢复待处理'}
+                        </Button>
+                      )}
+                    </div>
+                    {reasonText && (
+                      <p className="mt-1.5 text-muted">
+                        处理说明：{reasonText}
+                        {item.resolution?.patchReason ? `（${item.resolution.patchReason}）` : ''}
+                      </p>
+                    )}
+                    {item.fixHint && isPending && <p className="mt-1 text-body">衔接建议：{item.fixHint}</p>}
+                    {item.quote && (
+                      <p className="mt-1 truncate text-[11px] text-muted" title={item.quote}>
+                        原文：「{item.quote}」
+                      </p>
+                    )}
+                  </div>
+                )
+              })}
+            </div>
+          ) : (
+            <p className="rounded-md bg-surface-2 px-4 py-5 text-center text-caption text-muted">当前筛选下暂无偏差记录</p>
+          )}
+        </section>
+      )}
+
       {/* 3. Rolling Arc Plans + Archives & Drift Checks */}
       {arcRecords.length > 0 && (
         <section>
@@ -960,6 +1135,7 @@ function LedgerAndArcsView({
               const usedHooks = summary?.usedHooks ?? []
               const turningPoints = summary?.turningPoints ?? []
               const needsReview = summary?.needsReviewChapters ?? []
+              const repairedChapters = summary?.driftRepair?.chapters ?? []
 
               return (
                 <StaggerItem key={index} index={idx}>
@@ -974,6 +1150,11 @@ function LedgerAndArcsView({
                           {summary
                             ? <Badge tone="success" dot>已归档</Badge>
                             : <Badge tone="primary" dot>规划中 / 推进中</Badge>}
+                          {repairedChapters.length > 0 && (
+                            <Badge tone="success" icon={<CheckCircle2 />}>
+                              已局部回修：第 {repairedChapters.join('、')} 章
+                            </Badge>
+                          )}
                           {driftChecks.length > 0 && (
                             <Badge tone="warning" icon={<AlertTriangle />}>快检提醒 {driftChecks.length}</Badge>
                           )}
