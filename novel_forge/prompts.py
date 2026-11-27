@@ -15,6 +15,7 @@ from .book_plan import (
     volume_ladder_text, volumes_for_range,
 )
 from .draft_quality import STYLE_BIBLE_MARKER, compact_style_bible
+from .entity_salience import _mentions, active_subplots_view, entity_index, ranked_entities, retired_character_status, retired_roster
 from .llm import STORY_LEDGER_MARKER
 from .long_memory import (
     STORY_CHARACTER_FIELDS, active_memory_items, protagonist_name, relevant_memory_characters,
@@ -240,15 +241,19 @@ _WORD_COUNT_ADJUST_PROMPT = Template("""请对第${chapter_number}章进行${mod
 【待调整正文】
 ${chapter_text}""")
 
-_FACT_RECORDING_RULES = (
+_LEGACY_FACT_RECORDING_RULES = (
     "伤势只记录会持续影响后续行动的实质伤残、中毒或重伤；情绪反应、心率变化和轻微擦伤不入库。"
     "已有伤势沿用 id、注明部位与左右侧；正文确认已愈或已过明确恢复期时提交 active=false。"
     "物品只记录跨章复用的核心道具、契约、载具或通讯工具，保留有依据的颜色、佩戴侧、状态等关键属性；一次性消耗品不入库。"
 )
+_FACT_RECORDING_RULES = (
+    _LEGACY_FACT_RECORDING_RULES.replace("；一次性消耗品不入库。", "。")
+    + '\nitems 只记录对后续章节有意义的物品；一次性消耗品可省略，已入库且用完的可标注 status: "已消耗"。'
+)
 
 _FACT_EXTRACTION_SYSTEM = """[TASK:FACT_EXTRACTION]
 你是严谨的小说连续性档案员。请从刚生成的章节正文中提取所有关键事实增量（人物状态变化、伤势、时间线、物品位置/归属、秘密知情边界、伏笔埋设/强化/回收）。
-必须严格输出合法 JSON。\n""" + _FACT_RECORDING_RULES
+必须严格输出合法 JSON。\n"""
 
 _FACT_EXTRACTION_PROMPT = Template("""请提取第${chapter_number}章的规范事实增量：
 【已有事实库摘要】
@@ -595,8 +600,24 @@ def _visible_injuries(entries, context, current_chapter=None, *, story_ledger=Fa
     return [entry for entry in _records(entries) if visible(entry)]
 
 
+def _salient_facts(facts, kind, index, plan, arcs, current, context):
+    themes = horizon_memory(facts, arcs, current)["themes"] if current is not None and kind == "items" else ()
+    for name, tier, score, hit in ranked_entities(
+        kind, index, book_plan=plan, arc_plans=arcs, current_chapter=current,
+        context_text=context, resolved_theme_ranges=themes,
+    ):
+        row = index[kind][name]
+        entry = row["entry"]
+        if kind == "characters":
+            entry = {**row["state"], **entry}
+            if tier == "retired":
+                entry["status"] = retired_character_status(entry.get("status"))
+        yield name, entry, tier, score, hit
+
+
 def extract_relevant_facts(canonical_facts=None, *, context_text="", max_items=28, max_secrets=22, max_foreshadowing=22,
-                           current_chapter=None, story_ledger=False):
+                           current_chapter=None, story_ledger=False, book_plan=None, arc_plans=(), salience_index=None,
+                           max_characters=None):
     facts = canonical_facts or {}
     injuries = _visible_injuries(facts.get("injuries", facts.get("activeInjuries")), context_text, current_chapter,
                                   story_ledger=story_ledger)
@@ -606,8 +627,19 @@ def extract_relevant_facts(canonical_facts=None, *, context_text="", max_items=2
         open_clues, context_text, max_foreshadowing,
         lambda entry: " ".join(str(entry.get(key) or "") for key in ("id", "clue", "details")),
     )
+    use_salience = book_plan is not None or salience_index is not None or max_characters is not None
+    items = _dict(facts.get("items"))
+    character_rows = _dict(facts.get("characters")).items()
+    if use_salience:
+        index = entity_index(facts, before_chapter=current_chapter) if salience_index is None else salience_index
+        current_chapter = current_chapter if current_chapter is not None else index.get("beforeChapter")
+        ranked = _salient_facts(facts, "characters", index, book_plan, arc_plans, current_chapter, context_text)
+        character_rows = [(name, entry) for name, entry, *_ in ranked][:max(0, 32 if max_characters is None else max_characters)]
+        ranked = _salient_facts(facts, "items", index, book_plan, arc_plans, current_chapter, context_text)
+        items = dict([(name, entry) for name, entry, *_ in ranked][:max(0, max_items)])
+
     characters = {}
-    for name, entry in _dict(facts.get("characters")).items():
+    for name, entry in character_rows:
         entry = _dict(entry)
         characters[name] = {
             "name": entry.get("name") or name, "status": entry.get("status") or "active",
@@ -615,8 +647,7 @@ def extract_relevant_facts(canonical_facts=None, *, context_text="", max_items=2
             **({"sourceChapter": entry["sourceChapter"]} if "sourceChapter" in entry else {}),
         }
 
-    items = _dict(facts.get("items"))
-    if len(items) > max_items:
+    if not use_salience and len(items) > max_items:
         def item_terms(pair):
             name, entry = pair
             return " ".join(str(value or "") for value in
@@ -730,7 +761,7 @@ def _facts_before(facts, chapter):
     def earlier(entry):
         record = _dict(entry)
         return max(_number(record.get(key)) for key in
-                   ("sourceChapter", "updatedAtChapter", "chapterNumber", "plantedChapter")) < chapter
+                   ("sourceChapter", "updatedAtChapter", "lastSeenChapter", "chapterNumber", "plantedChapter")) < chapter
 
     selected = {key: ({name: row for name, row in value.items() if earlier(row)} if isinstance(value, dict)
                       else [row for row in _list(value) if earlier(row)])
@@ -778,6 +809,10 @@ def _allocated_arc_facts(entries):
     return facts
 
 
+def _subplot_hints(subplots, maximum):
+    return [{"id": row["id"], "text": _text_excerpt(row.get("text") or "", 120)} for row in subplots[:maximum]]
+
+
 def build_arc_outlines_prompt(*, book_plan, canonical_facts, start_chapter, total_chapters, arc_index,
                               preceding_chapters=(), recent_titles=(), continuation_direction="", finalize_book=False,
                               story_ledger=False, boundary_state=(), arc_plans=(), input_budget=None, rhythm=None,
@@ -796,9 +831,12 @@ def build_arc_outlines_prompt(*, book_plan, canonical_facts, start_chapter, tota
                         *(str(row.get("summary") or "") for row in preceding_chapters[-5:])])
     selected = extract_relevant_facts(past, context_text=context, current_chapter=start_chapter, story_ledger=story_ledger,
                                       max_foreshadowing=len(_list(past.get("foreshadowing"))) if terminal else 22)
-    for kind in ("constraints", "commitments", "subplots"):
+    for kind in ("constraints", "commitments"):
         if active := active_memory_items(past, kind, context):
             selected[kind] = active
+    visible_subplots, stale_subplots = active_subplots_view(facts, current_chapter=start_chapter, context_text=context)
+    if visible_subplots:
+        selected["subplots"] = visible_subplots[:8]
     if past.get("characterStates"):
         lead = protagonist_name(plan.get("mainCharacters"))
         selected["characterStates"] = [
@@ -879,12 +917,17 @@ def build_arc_outlines_prompt(*, book_plan, canonical_facts, start_chapter, tota
         {"key": "recentBeats", "entries": horizon["recentBeats"], "share": 8},
         {"key": "foreshadowing", "entries": [] if terminal else clues, "share": 6},
     ]
+    if stale_subplots:
+        slots.append({"key": "staleSubplots", "entries": _subplot_hints(stale_subplots, 4), "share": 2})
+        slots[1]["share"] -= 2
 
     def render(parts):
         selected_facts = _allocated_arc_facts(parts["facts"])
         if parts["foreshadowing"]:
             selected_facts["openForeshadowing"] = parts["foreshadowing"]
         memory = {key: value for key, value in parts.items() if key not in ("facts", "foreshadowing")}
+        if not memory.get("staleSubplots"):
+            memory.pop("staleSubplots", None)
         body = _json({**material, "canonicalFacts": selected_facts, **memory})
         return {"system": system, "prompt": f"{header}【已发生事实与全书路标】\n{locks}{body}\n【输出结构】\n{_json(example)}{retry}"}
 
@@ -893,7 +936,11 @@ def build_arc_outlines_prompt(*, book_plan, canonical_facts, start_chapter, tota
     return fit_prompt(render=render, slots=slots, input_budget=input_budget, code=ARC_PROMPT_BUDGET_EXCEEDED, label="滚纲")
 
 
-def _chapter_write_facts(canonical, relevant, context, *, current_chapter=None, story_ledger=False):
+def _chapter_write_facts(canonical, relevant, context, *, current_chapter=None, story_ledger=False,
+                         book_plan=None, arc_plans=(), salience_index=None):
+    if current_chapter is None and salience_index is not None:
+        current_chapter = salience_index.get("beforeChapter")
+
     def source(key, fallback):
         value = canonical.get(key)
         return relevant.get(fallback) if value is None else value
@@ -908,7 +955,9 @@ def _chapter_write_facts(canonical, relevant, context, *, current_chapter=None, 
         }
 
     def rank(entries):
-        return sorted(entries, key=lambda item: (item["relevance"], item["sourceChapter"]), reverse=True)
+        return sorted(entries, key=lambda item: (
+            item["relevance"], item.get("salience", item["sourceChapter"]),
+        ), reverse=True)
 
     injuries = [tag("activeInjuries", item, [item.get(key) for key in ("character", "bodyPart", "description")])
                 for item in _visible_injuries(source("injuries", "activeInjuries"), context, current_chapter,
@@ -917,22 +966,33 @@ def _chapter_write_facts(canonical, relevant, context, *, current_chapter=None, 
         tag("secrets", entry, [entry.get("secret"), *_list(entry.get("holders")), *_list(entry.get("excludedCharacters"))])
         for entry in _records(source("secrets", "secrets"))
     ]
-    items = [
-        tag("items", entry, [key, *(_dict(entry).get(field) for field in ("name", "owner", "holder", "location"))], key)
-        for key, entry in _dict(source("items", "items")).items()
-    ]
+    def entities(kind, fallback, terms, limit):
+        if salience_index is None:
+            return [tag(kind, entry, terms(key, entry), key) for key, entry in _dict(fallback).items()]
+        ranked = _salient_facts(canonical, kind, salience_index, book_plan, arc_plans, current_chapter, context)
+        rows = [
+            {**tag(kind, entry, terms(name, entry), name),
+             "salience": score if tier != "dormant" or hit else score - 20}
+            for name, entry, tier, score, hit in ranked
+        ]
+        return rank(rows)[:limit]
+
+    items = entities("items", source("items", "items"), lambda key, entry: [
+        key, *(_dict(entry).get(field) for field in ("name", "owner", "holder", "location")),
+    ], 28)
     timeline = [
         tag("recentTimeline", entry, [entry.get("event"), *_list(entry.get("characters"))], index)
         for index, entry in enumerate(_records(source("timeline", "recentTimeline"))[-5:])
     ]
-    characters = rank(tag("characters", entry, [key, _dict(entry).get("name")], key)
-                      for key, entry in _dict(relevant.get("characters")).items())
+    characters = rank(entities("characters", relevant.get("characters"),
+                               lambda key, entry: [key, _dict(entry).get("name")], 32))
     clues = rank(tag("openForeshadowing", entry, [entry.get("id"), entry.get("clue")])
                  for entry in _records(relevant.get("openForeshadowing")))
     return rank([*injuries, *secrets, *items, *timeline]), characters, [entry["value"] for entry in clues]
 
 
-def _chapter_anchors(book_plan, lead, include_core_rules, *, rolling_arc_outlines=False, story_notes="", boundary_state=()):
+def _chapter_anchors(book_plan, lead, include_core_rules, *, rolling_arc_outlines=False, story_notes="", boundary_state=(),
+                     roster="", hidden_cast=()):
     anchors = []
     if is_v2_book_plan(book_plan):
         if locks := canon_locks_text(book_plan.get("canonLocks"), boundary_state=boundary_state):
@@ -941,12 +1001,14 @@ def _chapter_anchors(book_plan, lead, include_core_rules, *, rolling_arc_outline
         anchors.append(f"不可变核心口径锁（初始值仅为历史基线）：{_json(locks)}")
     if story_notes:
         anchors.append(story_notes)
+    if roster:
+        anchors.append(roster)
     worldview = _dict(book_plan.get("worldview"))
     if book_plan.get("logline"):
         anchors.append(f"主线卖点：{book_plan['logline']}")
     if worldview.get("setting"):
         anchors.append(f"舞台世界观：{worldview['setting']}")
-    cast = _records(book_plan.get("mainCharacters"))
+    cast = [entry for entry in _records(book_plan.get("mainCharacters")) if entry.get("name") not in hidden_cast]
     if lead:
         cast = sorted(cast, key=lambda entry: entry.get("name") == lead, reverse=True)
     if cast:
@@ -985,7 +1047,8 @@ def _story_ledger_entries(ledger):
     return entries
 
 
-def _memory_slots(canonical, relevant, context, outline, lead, chapter_number, recent_summaries, *, arc_views=()):
+def _memory_slots(canonical, relevant, context, outline, lead, chapter_number, recent_summaries, *, arc_views=(),
+                  salience_index=None, core_names=frozenset(), retired_names=frozenset()):
     hard_items = [
         {"kind": kind, "value": value}
         for kind in ("constraints", "commitments")
@@ -1005,6 +1068,7 @@ def _memory_slots(canonical, relevant, context, outline, lead, chapter_number, r
     base = canonical.get("characters")
     characters = relevant_memory_characters(
         canonical, relevant.get("characters") if base is None else base, lead, f"{context} {_json(outline)}",
+        salience_index=salience_index, core_names=core_names, retired_names=retired_names,
     )
     for entry in characters:
         value = entry["value"]
@@ -1068,6 +1132,8 @@ def _render_allocated_facts(parts, use_long_memory):
         memory = {key: value for key, value in blocks.items() if value}
         if memory:
             facts["longMemory"] = memory
+    elif parts.get("subplots"):
+        facts["subplots"] = parts["subplots"]
     return facts
 
 
@@ -1076,16 +1142,46 @@ def build_chapter_write_prompt(*, book_plan=None, outline=None, prev_chapter_end
                                pov=_DEFAULT_POV, target_words=2000, total_chapters=None, style_guide=_DEFAULT_STYLE,
                                meme_level="none", meme_samples=None, input_budget=None, draft_quality=False,
                                long_memory=False, chapter_ai_gate=False, rolling_arc_outlines=False, story_ledger=False,
-                               boundary_state=()):
+                               boundary_state=(), arc_plans=(), salience_index=None):
+    has_plan = book_plan is not None
     book_plan, outline, canonical = _dict(book_plan), _dict(outline), _dict(canonical_facts)
     chapter_number = outline.get("chapterNumber") or 1
     use_long_memory = long_memory and input_budget is not None
     lead = protagonist_name(book_plan.get("mainCharacters")) if use_long_memory else None
     ending = _EDGE_SPACE.sub("", str(prev_chapter_ending or prev_chapter_summary or ""))
     context = _chapter_context(_text_excerpt(ending, 300, from_end=True), outline)
+    # Older prompt callers can pass an excerpt of the journal without chapter metadata.
+    history = _records(canonical.get("factHistory"))
+    canonical_history = not history or any(type(entry.get("chapter")) is int for entry in history)
+    current = int(_number(chapter_number))
+    use_subplot_projection = rolling_arc_outlines or long_memory and canonical_history
+    if salience_index is None and has_plan and use_subplot_projection:
+        salience_index = entity_index(canonical, before_chapter=current)
+    roster, hidden_cast, core_names, retired_names, subplots = "", set(), set(), set(), []
+    projection = canonical
+    if salience_index is not None:
+        retired = retired_roster(canonical, salience_index, arc_plans=arc_plans, current_chapter=current, limit=None)
+        retired_names = set(retired)
+        hidden_cast = {name for name in retired_names if not _mentions(name, context)}
+        if retired_names and (rolling_arc_outlines or long_memory):
+            prefix = "已退场/身故人物（未经铺垫不得复活或重登舞台）："
+            names = []
+            for name in retired[:30]:
+                if len(prefix) + len("、".join([*names, name])) <= 180:
+                    names.append(name)
+            if names:
+                roster = prefix + "、".join(names)
+        core_names = {name for name, _, tier, _, _ in _salient_facts(
+            canonical, "characters", salience_index, book_plan, arc_plans, current, context,
+        ) if tier == "core"}
+        projection = {**canonical, **_facts_before(canonical, current)}
+    if use_subplot_projection or salience_index is not None:
+        subplots, _ = active_subplots_view(canonical, current_chapter=current, context_text=context)
     relevant = (
-        extract_relevant_facts(canonical, context_text=context, current_chapter=chapter_number, story_ledger=story_ledger)
-        if relevant_facts is None else relevant_facts
+        extract_relevant_facts(projection, context_text=context, current_chapter=current, story_ledger=story_ledger,
+                               book_plan=book_plan if salience_index is not None else None, arc_plans=arc_plans,
+                               salience_index=salience_index)
+        if relevant_facts is None or salience_index is not None else relevant_facts
     )
     summaries = _list(recent_summaries)
     summary_text = "\n".join(
@@ -1093,7 +1189,7 @@ def build_chapter_write_prompt(*, book_plan=None, outline=None, prev_chapter_end
         for entry in summaries[-2:]
     )
     anchors = _chapter_anchors(book_plan, lead, input_budget is not None, rolling_arc_outlines=rolling_arc_outlines,
-                               boundary_state=boundary_state)
+                               boundary_state=boundary_state, roster=roster, hidden_cast=hidden_cast)
     volume_card = volume_card_text(book_plan, chapter_number)
     arc_views = compact_arc_summaries(prior_arc_summaries(canonical, _number(chapter_number))) if rolling_arc_outlines else []
     finale = _CHAPTER_WRITE_FINALE_BLOCK.substitute(
@@ -1101,13 +1197,18 @@ def build_chapter_write_prompt(*, book_plan=None, outline=None, prev_chapter_end
     ) if total_chapters and _number(chapter_number) >= _number(total_chapters) else ""
     style_lines = compact_style_bible(book_plan.get("styleBible")) if draft_quality else []
     draft_rule = (_DRAFT_RULE if draft_quality else "") + (_WRITE_STYLE_RED_LINES if chapter_ai_gate else "")
+    if rolling_arc_outlines or story_ledger or draft_quality and salience_index is not None:
+        draft_rule += "\n章名中的数字仅为规划参考，若与已核验事实或台账冲突，正文以事实为准，切勿为迎合标题改写数值。"
     ledger = {}
     if story_ledger:
         ledger = story_ledger_view(canonical, chapter_number=_number(chapter_number), book_plan=book_plan,
                                    context_text=_chapter_context("", outline))
+        if ledger.get("characterStates") and hidden_cast:
+            ledger["characterStates"] = {name: state for name, state in ledger["characterStates"].items()
+                                         if name not in hidden_cast}
         draft_rule += _STORY_LEDGER_WRITE + "\n" + STORY_LEDGER_MARKER
     if arc_views:
-        draft_rule += "\n既有单元的已演破局、信息揭示与大招只可承接后果或推进新层级，禁止按原样复演。"
+        draft_rule += "\n已演破局、信息揭示与大招只可承接后果或升级，禁止原样复演。"
     pretty_outline = _json(outline, pretty=True)
 
     def render(ending, summary, facts, samples, bible, card):
@@ -1141,10 +1242,12 @@ def build_chapter_write_prompt(*, book_plan=None, outline=None, prev_chapter_end
         visible = _visible_injuries(relevant.get("activeInjuries"), context, chapter_number, story_ledger=story_ledger)
         return render(snippet, summary_text, {**relevant, "activeInjuries": visible,
                                               **({"arcSummaries": arc_views} if arc_views else {}),
+                                              **({"subplots": subplots[:8]} if subplots else {}),
                                               **({"storyLedger": ledger} if ledger else {})}, meme_samples, style_lines, volume_card)
 
-    continuity, characters, clues = _chapter_write_facts(canonical, relevant, context, current_chapter=chapter_number,
-                                                        story_ledger=story_ledger)
+    continuity, characters, clues = _chapter_write_facts(projection, relevant, context, current_chapter=current,
+                                                        story_ledger=story_ledger, book_plan=book_plan,
+                                                        arc_plans=arc_plans, salience_index=salience_index)
     has_style = bool(style_lines)
     style_slot = [{"key": "styleBible", "entries": style_lines, "share": 8}] if has_style else []
     arc_slot = [{"key": "arcSummaries", "entries": arc_views, "share": 10}] if arc_views else []
@@ -1152,7 +1255,8 @@ def build_chapter_write_prompt(*, book_plan=None, outline=None, prev_chapter_end
     samples = _list(meme_samples) if meme_level != "none" else []
     if use_long_memory:
         hard_items, archives, rolling, characters, fallback, payoffs = _memory_slots(
-            canonical, relevant, context, outline, lead, chapter_number, summaries, arc_views=arc_views,
+            projection, relevant, context, outline, lead, chapter_number, summaries, arc_views=arc_views,
+            salience_index=salience_index, core_names=core_names, retired_names=retired_names,
         )
         slots = [
             {"key": "hardMemory", "entries": story_items + hard_items, "share": 20},
@@ -1164,7 +1268,8 @@ def build_chapter_write_prompt(*, book_plan=None, outline=None, prev_chapter_end
             {"key": "summary", "text": rolling, "share": 6},
             {"key": "characters", "entries": characters, "allocate_first": bool(lead),
              "first_fallback": fallback, "share": 7 if has_style else 10},
-            {"key": "subplots", "entries": active_memory_items(canonical, "subplots", context), "share": 3},
+            {"key": "subplots", "entries": subplots[:8] if use_subplot_projection or salience_index is not None else
+             active_memory_items(canonical, "subplots", context), "share": 3},
             {"key": "foreshadowing", "entries": [{"value": value, "paid": False} for value in clues]
              + [{"value": value, "paid": True} for value in payoffs], "share": 3},
             {"key": "samples", "entries": samples, "share": 1},
@@ -1182,6 +1287,9 @@ def build_chapter_write_prompt(*, book_plan=None, outline=None, prev_chapter_end
             {"key": "foreshadowing", "entries": clues, "share": 4 if has_style else 6},
             {"key": "samples", "entries": samples, "share": 2},
         ]
+        if subplots:
+            slots.append({"key": "subplots", "entries": subplots[:8], "share": 3})
+            slots[len(story_slot)]["share"] -= 3
 
     continuity_slot = next(slot for slot in slots if slot["key"] == "continuity")
     if rolling_arc_outlines:
@@ -1234,6 +1342,29 @@ def build_word_count_adjust_prompt(*, chapter_number, chapter_text, current_word
         **values, outline=_json(outline) if outline is not None else "按原文剧情推进", chapter_text=chapter_text,
     )
     return {"system": system, "prompt": prompt}
+
+
+def build_retitle_prompt(*, planned_title, conflicts, chapter_text, recent_titles=()):
+    system = ("[TASK:RETITLE]\n只输出一行不超过22字的中文章名，不带第X章前缀、标记或解释。"
+              "依据正文重拟，避免与正文冲突的数字及与近期章名重复。")
+    title = _text_excerpt(planned_title, 80)
+    entries = [
+        {"titleExpr": _text_excerpt(row["titleExpr"], 24),
+         "bodyExprs": [_text_excerpt(expr, 24) for expr in row["bodyExprs"][:4]]}
+        for row in conflicts
+    ]
+
+    def render(parts):
+        material = {"plannedTitle": title, "conflicts": parts["conflicts"], "recentTitles": parts["recent"],
+                    "beginning": parts["beginning"], "ending": parts["ending"]}
+        return {"system": system, "prompt": _json(material)}
+
+    return fit_prompt(render=render, input_budget=1000, reserve=0, slots=[
+        {"key": "conflicts", "entries": entries, "share": 22},
+        {"key": "recent", "entries": [_text_excerpt(value, 30) for value in recent_titles[-6:] if value], "share": 8},
+        {"key": "beginning", "text": chapter_text[:400], "share": 35},
+        {"key": "ending", "text": chapter_text[-400:], "from_end": True, "share": 35},
+    ])
 
 
 def _chapter_context(chapter_text, outline):
@@ -1393,11 +1524,19 @@ def build_arc_summary_prompt(arc, chapters, *, story_ledger=False, canonical_fac
                "usedHooks": [], "villainStatus": "反派名：新增筹码、失去筹码、退场状态"}
     system = _ARC_SUMMARY_SYSTEM + f"\n本单元 usedBeats 最多 {min(6, max(4, len(chapters)))} 条。"
     review = ""
+    facts = _dict(canonical_facts)
+    subplot_facts = {**facts, "arcSummaries": prior_arc_summaries(facts, arc["startChapter"])}
+    subplot_context = "\n".join(str(chapter.get(key) or "") for chapter in chapters for key in ("title", "summary", "content"))
+    visible, stale = active_subplots_view(subplot_facts, current_chapter=arc["endChapter"] + 1, context_text=subplot_context)
+    if visible or stale:
+        review += f"【可收束支线】\n{_json(_subplot_hints(visible + stale, 6))}\n"
+        example["subplotClosures"] = [{"id": "沿用支线ID", "status": "resolved|dropped", "quote": "4–120字原文（dropped可空）"}]
+        system += "\n可选 subplotClosures。已在本单元正文收束的用 resolved 并附原文，决定不再推进的用 dropped。"
     v2 = is_v2_book_plan(book_plan)
     if v2:
         locks = canon_locks_text(book_plan.get("canonLocks"), boundary_state=boundary_state)
         volumes = volumes_for_range(book_plan, arc["startChapter"], arc["endChapter"])
-        review = (f"{locks}\n" if locks else "") + f"【本单元涉及的分卷阶梯】\n{_json(volumes)}\n"
+        review += (f"{locks}\n" if locks else "") + f"【本单元涉及的分卷阶梯】\n{_json(volumes)}\n"
         example["volumeProgress"] = {"escalation": "已发生的升级≤40字", "cost": "已承担的代价≤30字",
                                      "retiredReused": ["退役手段复演，≤2条，每条≤24字"]}
         system += ("\n可选 volumeProgress，只记录正文已发生的升级、代价和退役手段复演。"
@@ -1427,7 +1566,8 @@ def build_fact_extraction_prompt(*, chapter_number, chapter_text, existing_facts
     effective_facts = existing_facts if canonical_facts is None else canonical_facts
     context = _chapter_context(chapter_text, outline)
     memory_instructions = _memory_extraction(effective_facts, context) if long_memory else ""
-    system = _FACT_EXTRACTION_SYSTEM
+    system = _FACT_EXTRACTION_SYSTEM + (_FACT_RECORDING_RULES if story_ledger or is_v2_book_plan(book_plan)
+                                        else _LEGACY_FACT_RECORDING_RULES)
     if story_ledger:
         ledger = story_ledger_view(effective_facts, chapter_number=_number(chapter_number), book_plan=book_plan,
                                    context_text=context)
@@ -1466,7 +1606,9 @@ def build_verify_prompt(*, chapter_number, chapter_text, outline=None, canonical
         '只有存在真实不可调和的硬冲突时才设 severity="error" 且 passed=false；轻微瑕疵或后续建议一律设为 severity="warning" 且 passed=true。'
     )
     system = _VERIFY_SYSTEM.substitute(
-        pov=pov, ai_instruction=ai_instruction, severity_rule=severity, fact_recording_rules=_FACT_RECORDING_RULES,
+        pov=pov, ai_instruction=ai_instruction, severity_rule=severity,
+        fact_recording_rules=_FACT_RECORDING_RULES if story_ledger or rolling_arc_outlines or is_v2_book_plan(book_plan)
+        else _LEGACY_FACT_RECORDING_RULES,
         memory_rule="\n若有活跃硬规则与期限，也核对本章是否延续；有原文支撑的正常状态变化应更新记忆。" if long_memory else "",
     )
     if story_ledger:

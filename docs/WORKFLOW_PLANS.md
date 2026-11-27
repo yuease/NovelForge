@@ -51,7 +51,7 @@
 
 ## 阶段三：正文撰写（`chapter_writing` · WF-07 / WF-08 / WF-09）
 
-- **状态**：三方方案已收束定稿，待阶段二完成后由 `gpt-6.2-sol` 落实
+- **状态**：已完成并验收通过（后端 136 项相关回归全绿，前端编译通过）
 
 ### 三版方案对比
 
@@ -153,30 +153,68 @@
 
 ## 阶段六：完本终审（`full_audit` · WF-15）
 
-- **状态**：Opus 5.5 与 Gemini 方案已就绪，待 Codex 额度 `06:05` 恢复后补齐 GPT-6.2-Astra 方案并最终定稿交 Sol 实现
+- **状态**：三方方案已收束定稿，待阶段五完成后由 `gpt-6.2-sol` 落实
 
-### 当前方案要点（待补齐 Astra 版三方终评）
-- **方案 A（GPT-6.2-Astra）**：*（Codex 额度于 `02:22` 触顶，已排定时任务待 `06:05` 恢复后自动续接会话 `01a21e0e-6850-7273-9dad-5e744ba6df60` 补齐）*
-- **方案 B（Claude Opus 5.5）**：
-  - 新建纯本地全书体检器 `novel_forge/book_diagnostics.py`（零 LLM 成本）：将问题分 `hard`（未解 `value/clock/alias` 硬伤、error 级元文本、账目断裂、严重 `needs_review`）/ `cap`（`canon/ooc`、刻板反应过热、连续同骨架 ≥4/≥6、旧套路复用、超 8 条长期未回收伏笔）/ `advisory`（退场角色复活等）；终审前自动本地改题；有任意 `hard` 项分数封顶 `69`，无 `hard` 按扣分项算 `scoreCap`。
-  - 终审预算 `28,672`（`fit_prompt` + `on_overflow="expand"` + `pretty=False`），砍掉 213 全量人物和 `items[-30:]`，换上 8 个高信噪比弹性槽（`volumes`、`riskEvidence` 12 章窗口、`planEvidence`、`foreshadowing`、`finaleChapters`、`coreCast` + `retiredRoster`、`rhythm` 统计、`deferredDrifts`）。
-  - 新建 `audit_judge.py`：校验 LLM 提出的阻断项必须正文引文可定位（防模型幻觉阻断），`score = min(rawScore, scoreCap)`，输出三态 `verdict: ready | revise_recommended | blocked`；`_audit` 按 `manuscriptHash` 缓存、单轮复修 ≤6 章（全生命周期每章 ≤1 次）、用本地 `downstream_light_check` 替换昂贵逐章 LLM 复核；新增 `POST /api/jobs/{id}/audit/accept` 允许作者确认带问题完本，永不死卡。
-- **方案 C（Gemini）**：
-  - 新建 `audit_diagnostics.py` 全书确定性体检 + `DEFAULT_AUDIT_INPUT_BUDGET = 24,576`；合并本地硬阻塞与模型报告，强制封顶分数并禁止存在未解硬伤时 `passed: true`；每轮复修 ≤6 章，前端 `MonitorPage` 展示 `localDiagnostics` 摘要与分数封顶理由。
+### 三版方案对比
+
+| 维度 | 方案 A（GPT-6.2-Astra） | 方案 B（Claude Opus 5.5） | 方案 C（Gemini） |
+|---|---|---|---|
+| **全书确定性体检** | `collect_book_diagnostics(snapshot)` 从校准后一致快照单次顺序扫全书；强调 `coverage` 覆盖率可见；区分仅白名单风格 `needs_review`（兼容既有测试放行）vs 硬事实 `needs_review` | `book_diagnostics.py` 将全书信号分 `hard / cap / advisory` 三级（覆盖未解 `driftLedger`、元文本、账目断裂、反应过热、连续骨架相似、旧套路复用、未回收伏笔与退场角色复活）；终审前本地自动改题；有 `hard` 项封顶 69 分 | `audit_diagnostics.py` 聚合未解 `driftChecks`、元文本、标题冲突与节奏统计，有 `hardBlockers` 封顶 75 分 |
+| **终审视野与预算** | `NOVEL_FORGE_AUDIT_INPUT_BUDGET` 默认 `24,576`（实发 ≤23,552），保护区包含“确证总数 vs 展示数”与 `coverage`；高危证据占 40% 成对保留双侧证据；砍掉 200 章首尾摘录/213 龙套/`items[-30:]` | 默认 `28,672` + `on_overflow="expand"` 不卡死 + `pretty=False`；8 个高信噪比弹性槽（`volumes`、`riskEvidence` 12 章窗口、`planEvidence`、`foreshadowing`、`finaleChapters`、`coreCast+retiredRoster`、`rhythm`、`deferredDrifts`） | 默认 `24,576` 复用 `fit_prompt`，以 `volumeSummaries` + 高危证据 + 核心实体替代全量噪音 |
+| **双层裁决与防橡皮图章** | 严格校验模型响应字段与引文可定位；`auditPassed = localHard==0 && modelVerdict=="pass"`；硬阻塞上限 59、系统克隆上限 79、广泛告警上限 89；单轮最多修 2 章、整次 ≤4 章，传结构化 finding 而非纯章号 | `audit_judge.py` 校验模型阻断项须正文引文定位（无据降级 `advisory`，防幻觉死循环）；`score = min(rawScore, scoreCap)`；三态 `verdict: ready / revise_recommended / blocked`；按 `manuscriptHash` 缓存续跑 0 调用；每轮 ≤6 章、单章终生 ≤1 次，用局部补丁+本地下游检验替代昂贵 LLM 下游复核；新增 `POST /api/jobs/{id}/audit/accept` 确认带问题完本 | 合并本地 `hardBlockers` 与模型报告，强制钳位 `scoreCap`，每轮 ≤6 章，失败保留 `AUDIT_GATE_FAILED` 与结构化诊断 |
+
+### 选方案与融合理由
+1. **确定性体检与分数封顶融合 Opus 5.5 的 `hard / cap / advisory` 三级分账与 Astra 的“`coverage` 覆盖率 + 白名单 `needs_review` 兼容”**：
+   - 仅含可降级风格问题的 `needs_review` 章节必须继续放行（保住 `test_python_pipeline.py:404` 既有契约），只把硬事实/账目/元文本/未解 `value/clock/alias` 硬伤划进 `hardBlockers`；
+   - 任何 `hardBlocker` 存在即令 `passed = False` 且 `scoreCap <= 69`（即使模型客气打 98 分也会被代码强制封顶），彻底消灭“98 分橡皮图章”；
+   - 无 `hardBlocker` 但存在系统性节奏克隆（连续高相似骨架 ≥6）/刻板反应过热/大量旧套路复用时，封顶分落到 ~72–79、输出 `verdict: "revise_recommended"`，**允许完本并给出清晰的修订入口**，绝不让 200 章死卡在终审循环。
+2. **终审预算采纳 Astra/Gemini 的 `24,576` 上限 + Opus 5.5 的 `on_overflow="expand"` 与 8 槽结构**：
+   - 彻底淘汰全量 213 角色、`items[-30:]` 和 200 章全量首尾摘录，单次终审从 >15 万 Token 压到 ≤24.6k（砍掉 84%）；保护区额外写明 `coverage` 和“总硬伤数 vs 已展示样本数”，避免模型误以为未展示的就不存在。
+3. **防死循环与有限复修采纳 Opus 5.5 的“`manuscriptHash` 缓存 + 局部补丁优先 + 本地下游检验 + `audit/accept` 人工兜底出口”并采纳 Astra 的“传结构化 finding 而不是纯章号”**：
+   - `_repair_audit_chapters` 接收结构化 finding，有 `quote` 的硬伤走 Stage 5 局部补丁（1 次小调用），下游验证改走 Stage 5 本地 `downstream_light_check`（省去原来每章额外 3 次 LLM 下游复核！），单轮上限 4 章、每章全生命周期上限 1 次；
+   - 新增 `POST /api/jobs/{id}/audit/accept` 允许作者在完整性与篇幅均达标时显式确认带问题完本并留痕 `override`，作者永远不会被困在终审环节。
+
+### 最终定稿落地规范
+- `novel_forge/book_diagnostics.py`（新建）：`collect_book_diagnostics(job, chapters, facts, outlines, arc_plans, *, book_plan)`（`hardBlockers` / `capItems` / `advisories` / `scoreCap` / `coverage` / `stats` / `highRiskChapters`）。
+- `novel_forge/audit_judge.py`（新建）：`ground_blockers(report, chapters)`、`adjudicate_audit(report, diagnostics, chapters)`（`verdict: ready | revise_recommended | blocked`、`rawScore`、`score`、`scoreCap`）、`select_audit_repairs(blockers, repair_ledger, *, limit=4)`。
+- `novel_forge/prompt_budget.py`：`DEFAULT_AUDIT_INPUT_BUDGET = 24_576`、`read_audit_input_budget()`。
+- `novel_forge/prompts.py`：`build_full_book_audit_prompt` 支持 `diagnostics` 与 `input_budget`（`on_overflow="expand"`、`pretty=False`），无 `diagnostics` 且无 `input_budget` 时兼容老调用。
+- `novel_forge/pipeline.py` & `storage.py` & `app.py` & `llm.py`：`_audit` 增加终审前本地改题、同版 `auditCache` 复用、结构化有限复修（优先 Stage 5 局部补丁 + 本地下游检验）、双层 `_completion_gate` 字段升级；新增 `POST /api/jobs/{id}/audit/accept`；更新前端 `MonitorPage.tsx` 完本检查区展示 `verdict`、原分→封顶分、硬阻断列表与「前往修订 / 确认带问题完本」按钮。
 
 ---
 
 ## 阶段七：运行时与长周期配额限流调度（`llm.py` / `pipeline.py` · WF-16）
 
-- **状态**：Opus 5.5 与 Gemini 方案已就绪，待 Codex 额度 `06:05` 恢复后补齐 GPT-6.2-Astra 方案并最终定稿交 Sol 实现
+- **状态**：三方方案已收束定稿，待阶段六完成后由 `gpt-6.2-sol` 落实
 
-### 当前方案要点（待补齐 Astra 版三方终评）
-- **方案 A（GPT-6.2-Astra）**：*（已排定时任务待 `06:05` 恢复后自动续接会话 `01a21e0e-6850-7273-9dad-5e744ba6df60` 补齐）*
-- **方案 B（Claude Opus 5.5）**：
-  - 新建纯函数模块 `novel_forge/rate_limits.py`（`ResetHint`、`parse_duration`、`parse_reset_hint`、`retry_at_iso`、`humanize_wait`、`is_long_quota`），按「响应头 > JSON（含 Gemini `retryDelay`）> 正文（扫 8,000 字符，覆盖 `15h 3m`、`90 minutes`、`Retry-After` 秒数与 RFC 7231 日期、`x-ratelimit-reset-*`、中文时长、绝对时间戳）」解析重置时长。
-  - **主判据改为“距离恢复 > 300 秒”**（不再依赖是否出现 quota 关键词，且计费词 `insufficient_quota` 优先于短时数字以保老测试兼容）；去掉 `Retry-After` 的 60 秒截断；内层遇到长周期或 >60s 直接上抛；增加进程内 `_quota_blocks[(circuit_key, model)]` 快速失败（`test_connection` 豁免）。
-  - 打通 `openai_siwc.py` / `openai_responses.py` 响应头透传，`SIWC_USAGE_LIMIT` 进 `_MANUAL_RESUME`（落 `interrupted` 而非 `failed`），短时 `SIWC_RATE_LIMIT` 进 `_TRANSIENT_ERRORS`；新增**连续 4 次无进展 429 且累计冷却 ≥15 分钟 → `QUOTA_SUSPECTED` 止损断点**；外层 `_cooldown` 尊重服务端等待时长 + 抖动；持久化 `retryAt / quotaScope / quotaKind / resetSource`，前端展示精准预计恢复时间与倒计时，`/resume` 对未到点同模型续跑返回 `quotaPending` 提醒。
-- **方案 C（Gemini）**：
-  - `_parse_reset_delay_seconds`（4,000 字符 + `Retry-After` 秒数/HTTP-date + 英文复合/中文时长）+ 300s 阈值归类 `QUOTA_EXCEEDED` 与 `retry_at`；`SIWC_USAGE_LIMIT` 进 `_MANUAL_RESUME`；`_can_auto_retry` 增加 `retry_after_ms > 300_000` 硬拒绝；短时 `_cooldown` 取 `max(step, retry_after_ms)`；前端 `format.ts` 展示本地预计恢复时间。
+### 三版方案对比
+
+| 维度 | 方案 A（GPT-6.2-Astra） | 方案 B（Claude Opus 5.5） | 方案 C（Gemini） |
+|---|---|---|---|
+| **统一解析与 300s 分界** | `rate_limits.py` 纯函数 `classify_rate_limit`，以 300s 为自动等待上限；**仅在 `x-ratelimit-reset-*` 对应 `remaining=0` 时采信该维重置时间**（防有余额的日窗口误杀 30s RPM 限流）；拒绝无时区裸时间，账单不足附带的 `Retry-After: 2` 不显示“2秒恢复” | `rate_limits.py`（`ResetHint`、`parse_duration`、`parse_reset_hint`、`retry_at_iso`、`humanize_wait`、`is_long_quota`），按「响应头 > JSON（含 Gemini `retryDelay`）> 正文 8000 字」覆盖英文复合时长/中文时长/RFC 7231 日期；计费词优先于短时数字保老测试兼容 | `_parse_reset_delay_seconds`（4000 字 + `Retry-After` 秒数/HTTP-date + 复合/中文时长）+ 300s 阈值 |
+| **SIWC 与全通道对齐** | 打通 `authorized()` HTTP 429 与 `_stream_responses()` SSE 流事件两路，保留原生 `SIWC_USAGE_LIMIT` 且禁止对已收流事件自动重放 | `responses_error(status, payload, headers=None)` 接管响应头；`SIWC_USAGE_LIMIT` 进 `_MANUAL_RESUME`，短时 `SIWC_RATE_LIMIT` 进 `_TRANSIENT_ERRORS`；新增进程内 `_quota_blocks[(circuit_key, model)]` 快速失败 | `SIWC_USAGE_LIMIT` 进 `_MANUAL_RESUME`，透传 `retry_at` |
+| **运行时调度与重启保护** | **发现 `recover_interrupted_jobs()` 漏排除 `QUOTA_EXCEEDED`**，要求与 `run_pipeline()` 共享手动恢复判据；长等待不污染 `_rate_slot` 共享冷却也不计入网络熔断；同断点连续 3 次作业级 429 转 `QUOTA_SUSPECTED` 手动断点 | 去掉 `Retry-After` 的 60s 硬截断；内层遇 >60s 直接上抛交外层 `_cooldown` 尊重服务端提示 + 抖动；同进度连续 4 次且累计冷却 ≥15 分钟转 `QUOTA_SUSPECTED`；`/resume` 对未到点同模型续跑返 `quotaPending` 提醒 | `_can_auto_retry` 增加 `retry_after_ms > 300_000` 硬拒绝，短时 `_cooldown` 取 `max(step, retry_after_ms)` |
+| **前端体验** | 修复 `format.ts` 裸 `/quota/i` 误匹配分钟限流的问题；完整本地日期时间展示 `retryAt` | `format.ts` 统一识别 `QUOTA_EXCEEDED`/`SIWC_USAGE_LIMIT`/`QUOTA_SUSPECTED` 并展示“预计 M月D日 HH:mm 恢复（约 X 小时 Y 分）”；监控页支持倒计时与换模续跑 | `format.ts` 拼出本地预计恢复时间与切换模型提示 |
+
+### 选方案与融合理由
+1. **解析器以 Opus 5.5 的 `rate_limits.py` 为实现骨架，严格植入 Astra 的三项防误报护栏**：
+   - ① 仅在 `x-ratelimit-reset-*` 对应的 `x-ratelimit-remaining-* == 0`（或错误文案明确点名该维）时才采信该头，绝不让仍有余量的 15 小时日窗口误判 30 秒 RPM 限流；
+   - ② 计费词（`insufficient_quota`/`余额不足`）附带的 `Retry-After: 2` 仍归为不可自动重试的计费类 `QUOTA_EXCEEDED`（100% 兼容 `test_python_llm.py:299`），且不生成误导性的“2 秒后恢复” `retryAt`；
+   - ③ 覆盖 `Retry-After` 秒数与 RFC 7231 HTTP-date、JSON `retryDelay`/`resets_at`、8,000 字符正文中的 `15 hours, 3 minutes` / `15h 3m` / `90 minutes` / `54000s` / 中文「15小时3分钟后重置」，彻底去掉原有 60 秒截断。
+2. **运行时防空转与重启防复发融合 Opus 5.5 与 Astra**：
+   - `QUOTA_EXCEEDED`、`SIWC_USAGE_LIMIT`、`QUOTA_SUSPECTED` 统一进入 `_MANUAL_RESUME` **且共用一套判据接入 `recover_interrupted_jobs()`**，确保服务重启后绝不悄悄拉起还在 15 小时冷却期的任务；
+   - 长周期错误（`is_long_quota` 或 `retry_after_ms > 300_000`）内外两层均 0 重试、不污染 `_rate_slot` 共享节流与网络熔断、进程内 `_quota_blocks[(circuit_key, model)]` 快速失败（`test_connection` 与换模型均不受阻）；
+   - 无提示普通 429 设同断点连续 **4 次**作业级 429 止损转 `QUOTA_SUSPECTED` 手动断点（有进度推进即清零计数），彻底杜绝伪装成短限流的长周期配额空转；
+   - 短时 429（≤300s）：内层仅等 ≤60s，>60s 上抛给外层 `_cooldown` 按服务端建议值 + 抖动冷却，绝不提前撞墙。
+3. **前端精准文案与去误判**：修复 `format.ts` 对分钟级 `quota` 的误匹配，在监控页清晰展示本地恢复时间（`预计 M月D日 HH:mm 恢复`）与一键换模续跑入口。
+
+### 最终定稿落地规范
+- `novel_forge/rate_limits.py`（新建纯逻辑模块）：`ResetHint`、`parse_duration`、`parse_reset_hint(*, headers=None, text="", payload=None, now=None)`（含 `remaining == 0` 校验）、`retry_at_iso`、`humanize_wait`、`is_long_quota(error)`。
+- `novel_forge/llm.py`、`openai_siwc.py`、`openai_responses.py`：`_http_error` 与 `responses_error` 接入 `parse_reset_hint`（去掉 60s 截断，透传 `headers`、`retry_after_ms`、`retry_at`、`quota_kind`、`reset_source`）；保留 SSE 流禁止重放保护；`call_llm` 对长周期或 >60s 直接上抛；长周期错误不污染 `_rate_slot` 与熔断器，并增加进程内 `_quota_blocks` 快速失败（可设 `NOVEL_FORGE_QUOTA_FAST_FAIL=0` 关闭）。
+- `novel_forge/pipeline.py`：`run_pipeline` 与 `recover_interrupted_jobs` 共享手动恢复集合（含 `QUOTA_EXCEEDED`、`SIWC_USAGE_LIMIT`、`QUOTA_SUSPECTED`）；`_can_auto_retry` 拒绝 `is_long_quota(error)`；同断点连续 4 次无进展 429 转 `QUOTA_SUSPECTED`；短时 `_cooldown` 尊重服务端 `retry_after_ms`；`_failed` 持久化 `retryAt`、`quotaScope`、`quotaKind`、`resetSource`、`resumePolicy`。
+- 前端：`web-gemini/src/lib/types.ts`、`format.ts`、`pages/MonitorPage.tsx` 补齐类型、精准恢复时间提示与换模续跑引导。
+
+---
+
 
 ---

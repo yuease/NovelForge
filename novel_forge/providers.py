@@ -8,6 +8,7 @@ from typing import Protocol
 import httpx
 
 from .openai_siwc import PROVIDER as SIWC, RESOURCE as SIWC_RESOURCE
+from .thinking_policy import thinking_capability
 
 
 PROVIDERS = {

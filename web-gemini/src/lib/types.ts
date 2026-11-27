@@ -16,7 +16,7 @@ export type LLMProvider =
   | 'ollama'
   | 'openai-compatible'
 
-export type ThinkingMode = 'disabled' | 'enabled'
+export type ThinkingMode = 'disabled' | 'enabled' | 'auto'
 
 export type MemeLevel = 'none' | 'light' | 'rich'
 
@@ -170,6 +170,7 @@ export interface LLMConfig {
   lightModel?: string
   temperature?: number
   thinkingMode?: ThinkingMode
+  thinkingModeSource?: 'user' | 'default' | 'auto' | string
   maxRetries?: number
   timeoutMs?: number
   autoResumeOnRateLimit?: boolean
@@ -376,6 +377,7 @@ export interface JobRecord {
   evaluationReport?: BookEvaluationReport | null
   arcPlans?: ArcPlan[]
   bookPlan?: BookPlan | null
+  writingProfile?: WritingProfile | null
   createdAt?: string
   updatedAt?: string
   llmConfig?: LLMConfig
@@ -489,6 +491,29 @@ export interface ChapterVerification {
   [key: string]: unknown
 }
 
+export interface TitleConflictItem {
+  titleExpr?: string
+  titleValue?: string
+  unit?: string
+  bodyValues?: string[]
+  bodyExprs?: string[]
+  preferredExpr?: string | null
+  reason?: string
+}
+
+export interface ChapterTitleCheck {
+  planned?: string
+  final?: string
+  method?: 'local' | 'llm' | 'strip' | string
+  conflicts?: TitleConflictItem[]
+}
+
+export interface WritingProfile {
+  reasoningHeavy?: boolean
+  score?: number
+  signals?: string[]
+}
+
 export interface ChapterRecord {
   chapterNumber: number
   title?: string
@@ -498,6 +523,8 @@ export interface ChapterRecord {
   status?: string
   verified?: boolean
   verification?: ChapterVerification | null
+  titleCheck?: ChapterTitleCheck | null
+  authorEdited?: boolean
   repairCount?: number
   issues?: string[]
   updatedAt?: string
@@ -660,6 +687,12 @@ export interface ArcVolumeProgress {
   retiredReused?: string[]
 }
 
+export interface ArcSubplotClosure {
+  id: string
+  status: 'resolved' | 'dropped' | string
+  quote?: string
+}
+
 export interface ArcSummary {
   arc?: number
   startChapter: number
@@ -670,6 +703,7 @@ export interface ArcSummary {
   skeleton?: string[]
   shape?: string
   volumeProgress?: ArcVolumeProgress | null
+  subplotClosures?: ArcSubplotClosure[]
   turningPoints?: Array<{ chapter?: number; text?: string }>
   usedBeats?: ArcEvidenceItem[]
   usedHooks?: ArcEvidenceItem[]

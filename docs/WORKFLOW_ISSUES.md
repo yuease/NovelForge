@@ -39,12 +39,15 @@
 
 ## 三、正文撰写（`chapter_writing` / `novel_forge/prompts.py`）
 
-- [ ] **WF-07 `[P0]` 200 章长程下 `items` / `characters` / `subplots` 无限膨胀，挤掉核心旧设定**
+- [x] **WF-07 `[P0]` 200 章长程下 `items` / `characters` / `subplots` 无限膨胀，挤掉核心旧设定**
   - **现象**：200 章跑完 `items = 643 件`、`characters = 213 人`、`characterStates = 126 人`、`subplots = 123 条`，一次性工业道具与龙套在 16,384 Token 预算下把早期世界观边界（如平行时空隔绝、工作室空间、前文母器清单）挤出可见槽位。
-- [ ] **WF-08 `[P0]` 章标题写前锁死、写后不回校，导致多章标题与正文数值直接打架**
+  - **已落地**：新建 `novel_forge/entity_salience.py` 实现存储无损的读取层五级分层（`core/active/dormant/ephemeral/retired`）与衰减打分、严格 `< current_chapter` 时序隔离、锚点区 `retiredRoster` 防退场人物复活、`themeLedger` 旧题材道具降权，并在 `arc_archive` 搭车支持 `subplotClosures` 收束与 35 章陈旧支线冷退。
+- [x] **WF-08 `[P0]` 章标题写前锁死、写后不回校，导致多章标题与正文数值直接打架**
   - **现象**：第 10 章标题“十吨起拍” vs 正文“1 吨起拍”；第 30 章标题“百支精梳棉” vs 正文“80 支”；第 18 章标题“百吨级重工通道” vs 正文“50 吨”。
-- [ ] **WF-09 `[P1]` 考据/重算术题材未防止力写手关闭思考（`thinkingMode: disabled`）**
+  - **已落地**：新建 `novel_forge/chapter_title.py`（中阿数字+通用量词+成语黑名单+同语境锚点冲突检测、零 LLM 本地替换 `local_retitle`、`strip_conflicting_number`），在提交/校准/终审复修前自动按已过审正文回校标题（含小模型重拟兜底与作者手动改题保护），并让滚纲优先消费定稿标题。
+- [x] **WF-09 `[P1]` 考据/重算术题材未防止力写手关闭思考（`thinkingMode: disabled`）**
   - **现象**：主力写手关思考口算十六两制、多朝斤石与史实年号生卒，产出 49 条算术/换算 P0 + 30 条史实 P0，且写章共发生 367 次调用 / 140 次重试。
+  - **已落地**：新建 `novel_forge/thinking_policy.py`（`writing_profile` 多信号识别、`thinking_capability` 保守能力矩阵、`resolve_writing_thinking` 区分用户显式与默认自动保护），对重考据/算术题材在写章与返修阶段自动开启受支持模型的思考并放宽输出预算，新增 HTTP 400 拒参一次回退缓存，前端创建页与监控页同步支持「自动（题材保护）」与重考据题材提示。
 
 ---
 

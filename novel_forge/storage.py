@@ -218,11 +218,13 @@ def _job_record(data, config, now):
     if not model or (provider != "mock" and model == "mock-novel-v1"):
         model = "mock-novel-v1" if provider == "mock" else config["model"]
     retries = raw.get("maxRetries") if "maxRetries" in raw else data.get("maxRetries", 5)
+    requested_thinking = _first_non_null(raw.get("thinkingMode"), data.get("thinkingMode"))
+    explicit_thinking = requested_thinking in ("enabled", "disabled", "auto")
     llm = {
         "provider": provider, "baseUrl": base_url or ("" if provider == "mock" else config["baseUrl"]),
         **({"useSavedConnection": True} if saved else {"apiKey": _first_non_null(raw.get("apiKey"), data.get("apiKey"), "")}),
-        "model": model, "thinkingMode": _first_non_null(raw.get("thinkingMode"), data.get("thinkingMode"),
-                                                       config["thinkingMode"], "disabled"),
+        "model": model, "thinkingMode": requested_thinking if explicit_thinking else "disabled",
+        "thinkingModeSource": ("auto" if requested_thinking == "auto" else "user") if explicit_thinking else "default",
         "temperature": _first_non_null(raw.get("temperature"), data.get("temperature"), 0.7),
         "timeoutMs": _number(_first_non_null(raw.get("timeoutMs"), data.get("timeoutMs"), 300000)) or 300000,
         "maxRetries": _number(retries, None),
@@ -273,6 +275,8 @@ def _chapter_record(number, data, now):
         "status": data.get("status") or "completed", "verification": data.get("verification"),
         "repairCount": _first_non_null(data.get("repairCount"), 0),
         "updatedAt": now, "createdAt": data.get("createdAt") or now,
+        **({"titleCheck": data["titleCheck"]} if data.get("titleCheck") is not None else {}),
+        **({"authorEdited": True} if data.get("authorEdited") is True else {}),
     }
 
 
@@ -553,7 +557,8 @@ class Store:
                       ON CONFLICT(job_id, number) DO UPDATE SET payload=excluded.payload""",
                    (job_id, chapter["chapterNumber"], _json(chapter)))
 
-    def _save_chapter(self, job_id, number, data, facts_delta, long_memory, *, meme_title=None, story_ledger=False):
+    def _save_chapter(self, job_id, number, data, facts_delta, long_memory, *, meme_title=None, story_ledger=False,
+                      track_author_edit=False):
         number = _number(number, None)
         if type(number) is not int or number < 1:
             raise ValueError("Chapter number must be a positive integer")
@@ -561,6 +566,12 @@ class Store:
             job = self._get_job(db, job_id, required=True)
             now = _now()
             chapter = _chapter_record(number, data, now)
+            previous = self._get_chapter(db, job_id, number) or {}
+            if track_author_edit and previous and any(previous.get(key) != chapter[key] for key in ("title", "content")):
+                chapter["authorEdited"] = True
+                chapter.pop("titleCheck", None)
+            elif previous.get("authorEdited") is True:
+                chapter["authorEdited"] = True
             index = dict(_dict(job.get("chapterIndex")))
             index[str(number)] = _chapter_index_entry(chapter)
             updated = {**job, "chapterIndex": index, "updatedAt": now,
@@ -575,7 +586,6 @@ class Store:
             current = _dict(job.get("canonicalFacts"))
             archives = [*_list(current.get("volumeSummaries")), *_list(current.get("arcSummaries"))]
             if any(_archive_touches(archive, [number]) for archive in archives):
-                previous = self._get_chapter(db, job_id, number) or {}
                 if (any(previous.get(key) != chapter[key] for key in ("title", "content", "summary"))
                         or (previous.get("status") == "needs_review") != (chapter["status"] == "needs_review")
                         or (_is_committed(previous) and not _is_committed(chapter))):
@@ -584,8 +594,10 @@ class Store:
             self._write_job(db, updated)
         return chapter, _canonical_facts(updated.get("canonicalFacts"))
 
-    def save_chapter(self, job_id, number, data, *, facts_delta=None, long_memory=False, story_ledger=False):
-        chapter, _ = self._save_chapter(job_id, number, data, facts_delta, long_memory, story_ledger=story_ledger)
+    def save_chapter(self, job_id, number, data, *, facts_delta=None, long_memory=False, story_ledger=False,
+                     track_author_edit=True):
+        chapter, _ = self._save_chapter(job_id, number, data, facts_delta, long_memory, story_ledger=story_ledger,
+                                        track_author_edit=track_author_edit)
         return chapter
 
     def save_verified_chapter(self, job_id, number, data, facts_delta=None, *, long_memory=False, meme_title=None,
@@ -792,6 +804,7 @@ class Store:
                 )}, "repairCount": _first_non_null(chapter.get("repairCount"), 0)}
                 if previous.get("title") != title or previous.get("content") != content:
                     changed.append(number)
+                    chapter.pop("titleCheck", None)
                 self._write_chapter(db, job_id, chapter)
             updated = {
                 **job, "chapterIndex": index, "updatedAt": now, "appliedRevisionId": revision_id,

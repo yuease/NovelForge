@@ -10,7 +10,7 @@ import { COLLAPSE_MOTION, EASE_OUT, TAB_MOTION } from '../lib/motion'
 import { navigate } from '../lib/router'
 import { estimateJobCostCny, formatCny } from '../lib/pricing'
 import { formatNumber, formatTokens, formatWords, friendlyError, messageOf } from '../lib/format'
-import type { ChapterRecord, JobRecord, LLMConfig, LLMProvider, MemeLevel, SSELogItem } from '../lib/types'
+import type { ChapterRecord, JobRecord, LLMConfig, LLMProvider, MemeLevel, SSELogItem, ThinkingMode } from '../lib/types'
 import { useStudio } from '../state/studio'
 import type { ExtendPayload } from '../state/studio'
 import {
@@ -185,6 +185,15 @@ function JobFocus({ job }: { job: JobRecord }) {
               <div className="flex flex-wrap items-center gap-2">
                 <StatusBadge status={job.status} />
                 {stageLabel && running && <Badge tone="neutral">{stageLabel}</Badge>}
+                {job.writingProfile?.reasoningHeavy && (
+                  <span title={job.writingProfile.signals?.length ? `识别信号：${job.writingProfile.signals.join('、')}` : undefined}>
+                    <Badge
+                      tone={job.llmConfig?.thinkingMode === 'disabled' && job.llmConfig?.thinkingModeSource === 'user' ? 'warning' : 'primary'}
+                    >
+                      重算术 / 考据题材
+                    </Badge>
+                  </span>
+                )}
               </div>
               <h2 className="mt-2 truncate font-display text-headline font-normal text-ink">{jobTitle(job)}</h2>
               <p className="mt-0.5 truncate text-body text-muted">
@@ -449,6 +458,7 @@ function JobModelPanel({ job, busy, onSave, onResume }: { job: JobRecord; busy: 
   const [lightModel, setLightModel] = useState(config?.lightModel ?? '')
   const [timeout, setTimeoutSec] = useState(Math.round((config?.timeoutMs ?? 300000) / 1000))
   const [retries, setRetries] = useState(config?.maxRetries ?? 5)
+  const [thinkingMode, setThinkingMode] = useState<ThinkingMode>(config?.thinkingMode ?? 'auto')
   const [autoResume, setAutoResume] = useState(config?.autoResumeOnRateLimit !== false && job.autoResumeOnRateLimit !== false)
   const resolved = resolveSelectedModel(catalog, provider, model)
   const saved = isModelChoiceReady(catalog, provider, resolved)
@@ -456,6 +466,7 @@ function JobModelPanel({ job, busy, onSave, onResume }: { job: JobRecord; busy: 
   const patch: Partial<LLMConfig> = {
     provider, model: resolved, lightModel, timeoutMs: Math.max(timeout, 30) * 1000,
     maxRetries: Math.min(20, Math.max(retries, 0)), autoResumeOnRateLimit: autoResume,
+    ...(provider === 'deepseek' ? { thinkingMode } : {}),
     ...(saved ? { useSavedConnection: true } : {}),
   }
 
@@ -470,6 +481,17 @@ function JobModelPanel({ job, busy, onSave, onResume }: { job: JobRecord; busy: 
         onChange={(p, m) => { if (p !== provider) setLightModel(''); setProvider(p); setModel(m) }}
       />
       <ModelSelect provider={provider} model={lightModel} onChange={setLightModel} catalog={catalog} disabled={busy} label="辅助模型" emptyLabel="与主模型相同" hint="用于审校、事实提取等轻量环节。" />
+      {provider === 'deepseek' && (
+        <Field label="写章思考模式">
+          {(id) => (
+            <Select id={id} value={thinkingMode} onChange={(e) => setThinkingMode(e.target.value as ThinkingMode)} disabled={busy}>
+              <option value="auto">自动（重算术/考据题材自动开启）</option>
+              <option value="enabled">始终启用</option>
+              <option value="disabled">手动关闭</option>
+            </Select>
+          )}
+        </Field>
+      )}
       <div className="grid grid-cols-2 gap-3">
         <Field label="超时（秒）">{(id) => <Input id={id} type="number" min={30} value={timeout} onChange={(e) => setTimeoutSec(Number(e.target.value))} />}</Field>
         <Field label="重试上限">{(id) => <Input id={id} type="number" min={0} max={20} value={retries} onChange={(e) => setRetries(Number(e.target.value))} />}</Field>

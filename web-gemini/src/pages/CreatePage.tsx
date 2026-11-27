@@ -379,9 +379,10 @@ export default function CreatePage() {
                     <Field label="思考模式">
                       {(id) => (
                         <Select id={id} value={thinkingChoice} onChange={(e) => setThinkingChoice(e.target.value as ThinkingMode | '')}>
-                          <option value="">使用连接设置</option>
-                          <option value="enabled">启用</option>
-                          <option value="disabled">关闭</option>
+                          <option value="">自动（重算术/考据题材自动开启）</option>
+                          <option value="auto">自动（题材保护）</option>
+                          <option value="enabled">始终启用</option>
+                          <option value="disabled">手动关闭</option>
                         </Select>
                       )}
                     </Field>

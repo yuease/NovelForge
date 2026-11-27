@@ -23,6 +23,7 @@ from .book_plan import PLAN_VERSION_V2, PLAN_V2_MARKER
 from .openai_responses import call_responses
 from .openai_siwc import PROVIDER as SIWC, RESOURCE as SIWC_RESOURCE, SiwcError, all_stages as siwc_all_stages
 from .providers import get_provider_definition, is_masked_api_key, provider_requires_key, same_endpoint_origin
+from .thinking_policy import resolve_vertex_thinking_config, strip_vertex_model_suffix
 
 
 DEFAULT_TIMEOUT_MS = 300_000
@@ -177,6 +178,12 @@ class _Circuit:
 
 _circuits = {}
 _state_lock = threading.Lock()
+_UNSUPPORTED_THINKING_KEYS: set[tuple[str, str, str]] = set()
+
+
+def reset_thinking_fallback_cache():
+    with _state_lock:
+        _UNSUPPORTED_THINKING_KEYS.clear()
 
 
 def reset_provider_circuit_state():
@@ -409,27 +416,21 @@ def _rejects_output_limit(error):
     )
 
 
+def _rejects_thinking(text):
+    if _CONTENT_BLOCK_RE.search(text):
+        return False
+    return bool(
+        re.search(r"\b(?:thinking|reasoning)\w*", text, re.I)
+        or re.fullmatch(r"\s*(?:unknown|invalid|unsupported)\s+(?:field|parameter|argument)\.?\s*", text, re.I)
+    )
+
+
 def _truncated_error(reason, text, budget, rejected_at, task):
     detail = "可见输出被截断" if text.strip() else "达到输出上限后没有可见正文，可能是思考用量占满预算"
     stage = f"【{task}】" if task else ""
     return LLMError(f"{stage}{detail}（{budget} tokens，{reason}）。可以调整模型或渠道后从断点继续。",
                     code="OUTPUT_TRUNCATED", status=502, finish_reason=reason, request_max_tokens=budget,
                     rejected_output_tokens=rejected_at if math.isfinite(rejected_at) else None)
-
-
-def strip_vertex_model_suffix(model=""):
-    return re.sub(r"-(?:search|build)$", "", str(model or "gemini-3.8-flash").strip(), flags=re.I)
-
-
-def resolve_vertex_thinking_config(model=""):
-    model = strip_vertex_model_suffix(model).lower()
-    if model.startswith("gemini-4-"):
-        return {"thinkingLevel": "LOW"}
-    if "3.8-flash" in model:
-        return {"thinkingBudget": 0}
-    if "flash" in model:
-        return {"thinkingLevel": "MINIMAL"}
-    return None
 
 
 def _encode_component(value):
@@ -759,7 +760,10 @@ async def _call_transport(client, transport, creds, system, prompt, temperature,
         raise LLMError("请先保存供应商的 API 地址。", code="CONFIG_REQUIRED", status=400)
     headers = {}
     label = get_provider_definition(provider)["label"]
-    thinking = None
+    thinking_field = None
+    thinking_key = (provider, creds.base_url, creds.model)
+    with _state_lock:
+        allow_thinking_field = thinking_key not in _UNSUPPORTED_THINKING_KEYS
     if transport in ("openai", "deepseek"):
         endpoint = f"{root}/chat/completions"
         if api_key:
@@ -785,7 +789,9 @@ async def _call_transport(client, transport, creds, system, prompt, temperature,
             body["prompt_cache_key"] = cache_key.strip()[:64]
         if transport == "deepseek":
             label = "DeepSeek"
-            body["thinking"] = {"type": "enabled" if creds.thinking_mode == "enabled" else "disabled"}
+            if allow_thinking_field:
+                body["thinking"] = {"type": "enabled" if creds.thinking_mode == "enabled" else "disabled"}
+                thinking_field = body, "thinking"
     elif transport == "anthropic":
         label = "Anthropic"
         endpoint = root + ("/messages" if root.endswith("/v1") else "/v1/messages")
@@ -824,8 +830,10 @@ async def _call_transport(client, transport, creds, system, prompt, temperature,
             endpoint = build_vertex_endpoint(root, creds.model)
             headers = {"x-goog-api-key": api_key}
             thinking = resolve_vertex_thinking_config(creds.model)
-            if thinking:
+            writing_task = system.startswith(("[TASK:CHAPTER_WRITE]", "[TASK:REPAIR]"))
+            if thinking and allow_thinking_field and (not writing_task or creds.thinking_mode == "enabled"):
                 generation["thinkingConfig"] = thinking
+                thinking_field = generation, "thinkingConfig"
             body["safetySettings"] = _VERTEX_SAFETY_SETTINGS
         else:
             label = "Gemini"
@@ -833,9 +841,11 @@ async def _call_transport(client, transport, creds, system, prompt, temperature,
             endpoint = f"{root}/models/{model}:generateContent?key={_encode_component(api_key)}"
 
     response = await _post(client, endpoint, body, headers)
-    if (response.status_code == 400 and thinking and re.search(r"thinking", response.text, re.I)
-            and re.search(r"unsupported|not supported|invalid", response.text, re.I)):
-        del body["generationConfig"]["thinkingConfig"]
+    if thinking_field is not None and response.status_code == 400 and _rejects_thinking(response.text):
+        with _state_lock:
+            _UNSUPPORTED_THINKING_KEYS.add(thinking_key)
+        fields, field = thinking_field
+        del fields[field]
         response = await _post(client, endpoint, body, headers)
     if not response.is_success:
         if tools and _rejects_tools(response.status_code, response.text):
@@ -1057,12 +1067,12 @@ async def call_llm(*, provider="mock", base_url="", api_key="", model="", thinki
     attempts = max(1, int(retries if retries is not None else max_retries if max_retries is not None else DEFAULT_RETRIES) + 1)
     guard = _guard_output()
     budget = int(max_tokens)
-    if guard and apply_output_floor:
-        budget = max(budget, min(_env_positive_int("NOVEL_FORGE_MIN_OUTPUT_TOKENS", 0), DEFAULT_MAX_TOKENS))
-    if transport == "vertex":
-        budget = max(1024, budget or DEFAULT_MAX_TOKENS)
     stage_match = re.match(r"^\[TASK:([A-Z_0-9]+)\]", system, re.I)
     stage = stage_match[1] if stage_match else None
+    if guard and apply_output_floor:
+        budget = max(budget, min(_env_positive_int("NOVEL_FORGE_MIN_OUTPUT_TOKENS", 0), DEFAULT_MAX_TOKENS))
+    if transport == "vertex" and stage != "RETITLE":
+        budget = max(1024, budget or DEFAULT_MAX_TOKENS)
     rejected_at = math.inf
     truncation = None
     tried = set()
@@ -1168,7 +1178,7 @@ _MOCK_TASKS = {
     "chapter_write": r"撰写第\s*\d+\s*章正文|ChapterWrite",
 }
 _MOCK_MARKERS = ("topic_candidates", "book_plan", "chapter_outlines", "arc_outlines", "arc_summary", "word_count_adjust", "fact_extraction",
-                 "verify", "repair", "de_ai", "full_audit", "chapter_write")
+                 "verify", "repair", "de_ai", "full_audit", "chapter_write", "retitle")
 _BRONZE_KEY = "刻有“玄天七号”的青铜钥匙"
 
 
@@ -1647,6 +1657,8 @@ async def call_mock_llm(*, system="", prompt="", timeout_ms=DEFAULT_TIMEOUT_MS, 
         text = _mock_chapter(combined, chapter, scenario, story_ledger=story_ledger)
     elif task == "word_count_adjust":
         text = _mock_word_count_adjust(combined, chapter)
+    elif task == "retitle":
+        text = "关口生变"
     elif task == "fact_extraction":
         body = prompt.partition(f"【第{chapter}章正文】")[2].partition("请按以下 JSON 格式输出")[0] if story_ledger else ""
         text = _mock_json(_mock_facts(chapter, scenario, story_ledger=story_ledger, body=body))

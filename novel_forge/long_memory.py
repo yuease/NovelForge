@@ -6,6 +6,7 @@ from decimal import Decimal
 from itertools import islice
 
 from .arc_planning import normalize_skeleton
+from .entity_salience import _mentions, entity_tier, retired_character_status, salience_score
 from .text_evidence import locate_quote, normalize_quote
 
 _ITEM_TYPES = {
@@ -579,6 +580,24 @@ def normalize_arc_summary(raw, chapters, *, story_ledger=False, plan_canon=False
                   if index < len(beats)][:cap]
     result = {**meta, "usedBeats": used_beats, "usedHooks": list(islice(evidenced("usedHooks"), 3)),
               "villainStatus": _clean_text(raw.get("villainStatus"), 120)}
+    closures = {}
+    for entry in _list(raw.get("subplotClosures")):
+        entry = _record(entry)
+        identifier, status, quote = entry.get("id"), entry.get("status"), entry.get("quote", "")
+        if not isinstance(identifier, str) or not 1 <= len(identifier.strip()) <= 80:
+            continue
+        if status not in ("resolved", "dropped") or not isinstance(quote, str):
+            continue
+        identifier, quote = identifier.strip(), quote.strip()
+        if status == "resolved" and not (4 <= len(quote) <= 120 and any(
+            locate_quote(quote, source) for source in sources.values()
+        )):
+            continue
+        if status == "dropped" and len(quote) > 120:
+            continue
+        closures.setdefault(identifier, {"id": identifier, "status": status, "quote": quote})
+    if closures:
+        result["subplotClosures"] = list(closures.values())
     if themes := list(dict.fromkeys(text for value in _list(raw.get("themes"))
                                    if (text := _clean_text(value, 24))))[:3]:
         result["themes"] = themes
@@ -649,18 +668,43 @@ def protagonist_name(main_characters):
     return lead["name"] if lead else None
 
 
-def relevant_memory_characters(facts, base_characters, lead, context):
+def relevant_memory_characters(facts, base_characters, lead, context, *, salience_index=None,
+                               core_names=frozenset(), retired_names=frozenset()):
     base = _record(base_characters)
     states = _record(_record(facts).get("characterStates"))
+    current = None
+    if salience_index is not None:
+        current = salience_index.get("beforeChapter")
+        rows = salience_index["characters"]
+        base = {name: row["entry"] for name, row in rows.items()}
+        states = {name: row["state"] for name, row in rows.items() if row["state"]}
     candidates = dict.fromkeys([*base, *states, *([lead] if lead else [])])
 
     def priority(name):
         seen = _record(states.get(name)).get("lastSeenChapter") or _record(base.get(name)).get("sourceChapter")
-        return name == lead, _utf16_length(name) >= 2 and name in context, _number(seen)
+        hit = _mentions(name, context)
+        if salience_index is None and not (core_names or retired_names):
+            return name == lead, _utf16_length(name) >= 2 and name in context, _number(seen)
+        tier = tiers.get(name)
+        score = salience_score(name, "characters", base.get(name), tier, salience_index, current_chapter=current,
+                               context_text=context) if salience_index is not None else 0
+        return name == lead, name in core_names, hit, score, _number(seen)
 
+    tiers = {}
+    for name in candidates:
+        entry = {**_record(states.get(name)), **_record(base.get(name))}
+        if name in retired_names:
+            tiers[name] = "retired"
+        elif name in core_names or name == lead:
+            tiers[name] = "core"
+        elif salience_index is not None:
+            tiers[name] = entity_tier(name, "characters", entry, salience_index, current_chapter=current)
     result = []
-    for name in sorted(candidates, key=priority, reverse=True)[:20]:
+    visible = [name for name in candidates if tiers.get(name) not in ("ephemeral", "retired") or _mentions(name, context)]
+    for name in sorted(visible, key=priority, reverse=True)[:20]:
         value = {**_record(base.get(name)), "name": name}
+        if tiers.get(name) == "retired":
+            value["status"] = retired_character_status(value.get("status") or _record(states.get(name)).get("status"))
         state = states.get(name)
         if isinstance(state, dict):
             links = sorted(
