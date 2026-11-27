@@ -9,6 +9,8 @@ from .llm import LLMError, estimate_tokens
 
 DEFAULT_CHAPTER_INPUT_BUDGET = 16_384
 DEFAULT_ARC_INPUT_BUDGET = 16_384
+DEFAULT_VERIFY_INPUT_BUDGET = 14_336
+DEFAULT_REPAIR_INPUT_BUDGET = 12_288
 CHAPTER_INPUT_RESERVE = 1_024
 ARC_PROMPT_BUDGET_EXCEEDED = "ARC_PROMPT_BUDGET_EXCEEDED"
 _SPACE = "\u0009-\u000d\u0020\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff"
@@ -29,6 +31,14 @@ def read_arc_input_budget(raw=_UNSET):
     if raw is _UNSET:
         raw = os.environ.get("NOVEL_FORGE_ARC_INPUT_BUDGET")
     return _read_input_budget(raw, DEFAULT_ARC_INPUT_BUDGET, label="滚纲", code="ARC_PROMPT_BUDGET_INVALID")
+
+
+def read_review_input_budget(kind="verify", raw=_UNSET):
+    env, default, label, code = {
+        "verify": ("NOVEL_FORGE_REVIEW_INPUT_BUDGET", DEFAULT_VERIFY_INPUT_BUDGET, "审校", "REVIEW_PROMPT_BUDGET_INVALID"),
+        "repair": ("NOVEL_FORGE_REPAIR_INPUT_BUDGET", DEFAULT_REPAIR_INPUT_BUDGET, "返修", "REPAIR_PROMPT_BUDGET_INVALID"),
+    }[kind]
+    return _read_input_budget(os.environ.get(env) if raw is _UNSET else raw, default, label=label, code=code)
 
 
 def _read_input_budget(raw, default, *, label, code):
@@ -107,7 +117,7 @@ def fit_chapter_prompt(*, render, slots, input_budget):
 
 
 def fit_prompt(*, render, slots, input_budget, reserve=CHAPTER_INPUT_RESERVE,
-               code="CHAPTER_PROMPT_BUDGET_EXCEEDED", label="写章"):
+               code="CHAPTER_PROMPT_BUDGET_EXCEEDED", label="写章", on_overflow="raise"):
     """Fit ordered text or entry slots using the final render to measure their cost."""
     limit = input_budget - reserve
 
@@ -122,8 +132,11 @@ def fit_prompt(*, render, slots, input_budget, reserve=CHAPTER_INPUT_RESERVE,
 
     slots = list(slots)
     allocated = {slot["key"]: [] if slot.get("entries") is not None else "" for slot in slots}
-    mandatory = size(render(allocated))
+    protected = render(allocated)
+    mandatory = size(protected)
     if mandatory > limit:
+        if on_overflow == "expand":
+            return {**protected, "budgetMeta": {"budget": input_budget, "used": mandatory, "expanded": True}}
         raise over_budget(mandatory)
     reserved = {}
     for slot in slots:

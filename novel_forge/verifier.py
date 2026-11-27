@@ -6,19 +6,21 @@ import json
 import math
 import re
 from contextlib import aclosing
-from decimal import Decimal
 
 from .arc_planning import character_name_registry, normalize_character_name
 from .book_plan import collect_boundary_state, is_v2_book_plan, valid_plan_ref, verified_boundary_changes
 from .chapter_style import (
     can_save_unverified_draft,
     find_chapter_style_issues,
+    normalize_mock_chapter_prose,
+    reaction_window_issues,
     run_deterministic_checks,
     verified_ai_blockers,
 )
 from .llm import LLMError, call_llm, output_was_truncated
+from .ledger_checks import assess_ledger_delta, is_dialogue_evidence
 from .long_memory import story_ledger_label_key, story_ledger_view
-from .prompts import build_repair_prompt, build_verify_prompt
+from .prompts import build_repair_prompt, build_review_context, build_verify_prompt
 from .text_evidence import locate_quote, normalize_quote
 
 
@@ -133,7 +135,6 @@ _HARD_CONFLICTS = {"hard_value_conflict", "world_rule_conflict", "core_scene_rep
 _STORY_TYPES = {"hard_value_conflict", "character_ooc"}
 _DISTINCT_NAME = re.compile(r"同名|重名|名字也叫|另(?:一个|一位)[^。！？.!?\n]{0,12}(?:也叫|叫|名叫|同名)|不是同一人|并非同一人|不是[^。！？.!?\n]{0,10}本人")
 _NAME_EXCEPTIONS = re.compile(r"(?:并不|没有|不是|并非|可能|好像|以为)同名|化名|笔名|艺名|曾用名|假扮|改名")
-_EXACT_BALANCE = re.compile(r"([+-]?\d{1,20}(?:\.\d{1,6})?)(万元|亿元|元|积分|点|分|级|枚|块)")
 
 
 def _hard_conflict_type(issue, kind):
@@ -226,46 +227,8 @@ def _story_conflict(issue, kind, view, source):
             **({"sourceChapter": chapter} if chapter is not None else {})}
 
 
-def ledger_arithmetic_conflicts(delta, chapter_text, view):
-    """Check only explicit chapter net change and closing balance in matching units."""
-    if not isinstance(delta, dict) or not isinstance(delta.get("memory"), dict):
-        return []
-    rows = _items(delta["memory"].get("ledgerBalances"))
-    balances = {story_ledger_label_key(row["label"]): row for row in view.get("ledgerBalances", [])}
-    source = normalize_quote(chapter_text)
-    issues = []
-    seen = set()
-    for entry in rows[:12]:
-        if not isinstance(entry, dict):
-            continue
-        label = story_ledger_label_key(entry.get("label"))
-        before = balances.get(label)
-        value, change, quote = (entry.get(key) for key in ("value", "change", "quote"))
-        if not before or label in seen or not all(isinstance(item, str) for item in (before.get("value"), value, change, quote)):
-            continue
-        quote = quote.strip()
-        if not 4 <= len(quote) <= 120:
-            continue
-        proof = locate_quote(quote, source)
-        if not proof or len(proof) > 160 or label not in proof.casefold():
-            continue
-        start, end, net = (normalize_quote(item) for item in (before["value"], value, change))
-        amounts = [_EXACT_BALANCE.fullmatch(item) for item in (start, end, net)]
-        if not all(amounts) or len({item[2] for item in amounts}) != 1 or not net.startswith(("+", "-")):
-            continue
-        # Require a stated net for the chapter and the closing balance in the actual excerpt.
-        if not re.search(rf"(?:本章|本轮|本次)(?:合计|累计)?净(?:变动|额)?[:=]?{re.escape(net)}(?!\d)", proof):
-            continue
-        if not re.search(rf"(?:期末余额|结算余额|最终余额)[:=]?{re.escape(end)}(?!\d)", proof):
-            continue
-        if Decimal(amounts[0][1]) + Decimal(amounts[2][1]) != Decimal(amounts[1][1]):
-            seen.add(label)
-            issues.append({
-                "type": "hard_value_conflict", "severity": "error", "quote": quote,
-                "sourceChapter": before.get("updatedAtChapter"), "ledgerRef": {"kind": "balance", "key": before["label"]},
-                "message": f"「{before['label']}」的前值 {before['value']} 与本轮净变动 {change} 无法得到期末余额 {value}。",
-            })
-    return issues
+def ledger_arithmetic_conflicts(delta, chapter_text, view, *, book_plan=None):
+    return assess_ledger_delta(delta, chapter_text, view, book_plan=book_plan)["issues"]
 
 
 def _min_words(minimum, target):
@@ -276,12 +239,13 @@ async def verify_chapter(*, chapter_number, chapter_text, outline=None, canonica
                          pov=_DEFAULT_POV, target_words=1500, min_words=None, max_words=None, llm_config=None,
                          verify_llm_config=None, test_scenario=None, chapter_ai_gate=False, long_memory=False,
                          strict_review_result=False, store=None, client=None, book_plan=None, recent_chapters=None,
-                         rolling_arc_outlines=False, story_ledger=False, boundary_state=()):
+                         rolling_arc_outlines=False, story_ledger=False, boundary_state=(), chapter_title=None,
+                         reaction_history=None, input_budget=None, review_context=None, arc_plans=()):
     facts = canonical_facts or {}
     minimum = _min_words(min_words, target_words)
     maximum = math.floor(target_words * 1.35 + 0.5) if max_words is None else max_words
     checks = run_deterministic_checks(chapter_number=chapter_number, chapter_text=chapter_text, canonical_facts=facts,
-                                      pov=pov, min_words=minimum, max_words=maximum)
+                                      pov=pov, min_words=minimum, max_words=maximum, title=chapter_title, book_plan=book_plan)
     local, word_count = checks["issues"], checks["wordCount"]
     if chapter_ai_gate and (style := find_chapter_style_issues(str(chapter_text or ""), facts, word_count,
                                                               recent_chapters=recent_chapters)):
@@ -290,12 +254,20 @@ async def verify_chapter(*, chapter_number, chapter_text, outline=None, canonica
                 "aiIssues": [], "factsDelta": None, "usage": None,
                 "summary": f"第{chapter_number}章发现 {len(issues)} 处问题"}
 
+    if review_context is None and input_budget is not None:
+        review_context = build_review_context(
+            chapter_number=chapter_number, outline=outline, canonical_facts=facts, book_plan=book_plan,
+            long_memory=long_memory, rolling_arc_outlines=rolling_arc_outlines, story_ledger=story_ledger,
+            boundary_state=boundary_state, arc_plans=arc_plans,
+        )
     prompt = build_verify_prompt(
         chapter_number=chapter_number, chapter_text=chapter_text, outline=outline, canonical_facts=facts,
         prev_chapter_ending=prev_chapter_ending, pov=pov, min_words=minimum, max_words=maximum,
         chapter_ai_gate=chapter_ai_gate, long_memory=long_memory, book_plan=book_plan, rolling_arc_outlines=rolling_arc_outlines,
-        story_ledger=story_ledger, boundary_state=boundary_state,
+        story_ledger=story_ledger, boundary_state=boundary_state, input_budget=input_budget, review_context=review_context,
+        arc_plans=arc_plans,
     )
+    budget_meta = prompt.pop("budgetMeta", None)
     config = _llm_options(verify_llm_config if verify_llm_config is not None else llm_config)
     scenario = test_scenario if test_scenario is not None else _llm_options(llm_config).get("test_scenario")
     reply = await call_llm(**{**config, "test_scenario": scenario}, **prompt, temperature=0.2, store=store, client=client)
@@ -306,21 +278,32 @@ async def verify_chapter(*, chapter_number, chapter_text, outline=None, canonica
         raise LLMError(f"第{chapter_number}章审校响应缺少有效 JSON，无法核验该章。",
                        code="CHAPTER_REVIEW_INVALID_JSON", status=502)
     parsed = parsed if isinstance(parsed, dict) else {}
+    local.extend(reaction_window_issues(str(chapter_text or ""), reaction_history,
+                                        chapter_number=chapter_number, ai_gate=chapter_ai_gate))
     has_word_error = any(issue["type"] == "word_count" and issue["severity"] == "error" for issue in local)
     remote = []
     hard_quotes = set()
     v2 = is_v2_book_plan(book_plan)
     plan_source = normalize_quote(chapter_text) if v2 else ""
     ledger_view, ledger_source = {}, ""
+    delta = parsed.get("factsDelta")
     if story_ledger:
-        ledger_view = story_ledger_view(facts, chapter_number=chapter_number, book_plan=book_plan,
-                                        context_text=f"{chapter_text}\n{json.dumps(outline or {}, ensure_ascii=False)}")
+        ledger_view = (review_context["story_ledger_view"] if review_context is not None
+                       else story_ledger_view(facts, chapter_number=chapter_number, book_plan=book_plan))
         ledger_source = normalize_quote(chapter_text)
         local.extend(_confirmed_name_collisions(parsed.get("newCharacterCandidates"), chapter_text, facts, book_plan, chapter_number))
-        remote.extend(ledger_arithmetic_conflicts(parsed.get("factsDelta"), chapter_text, ledger_view))
+        assessment = assess_ledger_delta(delta, chapter_text, ledger_view, book_plan=book_plan)
+        local.extend([*assessment["issues"], *assessment["warnings"]])
+        delta = assessment["cleanedDelta"]
 
     def grounded(issue):
         return bool(verified_ai_blockers([{**issue, "priority": "P1"}], chapter_text))
+
+    def story_conflict(issue, kind):
+        confirmed = _story_conflict(issue, kind, ledger_view, ledger_source)
+        if confirmed and confirmed["ledgerRef"]["kind"] == "balance" and is_dialogue_evidence(chapter_text, confirmed["quote"]):
+            return {**confirmed, "severity": "warning"}
+        return confirmed
 
     def plan_conflict(issue, kind):
         quote = issue.get("quote")
@@ -338,7 +321,7 @@ async def verify_chapter(*, chapter_number, chapter_text, outline=None, canonica
             remote.append(plan_conflict(issue, kind))
             continue
         if "ledgerRef" in issue or issue.get("type") == "character_ooc":
-            if story_ledger and (confirmed := _story_conflict(issue, issue.get("type"), ledger_view, ledger_source)):
+            if story_ledger and (confirmed := story_conflict(issue, issue.get("type"))):
                 remote.append(confirmed)
             continue
         if kind and grounded(issue):
@@ -371,9 +354,10 @@ async def verify_chapter(*, chapter_number, chapter_text, outline=None, canonica
             continue
         if "ledgerRef" in issue or entry["category"] in ("character_ooc", "character_name_collision"):
             candidate = {**issue, "message": entry["impact"] or entry["suggestion"] or "正文与已核实的随章台账冲突。"}
-            if story_ledger and (confirmed := _story_conflict(candidate, entry["category"], ledger_view, ledger_source)):
+            if story_ledger and (confirmed := story_conflict(candidate, entry["category"])):
                 remote.append(confirmed)
-                ai_issues.append({**entry, "priority": "P1" if entry["priority"] == "P2" else entry["priority"]})
+                priority = "P2" if confirmed["severity"] == "warning" else "P1" if entry["priority"] == "P2" else entry["priority"]
+                ai_issues.append({**entry, "priority": priority})
             continue
         if (kind := _hard_conflict_type(issue, entry["category"])) and grounded(entry):
             entry["priority"] = "P1" if entry["priority"] == "P2" else entry["priority"]
@@ -391,7 +375,6 @@ async def verify_chapter(*, chapter_number, chapter_text, outline=None, canonica
     passed = not any((issue.get("severity") or "error") == "error" for issue in issues) and (
         all(issue.get("severity") == "warning" for issue in issues) or parsed.get("passed") is not False
     )
-    delta = parsed.get("factsDelta")
     changes = verified_boundary_changes(parsed.get("boundaryChanges"), book_plan=book_plan, chapter_text=chapter_text) if passed else []
     return {
         "passed": passed, "chapterNumber": chapter_number, "wordCount": word_count, "issues": issues,
@@ -400,6 +383,7 @@ async def verify_chapter(*, chapter_number, chapter_text, outline=None, canonica
                     else parsed.get("summary") or f"第{chapter_number}章一致性审校通过"),
         "usage": reply.get("usage"),
         **({"boundaryChanges": changes} if changes else {}),
+        **({"budgetMeta": budget_meta} if budget_meta else {}),
     }
 
 
@@ -409,7 +393,8 @@ async def review_chapter_stages(*, chapter_number, chapter_text, job_id=None, ou
                                 max_retries=2, on_event=None, chapter_ai_gate=False, long_memory=False,
                                 degrade_on_verify_exhausted=False, store=None, client=None, book_plan=None,
                                 recent_chapters=None, rolling_arc_outlines=False, story_ledger=False,
-                                extract_missing_facts=None, boundary_state=()):
+                                extract_missing_facts=None, boundary_state=(), chapter_title=None, reaction_history=None,
+                                verify_input_budget=None, repair_input_budget=None, arc_plans=()):
     """Yield verify/review phases. Send 'repair' or advance normally to accept repair."""
     current = chapter_text
     repair_count = 0
@@ -417,14 +402,20 @@ async def review_chapter_stages(*, chapter_number, chapter_text, job_id=None, ou
     repairs = []
     usage = dict.fromkeys(("promptTokens", "completionTokens", "totalTokens"), 0)
     facts = canonical_facts or {}
+    review_context = build_review_context(
+        chapter_number=chapter_number, outline=outline, canonical_facts=facts, book_plan=book_plan,
+        long_memory=long_memory, rolling_arc_outlines=rolling_arc_outlines, story_ledger=story_ledger,
+        boundary_state=boundary_state, arc_plans=arc_plans,
+    )
     context = {
         "chapter_number": chapter_number, "outline": outline, "canonical_facts": facts,
         "prev_chapter_ending": prev_chapter_ending, "pov": pov, "target_words": target_words,
         "chapter_ai_gate": chapter_ai_gate, "book_plan": book_plan, "long_memory": long_memory,
         "rolling_arc_outlines": rolling_arc_outlines, "story_ledger": story_ledger, "boundary_state": boundary_state,
+        "review_context": review_context, "arc_plans": arc_plans,
     }
     check_options = {"chapter_number": chapter_number, "canonical_facts": facts, "pov": pov,
-                     "min_words": _min_words(min_words, target_words)}
+                     "min_words": _min_words(min_words, target_words), "title": chapter_title, "book_plan": book_plan}
 
     def add_usage(reply_usage):
         for key in usage:
@@ -436,16 +427,20 @@ async def review_chapter_stages(*, chapter_number, chapter_text, job_id=None, ou
             **context, chapter_text=current, min_words=min_words, max_words=max_words, llm_config=llm_config,
             verify_llm_config=verify_llm_config, test_scenario=test_scenario,
             strict_review_result=degrade_on_verify_exhausted, store=store, client=client, recent_chapters=recent_chapters,
+            input_budget=verify_input_budget, chapter_title=chapter_title, reaction_history=reaction_history,
         )
         if story_ledger and extract_missing_facts and verification["passed"] and not isinstance(verification["factsDelta"], dict):
             delta = await extract_missing_facts(current)
-            view = story_ledger_view(facts, chapter_number=chapter_number, book_plan=book_plan)
-            conflicts = ledger_arithmetic_conflicts(delta, current, view)
-            verification["factsDelta"] = delta if not conflicts else None
+            assessment = assess_ledger_delta(delta, current, review_context["story_ledger_view"], book_plan=book_plan)
+            conflicts = assessment["issues"]
+            verification["factsDelta"] = assessment["cleanedDelta"] if not conflicts else None
+            verification["issues"] = list(verification["issues"])
+            for issue in [*conflicts, *assessment["warnings"]]:
+                if issue not in verification["issues"]:
+                    verification["issues"].append(issue)
             if conflicts:
                 verification.pop("boundaryChanges", None)
-                verification.update(passed=False, issues=[*verification["issues"], *conflicts],
-                                    summary=f"第{chapter_number}章补提事实时发现余额硬冲突")
+                verification.update(passed=False, summary=f"第{chapter_number}章补提事实时发现余额硬冲突")
         add_usage(verification.get("usage"))
         passed = verification["passed"]
         if repair_input is not None:
@@ -479,15 +474,16 @@ async def review_chapter_stages(*, chapter_number, chapter_text, job_id=None, ou
             "chapterNumber": chapter_number, "attempt": repair_count, "maxRetries": max_retries, "issues": repair_input,
         })
         prompt = build_repair_prompt(
-            **context, chapter_text=current, issues=repair_input,
+            **context, chapter_text=current, issues=repair_input, input_budget=repair_input_budget,
             ai_issues=[] if chapter_ai_gate else [issue for issue in verification["aiIssues"] if issue["priority"] in ("P0", "P1")],
         )
+        prompt.pop("budgetMeta", None)
         config = _llm_options(llm_config)
         if test_scenario is not None:
             config["test_scenario"] = test_scenario
         reply = await call_llm(**config, **prompt, temperature=0.4, store=store, client=client)
         add_usage(reply.get("usage"))
-        rewritten = str(reply.get("text") or "").strip()
+        rewritten = normalize_mock_chapter_prose(str(reply.get("text") or "").strip(), chapter_number)
         if not output_was_truncated(reply.get("finishReason")) and len(rewritten.encode("utf-16-le", "surrogatepass")) >= 100:
             current = rewritten
 

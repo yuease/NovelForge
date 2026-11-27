@@ -488,6 +488,11 @@ export interface ChapterVerification {
   passed?: boolean
   summary?: string
   boundaryChanges?: BoundaryChangeRecord[]
+  budgetMeta?: {
+    budget?: number
+    used?: number
+    expanded?: boolean
+  }
   [key: string]: unknown
 }
 

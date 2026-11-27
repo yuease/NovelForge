@@ -23,6 +23,7 @@ from .hotspots import generate_concept
 from .llm import LLMError, test_connection
 from .openai_siwc import OpenAISiwc, SiwcError
 from .pipeline import PipelineError, PipelineRuntime, _write
+from .prompt_budget import read_review_input_budget
 from .providers import ProviderCatalogError, list_model_catalog, sync_provider_models, update_model_settings
 from .storage import StorageError, Store, claim_data_dir, public_job
 from .siwc_routes import siwc_router
@@ -464,7 +465,8 @@ def create_app(data_dir: Path | None = None, *, client=None):
             verification = await verify_chapter(
                 chapter_number=chapter_number, chapter_text=draft["content"], outline=outline, canonical_facts=facts,
                 strict_review_result=pending, chapter_ai_gate=pending and os.getenv("NOVEL_FORGE_WRITE_AI_GATE") != "0",
-                boundary_state=boundary_state, **settings,
+                boundary_state=boundary_state, chapter_title=draft.get("title"),
+                input_budget=read_review_input_budget(), **settings,
             )
             if pending and verification["passed"]:
                 draft["status"] = "verified"

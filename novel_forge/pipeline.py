@@ -19,7 +19,7 @@ from .book_plan import (
     PLAN_VERSION_V2, BookPlanValidationError, collect_boundary_state, is_v2_book_plan, validate_book_plan, volume_for_chapter,
     verified_boundary_changes,
 )
-from .chapter_style import can_save_unverified_draft
+from .chapter_style import can_save_unverified_draft, normalize_mock_chapter_prose, reaction_counts
 from .chapter_title import clean_retitle, local_retitle, strip_conflicting_number, title_body_conflicts
 from .docx_export import DOCX_CONTENT_TYPE, FANQIE_SIZE_LIMIT, build_fanqie_docx, format_fanqie_chapter_title, split_fanqie_paragraphs
 from .draft_quality import clean_chapter_draft, normalize_style_bible, strip_draft_headings
@@ -28,7 +28,7 @@ from .hotspots import HotspotsFeed, select_or_generate_concept
 from .llm import DEFAULT_MAX_TOKENS, LLMError, build_mock_volume_summary, call_llm, output_was_truncated, protected_output_budget
 from .long_memory import normalize_volume_summary
 from .memes import MemeStore
-from .prompt_budget import ARC_PROMPT_BUDGET_EXCEEDED, DEFAULT_ARC_INPUT_BUDGET, read_arc_input_budget
+from .prompt_budget import ARC_PROMPT_BUDGET_EXCEEDED, DEFAULT_ARC_INPUT_BUDGET, read_arc_input_budget, read_review_input_budget
 from .prompts import (
     STYLE_PRESETS,
     build_arc_outlines_prompt,
@@ -69,7 +69,10 @@ _MARKDOWN_HEADING = re.compile(r"^#{1,6}\s*")
 
 
 def read_writing_options(job=None):
-    return {**read_prompt_writing_options(job), "arc_input_budget": read_arc_input_budget()}
+    return {
+        **read_prompt_writing_options(job), "arc_input_budget": read_arc_input_budget(),
+        "verify_input_budget": read_review_input_budget("verify"), "repair_input_budget": read_review_input_budget("repair"),
+    }
 
 
 class PipelineError(RuntimeError):
@@ -1040,6 +1043,7 @@ class PipelineRuntime:
             chapter["chapterNumber"]: chapter for chapter in await asyncio.to_thread(self.store.get_chapters, job_id)
             if _is_committed(chapter)
         }
+        reaction_cache = {number: reaction_counts(chapter.get("content") or "") for number, chapter in committed.items()}
         running_words = sum(_word_count(chapter) for chapter in committed.values())
         first_missing = next((number for number in range(1, total + 1) if number not in committed), total + 1)
         profile = job.get("writingProfile")
@@ -1159,6 +1163,7 @@ class PipelineRuntime:
             written = await self._llm(job_id, "chapter_writing", write_config, prompt, config.get("temperature", 0.7),
                                       max_tokens=budget)
             chapter_text = str(written.get("text") or "").strip()
+            chapter_text = normalize_mock_chapter_prose(chapter_text, number)
             if output_was_truncated(written.get("finishReason")):
                 raise LLMError("写章输出达到上限，请从断点继续。", code="OUTPUT_TRUNCATED", status=502, retryable=True)
             words = count_chinese_words(chapter_text)
@@ -1179,6 +1184,7 @@ class PipelineRuntime:
                 fact_prompt = build_fact_extraction_prompt(
                     chapter_number=number, chapter_text=body, outline=outline, canonical_facts=facts,
                     long_memory=options["long_memory"], story_ledger=story_ledger, book_plan=job.get("bookPlan"),
+                    input_budget=options["verify_input_budget"],
                 )
                 reply = await self._llm(job_id, "fact_extraction", auxiliary, fact_prompt, 0.2)
                 return _dict(parse_json_from_llm(reply.get("text"))) if not output_was_truncated(reply.get("finishReason")) else {}
@@ -1192,6 +1198,9 @@ class PipelineRuntime:
                 max_retries=max_repairs, chapter_ai_gate=options["chapter_ai_gate"], long_memory=options["long_memory"],
                 degrade_on_verify_exhausted=options["degrade_on_verify_exhausted"], store=self.store, client=self.client,
                 on_event=lambda name, fields: self._publish(job_id, name, **fields),
+                chapter_title=title, arc_plans=arcs, verify_input_budget=options["verify_input_budget"],
+                repair_input_budget=options["repair_input_budget"],
+                reaction_history={n: reaction_cache[n] for n in range(max(1, number - 9), number) if n in reaction_cache},
             )) as review:
                 verify = await anext(review)
                 while True:
@@ -1206,6 +1215,7 @@ class PipelineRuntime:
                     needs_review = result["canCommitForReview"] and (
                         body == result["chapterText"] or can_save_unverified_draft(
                             body, result["verification"], chapter_number=number, canonical_facts=facts, pov=pov, min_words=minimum,
+                            title=title, book_plan=plan,
                         )
                     )
                     decision = {**decision, "canCommitForReview": needs_review}
@@ -1240,6 +1250,7 @@ class PipelineRuntime:
             if meme_title:
                 used_samples.add(meme_title)
             committed[number] = saved
+            reaction_cache[number] = reaction_counts(body)
             running_words += _word_count(saved)
             arc = next((arc for arc in arcs if arc["endChapter"] == number), None)
             archive_arc = arc is not None and any(n not in committed for n in range(number + 1, total + 1))

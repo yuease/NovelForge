@@ -53,18 +53,22 @@
 
 ## 四、写中审校与返修（`chapter_verify` / `verifier.py` / `chapter_style.py`）
 
-- [ ] **WF-10 `[P0]` `build_verify_prompt` 与 `build_repair_prompt` 未接入 Token 预算器（最大烧钱黑洞）**
+- [x] **WF-10 `[P0]` `build_verify_prompt` 与 `build_repair_prompt` 未接入 Token 预算器（最大烧钱黑洞）**
   - **现象**：单 `chapter_verify` 阶段烧掉 **1,863 万 Token（占全书 65%，均摊每章输入 7.1 万 Token）**，却依然漏过 99 条 P0。
   - **代码位置**：`novel_forge/prompts.py` `build_verify_prompt()`、`build_repair_prompt()`（直接 `pretty=True` 全量拼装事实与记忆）。
-- [ ] **WF-11 `[P0]` 账目算术硬校验 `ledger_arithmetic_conflicts` 正则过严形同虚设**
+  - **已落地**：`prompt_budget.py` 新增 `on_overflow="expand"` 与 `read_review_input_budget`（审校 `14,336`、返修 `12,288`），`prompts.py` 新增单章复用 `build_review_context` 与紧凑 `pretty=False` 序列化（200 章压测夹具实测审校 13,265 / 返修 11,162 Token）。
+- [x] **WF-11 `[P0]` 账目算术硬校验 `ledger_arithmetic_conflicts` 正则过严形同虚设**
   - **现象**：49 条算术与账目冲突（含第 6 章售盐收入在第 10 章余额归零漏计）全数漏网。
   - **代码位置**：`novel_forge/verifier.py` `ledger_arithmetic_conflicts()`（同时要求账户全称 `label` + `本章净变动:` + `期末余额:` 逐字出现在同一条 120 字正文引文中）。
-- [ ] **WF-12 `[P0]` 本地确定性门禁漏拦“破第四面墙元文本”与“标题-正文数值冲突”**
+  - **已落地**：新建 `novel_forge/ledger_checks.py`（中阿数字+书内动态换算 `unit_conversions`+A/B/C/D 四类检查+`numeric_claims`），自然正文取证取代财务报表正则，严格区分正文硬错与抽取错 delta 清洗并在补提路径共享。
+- [x] **WF-12 `[P0]` 本地确定性门禁漏拦“破第四面墙元文本”与“标题-正文数值冲突”**
   - **现象**：上下文反复出现的 `第X章` 诱发模型直接写进正文（第 80 章台词“把第78章大秦五原关樟木箱里……”漏过；第 200 章“随着第199章因果闭环达成”幸好被模型审校截住）。
   - **代码位置**：`novel_forge/chapter_style.py` `run_deterministic_checks()`。
-- [ ] **WF-13 `[P1]` 审校 `usedBeats` 窗口过窄（仅 12 条 ≈ 9 章）且缺高频反派反应滑窗拦截**
+  - **已落地**：新增 `find_meta_text`（叙述+对白全扫描 + 5 类同句白名单，`meta_text` 阻断降级提交）并接入 Stage 3 标题冲突输出 `title_mismatch` (`warning`)。
+- [x] **WF-13 `[P1]` 审校 `usedBeats` 窗口过窄（仅 12 条 ≈ 9 章）且缺高频反派反应滑窗拦截**
   - **现象**：超过 9 章的整段重演审校看不见；全书“瞳孔骤缩/微缩”出现 24 次、“裤裆湿透 / 拖死狗”连续多章复刻。
   - **代码位置**：`novel_forge/prompts.py`（`compact_used_beats(arc_views, limit=12)`）、`novel_forge/chapter_style.py`。
+  - **已落地**：新增 `recall_used_beats` 全书 4 字召回 + Stage 2 `theme_hits` 组成 `repeatRecall` 槽；新增 10 组刻板反应族 5 章/10 章滑窗（`reaction_window_issues`）且取消对远程事实审校的短路遮蔽。
 
 ---
 

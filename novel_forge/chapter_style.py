@@ -4,6 +4,8 @@ import re
 import unicodedata
 from itertools import combinations
 
+from .chapter_title import title_body_conflicts
+from .ledger_checks import parse_amount
 from .storage import count_chinese_words
 from .text_evidence import locate_quote as _locate_quote, normalize_quote as _normalize_quote
 
@@ -14,6 +16,29 @@ _QUOTED_DIALOGUE = re.compile(r'“[^”]*”|「[^」]*」|『[^』]*』|"[^"]*
 _STYLE_DIALOGUE = re.compile(_QUOTED_DIALOGUE.pattern + r"|‘[^’]*’|＂[^＂]*＂")
 _FILLER = re.compile(r"瞬间|骤然|死寂|仿佛|一丝(?!不苟|不挂|一毫)|一抹(?!黑|布)")
 _MOUTH_ARC = re.compile(r"(?:嘴角|唇角)[^。！？.!?；;\r\n]{0,10}?(?:勾起|泛起|扯出|咧开|扬起|浮现)")
+_REACTIONS = {
+    "pupil": re.compile(r"瞳孔(?:猛然|骤然|剧烈|微微|瞬间)?(?:一缩|骤缩|微缩|紧缩|收缩|地震)"),
+    "gasp": re.compile(r"倒吸(?:了一口|一口)?(?:凉气|冷气)"),
+    "mouth": _MOUTH_ARC,
+    "knuckle": re.compile(r"指节(?:泛白|发白|捏得发白)"),
+    "throat": re.compile(r"喉结(?:上下)?(?:滚动|滑动)"),
+    "soaked": re.compile(r"(?:冷汗|后背)[^。！？\n]{0,6}湿透|裤裆[^。！？\n]{0,6}(?:一热|湿透|湿了|尿)"),
+    "drag": re.compile(r"(?:像|如同|宛如)?拖死狗"),
+    "collapse": re.compile(r"(?:双腿|双膝|腿)一软|扑通(?:一声)?跪"),
+    "pallor": re.compile(r"脸色(?:瞬间|骤然|猛地)?(?:煞白|惨白|铁青|猪肝色)"),
+    "silence": re.compile(r"全场死寂|鸦雀无声|落针可闻"),
+}
+_META_TEXT = re.compile(
+    r"第\s*(?P<number>[0-9０-９]{1,4}|[零〇一二两三四五六七八九十百千]{1,6})\s*章"
+    r"|上一章|下一章|前几章|上几章|本章结尾|读者(?:朋友|们|大大)|作者(?:按|注|有话说)"
+)
+_META_DOCUMENT = re.compile(
+    r"秘籍|功法|乐章|序章|法典|条例|章程|书稿|古籍|典籍|卷|篇|节|律|典|册|条|奏|疏|折|诏|史|志"
+    r"|回(?!到|来|去|头|想|忆|答|应|环)|(?<!已)经(?!过|常|历)|传(?!说|闻|来|出|入)|记(?!得|下|住|忆)"
+)
+_META_IDIOM = re.compile(r"约法三章|杂乱无章|顺理成章|出口成章|章程|印章|勋章|文章|奏章|规章|断章取义")
+_METAFICTION = re.compile(r"穿书|原著|小说世界|书中人|剧本世界")
+_META_NEGATION = re.compile(r"(?:没有|并非|不是|不含|不涉及|不存在)[^，。！？；,\n]{0,5}$")
 _EXPLAINING = re.compile(
     r"(?:这番话|这句话)看似[^。！？!?；;\r\n]{2,40}?(?:实则|实际上)"
     r"|(?:^|(?<=[。！？!?；;\n]))[ \t]*说白了[，,]?就是"
@@ -55,6 +80,7 @@ _PLACEHOLDERS = (
 _NON_FATAL_STYLE_RULES = {
     "dash_density", "psychological_lead_density", "repeated_subject", "single_paragraph",
     "cliche_filler_density", "mouth_arc_cliche", "explanatory_narration", "repetitive_ending_hook",
+    "formulaic_reaction_window",
 }
 _NON_FATAL_AI_CATEGORIES = {"over_explaining", "formulaic_reaction", "shared_voice", "static_situation", "repetitive_hooks"}
 
@@ -109,6 +135,96 @@ def _around_match(prose, match):
     left = re.split(r"[。！？!?\n]", prose[max(0, match.start() - 24):match.start()])[-1]
     right = re.split(r"[。！？!?\n]", prose[match.end():match.end() + 34], maxsplit=1)[0]
     return left + match[0] + right
+
+
+def normalize_mock_chapter_prose(text, chapter_number):
+    """Rewrite the two canned mock passages that refer to their own chapter numbers."""
+    opening = rf"^第{chapter_number}章的序幕在清晨的薄雾中拉开。(?=(?:林渊|我)站在落地窗前，指尖轻轻敲击着桌面)"
+    return re.sub(opening, "清晨，薄雾未散。", text).replace(
+        "从怀中取出那枚自第2章起便贴身保管的“玄天七号”青铜钥匙",
+        "从怀中取出那枚自林家老宅寻获后便贴身保管的“玄天七号”青铜钥匙",
+    )
+
+
+def _reaction_hits(text):
+    hits = {family: [] for family in _REACTIONS}
+    for _, prose in _narration(text):
+        for family, pattern in _REACTIONS.items():
+            hits[family].extend(_around_match(prose, match) for match in pattern.finditer(prose))
+    return hits
+
+
+def reaction_counts(text: str) -> dict[str, int]:
+    return {family: len(hits) for family, hits in _reaction_hits(text).items() if hits}
+
+
+def reaction_window_issues(chapter_text: str, reaction_history, *, chapter_number: int, ai_gate: bool = False) -> list[dict]:
+    issues = []
+    history = reaction_history or {}
+    for family, hits in _reaction_hits(chapter_text).items():
+        count = len(hits)
+        if not count:
+            continue
+        near = [history.get(number, {}).get(family, 0)
+                for number in range(max(1, chapter_number - 9), chapter_number)] if chapter_number > 5 else []
+        distinct = 1 + sum(bool(value) for value in near[-4:])
+        cumulative = count + sum(near)
+        if count >= 4:
+            message = f"本章同类反应套式出现 {count} 次。"
+        elif distinct >= 4:
+            message = f"近五章有 {distinct} 章复用同类反应套式。"
+        elif count == 3:
+            message = f"本章同类反应套式出现 {count} 次。"
+        elif near and cumulative >= 6:
+            message = f"近十章同类反应套式累计出现 {cumulative} 次。"
+        else:
+            continue
+        issues.append({
+            "type": "ai_flavor", "rule": "formulaic_reaction_window", "reactionFamily": family,
+            "severity": "error" if ai_gate and (count >= 4 or distinct >= 4) else "warning",
+            "quote": _issue_quote(hits[0]), "message": message,
+            "suggestion": "保留必要反应，其余改为符合当前人物与情境的动作、台词或沉默。",
+        })
+    return issues
+
+
+def find_meta_text(text: str, *, chapter_number: int, book_plan=None) -> list[dict]:
+    plan = book_plan or {}
+    premises = (plan.get("genre"), plan.get("logline"), (plan.get("worldview") or {}).get("setting"))
+    metafiction = any(not _META_NEGATION.search(value[:hit.start()]) for value in premises if isinstance(value, str)
+                      for hit in _METAFICTION.finditer(value))
+    heading = text.split("\n", 1)[0]
+    heading_match = re.fullmatch(r"[ \t]*(?:#{1,6}[ \t]*)?(" + _META_TEXT.pattern
+                                + r")(?:[ \t：:、]+[^。！？!?“”「」]{0,40})?[ \t\r]*", heading)
+    books = list(re.finditer(r"《[^《》\n]*》", text))
+    panels = list(re.finditer(r"【[^【】]*】", text))
+    issues = []
+    for hit in _META_TEXT.finditer(text):
+        amount = parse_amount(hit["number"] + "章") if hit["number"] else None
+        number = amount[0] if amount else None
+        if heading_match and hit.span() == heading_match.span(1) and number == chapter_number:
+            continue
+        if any(book.start() < hit.start() < book.end() or 0 <= hit.start() - book.end() <= 8
+               and not re.search(r"[。！？!?；;\n]", text[book.end():hit.start()]) for book in books):
+            continue
+        prefix = text[max(0, hit.start() - 8):hit.start()]
+        suffix = text[hit.end():hit.end() + 8]
+        # Bound the whitelist to the same local phrase.
+        prefix = re.split(r"[。！？!?；;\n“”「」]", prefix)[-1]
+        suffix = re.split(r"[。！？!?；;\n“”「」]", suffix, maxsplit=1)[0]
+        if _META_DOCUMENT.search(prefix) or _META_DOCUMENT.search(suffix) or _META_IDIOM.search(hit[0]):
+            continue
+        quest = number is not None and any(panel.start() < hit.start() < panel.end() for panel in panels) and bool(
+            re.match(r"\s*(?:任务|副本|关卡)", suffix)
+        )
+        explicit = number is None or number >= 1 and number <= chapter_number + 30
+        issues.append({
+            "type": "meta_text", "severity": "error" if explicit and not (quest or metafiction) else "warning",
+            "quote": _issue_quote(_around_match(text, hit)),
+            "message": "正文引用了章节编号或作者、读者等文本外信息。",
+            "suggestion": "用故事中的时间、地点、人物或事件替换文本外引用。",
+        })
+    return issues
 
 
 def _account_recap(prose):
@@ -289,7 +405,7 @@ def _chapter_value(value, missing=None):
 
 
 def run_deterministic_checks(*, chapter_number, chapter_text="", canonical_facts=None,
-                             pov="第三人称限知", min_words=300, max_words=10000):
+                             pov="第三人称限知", min_words=300, max_words=10000, title=None, book_plan=None):
     text = str(chapter_text or "")
     facts = canonical_facts or {}
     word_count = count_chinese_words(text)
@@ -345,6 +461,10 @@ def run_deterministic_checks(*, chapter_number, chapter_text="", canonical_facts
             if name and name != "我" and re.search(rf"{re.escape(name)}(?:暗自心想|心中暗道|内心独白)", text):
                 add("pov_violation", f"第{chapter_number}章视角越界：第一人称视角下直接描写了「{name}」的不可见内心活动",
                     "warning")
+    issues.extend(find_meta_text(text, chapter_number=chapter_number, book_plan=book_plan))
+    if title:
+        for conflict in title_body_conflicts(title, text):
+            add("title_mismatch", conflict["reason"] + f"（章名：{conflict['titleExpr']}）", "warning", **conflict)
     return {"issues": issues, "wordCount": word_count}
 
 

@@ -16,12 +16,14 @@ from .book_plan import (
 )
 from .draft_quality import STYLE_BIBLE_MARKER, compact_style_bible
 from .entity_salience import _mentions, active_subplots_view, entity_index, ranked_entities, retired_character_status, retired_roster
+from .ledger_checks import numeric_claims
 from .llm import STORY_LEDGER_MARKER
 from .long_memory import (
     STORY_CHARACTER_FIELDS, active_memory_items, protagonist_name, relevant_memory_characters,
     story_ledger_events, story_ledger_view,
 )
 from .prompt_budget import ARC_PROMPT_BUDGET_EXCEEDED, fit_chapter_prompt, fit_prompt, read_chapter_input_budget
+from .text_evidence import normalize_quote
 
 POV_RULES = {
     "第一人称": "严格使用第一人称「我」进行叙事，所有心理活动、感官观察、信息获取必须严格受限于「我」的在场视野，禁止出现「我」不可能知道的他人内心独白或远方密谋。",
@@ -1464,6 +1466,220 @@ def _review_notes(book_plan, facts, context, chapter_number, long_memory, *, rol
     return f"{anchors}\n【当前约束与前卷摘要】\n{_json(memory)}" if memory else anchors
 
 
+_REVIEW_CJK = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]+")
+_REVIEW_WORD = re.compile(r"[a-z0-9]{2,}")
+_REVIEW_OUTLINE_FIELDS = ("chapterNumber", "title", "goal", "summary", "keyEvents", "hook")
+_REVIEW_SHARES = {"textEntities": 30, "repeatRecall": 18, "hardMemory": 12, "arcNear": 10,
+                  "foreshadowing": 10, "coreRules": 8, "subplots": 7, "horizon": 5}
+_REPAIR_SHARES = {"textEntities": 50, "repeatRecall": 20, "hardMemory": 15, "coreRules": 15}
+
+
+def _review_terms(text, width=4):
+    terms = set(_REVIEW_WORD.findall(text.casefold()))
+    for run in _REVIEW_CJK.findall(text):
+        if len(run) < width:
+            if len(run) >= 2:
+                terms.add(run)
+        else:
+            terms.update(run[index:index + width] for index in range(len(run) - width + 1))
+    return terms
+
+
+def recall_used_beats(arc_summaries, chapter_text, *, exclude_near=(), limit=6, min_overlap=0.35) -> list[dict]:
+    excluded = set(exclude_near)
+    terms = _review_terms(chapter_text)
+    matches = {}
+    folded = chapter_text.casefold()
+    for row in arc_summaries:
+        if (row.get("startChapter"), row.get("endChapter")) in excluded:
+            continue
+        for beat in _records(row.get("usedBeats")):
+            text, chapter = beat.get("text"), beat.get("chapter")
+            if type(chapter) is not int or not isinstance(text, str) or not (text := text.strip()):
+                continue
+            keys = _review_terms(text)
+            ratio = len(keys & terms) / len(keys) if keys else 0
+            exact = any(len(phrase) >= 4 and phrase in folded for phrase in
+                        re.findall(r"[\w]+", text.casefold()))
+            if ratio >= min_overlap or exact:
+                key = text.casefold()
+                score = ratio, exact, chapter
+                if key not in matches or score > matches[key][0]:
+                    matches[key] = score, {"chapter": chapter, "text": _text_excerpt(text, 160)}
+    return [beat for _, beat in sorted(matches.values(), key=lambda pair: pair[0], reverse=True)[:max(0, limit)]]
+
+
+def build_review_context(*, book_plan, canonical_facts, outline, chapter_number, long_memory=False,
+                         rolling_arc_outlines=False, story_ledger=False, boundary_state=(), arc_plans=()) -> dict:
+    """Prepare prior evidence once; chapter-dependent relevance is applied during rendering."""
+    plan, facts = _dict(book_plan), _dict(canonical_facts)
+    current = int(_number(chapter_number))
+    world = _dict(plan.get("worldview"))
+    locks = plan.get("canonLocks")
+    if is_v2_book_plan(plan):
+        locks_text = canon_locks_text(locks, boundary_state=boundary_state)
+    else:
+        if rolling_arc_outlines and (compact_locks := normalize_canon_locks(locks)):
+            locks = compact_locks
+        locks_text = _json(locks) if isinstance(locks, dict) and locks else ""
+    horizon = horizon_memory(facts, arc_plans, current)
+    projection = _facts_before(facts, current)
+    subplots, idle = active_subplots_view(facts, current_chapter=current) if long_memory else ([], [])
+    clues = _records(projection["foreshadowing"] if "foreshadowing" in facts else facts.get("openForeshadowing"))
+    return {
+        "chapter_number": current, "book_plan": plan, "arc_plans": arc_plans,
+        "outline": {key: outline[key] for key in _REVIEW_OUTLINE_FIELDS if key in _dict(outline)},
+        "canon_locks_text": locks_text,
+        "volume_card_text": volume_card_text(plan, current),
+        "anchors": _chapter_anchors({
+            "logline": _text_excerpt(plan.get("logline") or "", 150),
+            "worldview": {"setting": _text_excerpt(world.get("setting") or "", 220)},
+            "mainCharacters": [{key: _text_excerpt(entry.get(key) or "", 40) for key in ("name", "role")}
+                               for entry in _records(plan.get("mainCharacters"))[:6]],
+        }, None, False),
+        "story_ledger_view": story_ledger_view(facts, chapter_number=current, book_plan=plan) if story_ledger else {},
+        "entity_index": entity_index(facts, before_chapter=current),
+        "horizon_memory": horizon,
+        "arcSummaries": prior_arc_summaries(facts, current),
+        "constraints": [row for row in _records(projection.get("constraints")) if row.get("status") == "active"],
+        "commitments": [row for row in _records(projection.get("commitments")) if row.get("status") == "active"],
+        "subplots": [*subplots, *idle],
+        "coreRules": [rule.strip() for rule in _list(world.get("coreRules")) if isinstance(rule, str) and rule.strip()],
+        "openForeshadowing": [row for row in clues if row.get("status") != "paid_off"],
+        "payoffs": sorted((row for row in clues if row.get("status") == "paid_off"
+                           and 0 < current - _number(row.get("payoffChapter")) <= 20),
+                          key=lambda row: _number(row.get("payoffChapter")), reverse=True)[:4],
+        "injuries": projection.get("injuries", facts.get("activeInjuries")),
+        "secrets": projection.get("secrets"),
+        "long_memory": long_memory,
+    }
+
+
+def _review_entry(row, fields, *, cap=120):
+    return {key: _text_excerpt(value, cap) if isinstance(value, str) else
+            [_text_excerpt(item, 60) if isinstance(item, str) else item for item in value[:8]]
+            if isinstance(value, list) else value for key in fields if (value := row.get(key)) is not None}
+
+
+def _review_entities(review, context, issue_text):
+    index = review["entity_index"]
+    selected = []
+    for kind, maximum, fields in (
+        ("characters", 24, ("name", "status", "location", "role", "traits", "sourceChapter", "currentGoal", "stance")),
+        ("items", 20, ("name", "owner", "holder", "location", "status", "attributes", "sourceChapter", "value")),
+    ):
+        ranked = ranked_entities(
+            kind, index, book_plan=review["book_plan"], arc_plans=review["arc_plans"],
+            current_chapter=review["chapter_number"], context_text=context,
+            resolved_theme_ranges=review["horizon_memory"]["themes"],
+        )
+        hits = sorted((name for name, _, _, hit in ranked if hit), key=lambda name: not _mentions(name, issue_text))
+        for rank, name in enumerate(hits[:maximum]):
+            row = index[kind][name]
+            selected.append((not _mentions(name, issue_text), rank, kind,
+                             _review_entry({**row["state"], **row["entry"], "name": name}, fields)))
+
+    for kind, rows, fields, match_fields in (
+        ("activeInjuries", _visible_injuries(review["injuries"], context, review["chapter_number"]),
+         ("id", "character", "bodyPart", "description", "severity", "sourceChapter"), ("character", "description", "bodyPart")),
+        ("secrets", _records(review["secrets"]),
+         ("secret", "holders", "excludedCharacters", "sourceChapter"), ("secret", "holders", "excludedCharacters")),
+    ):
+        def matches(row, text):
+            return any(_mentions(term, text) for key in match_fields for term in
+                       (row[key] if isinstance(row.get(key), list) else [row.get(key)]))
+
+        matched = sorted((row for row in rows if matches(row, context)), key=lambda row: not matches(row, issue_text))
+        selected.extend((not matches(row, issue_text), rank, kind, _review_entry(row, fields))
+                        for rank, row in enumerate(matched[:20]))
+    return [(kind, row) for _, _, kind, row in sorted(selected, key=lambda entry: entry[:2])]
+
+
+def _review_slots(review, chapter_text, *, repair=False, issues=(), ai_issues=()):
+    issue_text = _json([issues, ai_issues]) if repair else ""
+    context = _chapter_context(chapter_text, review["outline"]) + " " + issue_text
+    terms = _review_terms(context)
+    horizon = review["horizon_memory"]
+
+    def relevance(value):
+        return len(_review_terms(value) & terms)
+
+    def matched(rows, fields, limit):
+        ranked = [(relevance(" ".join(str(row.get(key) or "") for key in fields)), row) for row in rows]
+        return [row for score, row in sorted(ranked, key=lambda pair: pair[0], reverse=True)[:limit] if score]
+
+    values = {
+        "textEntities": _review_entities(review, context, issue_text),
+        "repeatRecall": [],
+        "hardMemory": [],
+        "coreRules": [("coreRules", _text_excerpt(rule, 120))
+                      for rule in sorted(review["coreRules"], key=relevance, reverse=True)[:10]],
+    }
+    if not repair or any(isinstance(issue, dict) and "core_scene_repetition" in (
+        issue.get("type"), issue.get("category"), issue.get("hardConflictType"),
+    ) for issue in (*issues, *ai_issues)):
+        values["repeatRecall"] = [
+            *(("recalledBeats", beat) for beat in recall_used_beats(
+                review["arcSummaries"], chapter_text,
+                exclude_near=[(row["startChapter"], row["endChapter"]) for row in horizon["near"]],
+            )),
+            *(("usedBeats", beat) for beat in horizon["recentBeats"]),
+            *(("themeHits", hit) for hit in theme_hits(horizon["themes"], context)),
+        ]
+    if review["long_memory"]:
+        for kind in ("constraints", "commitments"):
+            values["hardMemory"].extend((kind, _review_entry(row, ("id", "text", "deadline", "sourceChapter", "updatedAtChapter")))
+                                        for row in active_memory_items(review, kind, context, 6))
+    if not repair:
+        values.update(
+            arcNear=[("arcSummaries", row) for row in compact_arc_summaries(horizon["near"], include_beats=False)],
+            foreshadowing=[("openForeshadowing", _review_entry(row, ("id", "clue", "details", "status", "plantedChapter")))
+                          for row in matched(review["openForeshadowing"], ("clue", "details", "id"), 10)],
+            subplots=[("activeSubplots", _review_entry(row, ("id", "text", "characters", "updatedAtChapter")))
+                      for row in matched(review["subplots"], ("text", "title", "characters"), 6)]
+                     + [("recentPayoffs", _review_entry(row, ("id", "clue", "details", "payoffChapter")))
+                        for row in review["payoffs"]],
+            horizon=[("volumeSummaries", {"range": row["range"], "mainline": _text_excerpt(row["mainline"], 140)})
+                     for row in horizon["volumes"][:1]],
+        )
+    shares = _REPAIR_SHARES if repair else _REVIEW_SHARES
+    return [{"key": key, "share": share, "entries": values[key]} for key, share in shares.items()]
+
+
+def _review_blocks(review, chapter_text, issues=()):
+    view = review["story_ledger_view"]
+    evidence = normalize_quote(chapter_text + _json(issues))
+    states = {name: row for name, row in view.get("characterStates", {}).items()
+              if normalize_quote(name) in evidence}
+    ledger = {**view, **({"characterStates": states} if states else {})}
+    if not states:
+        ledger.pop("characterStates", None)
+    blocks = [review["anchors"]]
+    if review["canon_locks_text"]:
+        blocks.append("【总纲口径锁】\n" + review["canon_locks_text"])
+    if review["volume_card_text"]:
+        blocks.append(review["volume_card_text"])
+    if ledger:
+        blocks.append("【本章前随章台账与核心人物锁】\n" + _json({"storyLedger": ledger}))
+    return "".join("\n" + block for block in blocks if block)
+
+
+def _allocated_review(parts):
+    sections = {}
+    for slot, entries in parts.items():
+        groups = {}
+        for kind, row in entries:
+            groups.setdefault(kind, []).append(row)
+        if groups:
+            sections[slot] = groups
+    return _json(sections)
+
+
+def _compact_schema(template, marker, **schema_values):
+    body, schema = template.template.split(marker, 1)
+    return Template(body + marker + _json(json.loads(Template(schema).substitute(schema_values))))
+
+
 def build_volume_summary_prompt(chapters):
     evidence = []
     for entry in chapters:
@@ -1562,7 +1778,8 @@ def build_arc_summary_prompt(arc, chapters, *, story_ledger=False, canonical_fac
 
 
 def build_fact_extraction_prompt(*, chapter_number, chapter_text, existing_facts=None, canonical_facts=None,
-                                 long_memory=False, outline=None, story_ledger=False, book_plan=None):
+                                 long_memory=False, outline=None, story_ledger=False, book_plan=None,
+                                 input_budget=None, compact=False):
     effective_facts = existing_facts if canonical_facts is None else canonical_facts
     context = _chapter_context(chapter_text, outline)
     memory_instructions = _memory_extraction(effective_facts, context) if long_memory else ""
@@ -1574,12 +1791,18 @@ def build_fact_extraction_prompt(*, chapter_number, chapter_text, existing_facts
         if ledger:
             memory_instructions += "\n" + _story_notes(ledger)
         system += _STORY_LEDGER_EXTRACTION + "\n" + STORY_LEDGER_MARKER
-    prompt = _FACT_EXTRACTION_PROMPT.substitute(
+    compact = compact or input_budget is not None
+    memory_spec = _memory_delta_spec(long_memory, story_ledger)
+    template = _compact_schema(
+        _FACT_EXTRACTION_PROMPT, "输出（无新增项可为空数组或空对象）：\n", memory_spec=memory_spec,
+    ) if compact else _FACT_EXTRACTION_PROMPT
+    prompt = template.substitute(
         chapter_number=chapter_number, chapter_text=chapter_text,
         facts=_json(extract_relevant_facts(effective_facts, context_text=context, current_chapter=chapter_number,
-                                          story_ledger=story_ledger), pretty=True),
+                                          story_ledger=story_ledger, book_plan=book_plan if compact else None,
+                                          max_characters=24 if compact else None), pretty=not compact),
         memory_instructions=memory_instructions,
-        memory_spec=_memory_delta_spec(long_memory, story_ledger),
+        memory_spec=memory_spec,
     )
     return {"system": system, "prompt": prompt}
 
@@ -1587,7 +1810,7 @@ def build_fact_extraction_prompt(*, chapter_number, chapter_text, existing_facts
 def build_verify_prompt(*, chapter_number, chapter_text, outline=None, canonical_facts=None, prev_chapter_ending="",
                         pov=_DEFAULT_POV, min_words=500, max_words=5000, check_ai_flavor=True,
                         chapter_ai_gate=False, long_memory=False, book_plan=None, rolling_arc_outlines=False,
-                        story_ledger=False, boundary_state=()):
+                        story_ledger=False, boundary_state=(), input_budget=None, review_context=None, arc_plans=()):
     # As in Node, exact word counts are checked locally and are not sent to the reviewer.
     ai_instruction = ""
     if check_ai_flavor:
@@ -1627,6 +1850,34 @@ def build_verify_prompt(*, chapter_number, chapter_text, outline=None, canonical
     ending = _VERIFY_ENDING_BLOCK.substitute(
         ending=_text_excerpt(prev_chapter_ending, 600, from_end=True)
     ) if prev_chapter_ending else ""
+    if input_budget is not None:
+        review = review_context if review_context is not None else build_review_context(
+            book_plan=book_plan, canonical_facts=canonical_facts, outline=outline, chapter_number=chapter_number,
+            long_memory=long_memory, rolling_arc_outlines=rolling_arc_outlines, story_ledger=story_ledger,
+            boundary_state=boundary_state, arc_plans=arc_plans,
+        )
+        system += "\nrecalledBeats 是与本章相近的较早桥段，核对是否无新后果地复演（core_scene_repetition）。"
+        notes = _review_blocks(review, chapter_text)
+        if claims := numeric_claims(chapter_text, review["story_ledger_view"], book_plan):
+            notes += "\n【金额证据 numericClaims】\n" + "\n".join(claims)
+        template = _compact_schema(
+            _VERIFY_PROMPT, "输出 JSON（严格包含 issues、aiIssues、factsDelta）：\n",
+            chapter_number=review["chapter_number"], memory_spec=_memory_delta_spec(long_memory, story_ledger),
+            identity_spec=_IDENTITY_SPEC if story_ledger else "",
+        )
+        memory_instructions = _MEMORY_EXTRACTION_INSTRUCTIONS.template.split("已有活跃条目：", 1)[0] if long_memory else ""
+        outline_json = _json(review["outline"])
+
+        def render(parts):
+            return {"system": system, "prompt": template.substitute(
+                chapter_number=chapter_number, chapter_text=chapter_text, outline=outline_json,
+                ending_block=ending, review_notes=notes, facts=_allocated_review(parts),
+                memory_instructions=memory_instructions,
+            )}
+
+        return fit_prompt(render=render, slots=_review_slots(review, chapter_text), input_budget=input_budget,
+                          on_overflow="expand")
+
     context = _chapter_context(chapter_text, outline)
     prompt = _VERIFY_PROMPT.substitute(
         chapter_number=chapter_number, chapter_text=chapter_text, outline=_json(outline or {}), ending_block=ending,
@@ -1645,11 +1896,13 @@ def build_verify_prompt(*, chapter_number, chapter_text, outline=None, canonical
 def build_repair_prompt(*, chapter_number, chapter_text, issues=None, ai_issues=None, outline=None,
                         canonical_facts=None, prev_chapter_ending="", pov=_DEFAULT_POV, target_words=2000,
                         chapter_ai_gate=False, book_plan=None, long_memory=False, rolling_arc_outlines=False,
-                        story_ledger=False, boundary_state=()):
+                        story_ledger=False, boundary_state=(), input_budget=None, review_context=None, arc_plans=()):
     ending = _REPAIR_ENDING_BLOCK.substitute(
         ending=_text_excerpt(prev_chapter_ending, 700, from_end=True)
     ) if prev_chapter_ending else ""
-    ai_fix = _REPAIR_AI_FIX_BLOCK.substitute(ai_issues=_json(ai_issues, pretty=True)) if _list(ai_issues) else ""
+    ai_fix = _REPAIR_AI_FIX_BLOCK.substitute(
+        ai_issues=_json(ai_issues, pretty=input_budget is None),
+    ) if _list(ai_issues) else ""
     style_instruction = (
         "按对应原句和修改建议逐项修正句式、套语或分段，保留人物行动和信息。"
         if chapter_ai_gate else
@@ -1663,6 +1916,26 @@ def build_repair_prompt(*, chapter_number, chapter_text, issues=None, ai_issues=
         system += (_STORY_LEDGER_WRITE +
                    "若确认是不同人物撞名，给新增人物独立全名并同步本章相关称呼。"
                    "保留正常跨日、交易及有证据的人物转折。\n" + STORY_LEDGER_MARKER)
+    if input_budget is not None:
+        review = review_context if review_context is not None else build_review_context(
+            book_plan=book_plan, canonical_facts=canonical_facts, outline=outline, chapter_number=chapter_number,
+            long_memory=long_memory, rolling_arc_outlines=rolling_arc_outlines, story_ledger=story_ledger,
+            boundary_state=boundary_state, arc_plans=arc_plans,
+        )
+        system += "\ntitle_mismatch 仅用于校正章名；正文修复以核实的情节和数值为准。"
+        notes = _review_blocks(review, chapter_text, [issues, ai_issues])
+        outline_json, issues_json = _json(review["outline"]), _json(issues or [])
+
+        def render(parts):
+            return {"system": system, "prompt": _REPAIR_PROMPT.substitute(
+                chapter_number=chapter_number, target_words=target_words, chapter_text=chapter_text,
+                outline=outline_json, ending_block=ending, issues=issues_json, ai_fix_block=ai_fix,
+                facts=_allocated_review(parts), review_notes=notes,
+            )}
+
+        slots = _review_slots(review, chapter_text, repair=True, issues=_list(issues), ai_issues=_list(ai_issues))
+        return fit_prompt(render=render, slots=slots, input_budget=input_budget, on_overflow="expand")
+
     context = _chapter_context(chapter_text, outline)
     prompt = _REPAIR_PROMPT.substitute(
         chapter_number=chapter_number, target_words=target_words, chapter_text=chapter_text,
