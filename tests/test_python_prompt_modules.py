@@ -677,7 +677,7 @@ class PromptTests(unittest.TestCase):
         self.assertEqual(len(bounded["keyAssets"]), 1)
         self.assertIsNone(normalize_canon_locks({"powerScale": 100, "keyAssets": "错误"}))
 
-    def test_arc_context_projections_keep_locks_and_recent_cumulative_beats_with_long_memory_off(self):
+    def test_arc_context_projections_keep_locks_and_bound_rolling_beats_with_long_memory_off(self):
         plan, outline, facts = story_fixture()
         plan["canonLocks"] = {"powerScale": "满级100，主角开局46。", "keyAssets": ["银铃只系右手腕。"]}
         facts["arcSummaries"] = [{
@@ -701,7 +701,9 @@ class PromptTests(unittest.TestCase):
         self.assertIn("满级100", roll["prompt"])
         self.assertIn("终局收网单元", roll["prompt"])
         self.assertIn("船底没有开启的暗格", roll["prompt"])
-        self.assertIn("独有机制1乙", roll["prompt"])
+        material = json.loads(roll["prompt"].split("【已发生事实与全书路标】\n")[1].split("\n【输出结构】")[0])
+        self.assertNotIn({"chapter": 5, "text": "独有机制1乙"}, material["recentBeats"])
+        self.assertIn({"chapter": 35, "text": "独有机制7乙"}, material["recentBeats"])
         self.assertIn("反派筹码7", roll["prompt"])
         self.assertNotIn("单元8剧情", roll["prompt"])
 

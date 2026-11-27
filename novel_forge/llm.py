@@ -1322,24 +1322,37 @@ def _mock_outlines(text, scenario):
     return outlines
 
 
+def _mock_arc_skeleton(index):
+    pairs = (
+        ("investigation", "confrontation"), ("negotiation", "reveal"), ("pursuit", "acquisition"),
+        ("deadline", "scheme"), ("relationship", "trial"), ("loss", "reward"),
+    )
+    return list(pairs[(index - 1) % len(pairs)])
+
+
 def _mock_arc_outlines(text, scenario):
+    index = int(_mock_field(text, r"当前单元[：:]\s*(\d+)", "1"))
     start = int(_mock_field(text, r"起始章节[：:]\s*(\d+)", "1"))
     total = int(_mock_field(text, r"全书总章数[：:]\s*(\d+)", str(start)))
     minimum = int(_mock_field(text, r"最少章数[：:]\s*(\d+)", "3"))
     maximum = int(_mock_field(text, r"最多章数[：:]\s*(\d+)", "6"))
-    end = start + min(maximum, max(minimum, 5)) - 1
+    allowed = json.loads(_mock_field(text, r"allowedLengths[：:]\s*(\[[\d,\s]+\])", "[]"))
+    lengths = [length for length in allowed if minimum <= length <= maximum] or range(minimum, maximum + 1)
+    end = start + min(lengths, key=lambda length: abs(length - 5)) - 1
     rows = _mock_outlines(f"起始章节：{start}\n结束章节：{end}", scenario)
     if end == total:
         rows[-1]["goal"] = "清算最后的交易，交代旧案与各方选择的后果"
         rows[-1]["summary"] += " 本章揭开旧案、兑现未揭伏笔并收束冲突。"
         rows[-1]["hook"] = "主线收束，角色各自承担选择的后果。"
     return {"arcTitle": f"第{start}至{end}章调查与交锋", "arcGoal": f"确认第{end}章证据来源并逼出新的决策。",
+            "skeleton": _mock_arc_skeleton(index),
             "villainChips": [{"villain": "赵天豪", "newChips": [f"第{start}章协商代理权"],
                               "exitPlan": "exit" if end == total else "retain"}], "chapters": rows}
 
 
 def _mock_arc_summary(prompt, *, story_ledger=False):
     try:
+        index = int(_mock_field(prompt, r"归档第\s*(\d+)\s*单元", "1"))
         rows, _ = json.JSONDecoder().raw_decode(prompt.split("【正文依据】", 1)[1].lstrip())
         first = rows[0]["chapterNumber"]
         last = rows[-1]["chapterNumber"]
@@ -1351,7 +1364,7 @@ def _mock_arc_summary(prompt, *, story_ledger=False):
             if n in (first, (first + last) // 2, last):
                 turns.append({"chapter": n, "text": row.get("title") or f"第{n}章获取证据"})
             fragments = [line.strip() for line in body.splitlines() if line.strip()]
-            if fragments and len(beats) < 4:
+            if fragments:
                 beats.append({"chapter": n, "text": f"第{n}章的证据交接与当面拆招",
                               "quote": fragments[min(1, len(fragments) - 1)][:45]})
             if tail.strip() and len(hooks) < 3:
@@ -1359,6 +1372,8 @@ def _mock_arc_summary(prompt, *, story_ledger=False):
                               "quote": tail.strip()[-45:]})
         summary = {"mainline": f"第{first}至{last}章完成调查与交接，双方掌握的证据与下一步行动发生变化。",
                    "turningPoints": turns, "usedBeats": beats, "usedHooks": hooks,
+                   "themes": [f"第{first}章交割凭证"], "skeleton": _mock_arc_skeleton(index),
+                   "shape": "循线取证后完成交接，双方重新选择行动。",
                    "villainStatus": f"赵天豪：第{last}章旧证据被迫交接，暂退幕后。"}
         if story_ledger:
             summary["driftChecks"] = [

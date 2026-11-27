@@ -19,17 +19,21 @@
 
 ## 二、滚动单元规划（`chapter_outlines` / `novel_forge/arc_planning.py`）
 
-- [ ] **WF-03 `[P0]` 开启滚纲后 10 章卷摘要直接停产，全书失去中远景记忆**
+- [x] **WF-03 `[P0]` 开启滚纲后 10 章卷摘要直接停产，全书失去中远景记忆**
   - **现象**：200 章全书 `volumeSummaries = 0`，跨 20 章以上没有任何中远景主题地图。
   - **代码位置**：`novel_forge/pipeline.py`（`elif not rolling and options["long_memory"] and number % 10 == 0` 跳过卷摘要）。
-- [ ] **WF-04 `[P0]` 滚纲只看最近 2 个单元（约 6 章），隔十几章整章失忆重演**
+  - **已落地**：解耦滚纲与 10 章卷摘要归档，新增 `_catch_up_volumes` 在章提交后（含终章）、断点续跑、滚纲前（计算 `arc_context_version` 之前）三处幂等补档；前端「跨章事实」同步在滚纲模式下展示「十章远景卷摘要」。
+- [x] **WF-04 `[P0]` 滚纲只看最近 2 个单元（约 6 章），隔十几章整章失忆重演**
   - **现象**：第 51–52 章全员失忆，把第 30–32 章已演完的“新疆长绒棉保暖内衣 + 跪坐换高脚椅”原样重演一遍。
   - **代码位置**：`novel_forge/arc_planning.py` `compact_arc_summaries()` 写死 `archives[:2]`。
-- [ ] **WF-05 `[P0]` `usedBeats` 无上限直塞滚纲，从防重复反噬成“3 章流水线克隆模板”**
+  - **已落地**：实现四层不重叠视野 `horizon_memory`（`near` 2 单元 + `capsules` ≤12 + `volumes` ≤20 + 全书 `themeLedger` ≤80）；修复写章 `_memory_slots` 清空卷摘要问题并新增写章 `horizon` 弹性槽（命中的旧题材 `theme_hits` + 远景卷摘要）。
+- [x] **WF-05 `[P0]` `usedBeats` 无上限直塞滚纲，从防重复反噬成“3 章流水线克隆模板”**
   - **现象**：全书 62 个单元中 **51 个是 3 章**，第 151–196 章连刷 15 轮“双内鬼 → 四机联检 → 读秒空投 → 卖 1.5 亿 → 撬密卷”；且第 29–32 章 4 条名额被仪器型号占满，第 31 章“高脚椅”压根未进入 `usedBeats`。
   - **代码位置**：`novel_forge/prompts.py` `build_arc_outlines_prompt()`（无上限塞入 243 条明细 `usedBeats`）。
-- [ ] **WF-06 `[P1]` 滚纲绕开 Token 预算器，且缺少连续相同单元长度/套路的打断机制**
+  - **已落地**：`normalize_arc_summary` 实行按章轮流保底配额 `usedBeats`（上限 `min(6, max(4, 章数))`）并新增 `themes`/`skeleton`/`shape`；滚纲 `recentBeats` 严控在最近 2 单元 ≤12 条；引入 16 码全题材骨架 `SKELETON_CODES`、`arc_rhythm` 长度硬校验 + 骨架相似度/题材碰撞软拦截。
+- [x] **WF-06 `[P1]` 滚纲绕开 Token 预算器，且缺少连续相同单元长度/套路的打断机制**
   - **现象**：76 次滚纲调用耗 262 万 Token，放任连续 15 轮选 3 章套用同一叙事骨架。
+  - **已落地**：将 `prompt_budget.py` 泛化为 `fit_prompt`，新增滚纲预算 `DEFAULT_ARC_INPUT_BUDGET = 16_384`（`NOVEL_FORGE_ARC_INPUT_BUDGET` 可配，超保护区报 `ARC_PROMPT_BUDGET_EXCEEDED` 安全停断点）与 8 个优先级弹性槽，含重试均受预算约束。
 
 ---
 

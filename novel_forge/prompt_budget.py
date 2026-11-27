@@ -1,4 +1,4 @@
-"""Bound the rendered chapter prompt and distribute optional context by priority."""
+"""Bound rendered prompts and distribute optional context by priority."""
 
 import math
 import os
@@ -8,7 +8,9 @@ from .llm import LLMError, estimate_tokens
 
 
 DEFAULT_CHAPTER_INPUT_BUDGET = 16_384
+DEFAULT_ARC_INPUT_BUDGET = 16_384
 CHAPTER_INPUT_RESERVE = 1_024
+ARC_PROMPT_BUDGET_EXCEEDED = "ARC_PROMPT_BUDGET_EXCEEDED"
 _SPACE = "\u0009-\u000d\u0020\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff"
 _EDGE_SPACE = re.compile(rf"^[{_SPACE}]+|[{_SPACE}]+$")
 _LEADING_SPACE = re.compile(rf"^[{_SPACE}]+")
@@ -20,12 +22,22 @@ _UNSET = object()
 def read_chapter_input_budget(raw=_UNSET):
     if raw is _UNSET:
         raw = os.environ.get("NOVEL_FORGE_CHAPTER_INPUT_BUDGET")
+    return _read_input_budget(raw, DEFAULT_CHAPTER_INPUT_BUDGET, label="写章", code="CHAPTER_PROMPT_BUDGET_INVALID")
+
+
+def read_arc_input_budget(raw=_UNSET):
+    if raw is _UNSET:
+        raw = os.environ.get("NOVEL_FORGE_ARC_INPUT_BUDGET")
+    return _read_input_budget(raw, DEFAULT_ARC_INPUT_BUDGET, label="滚纲", code="ARC_PROMPT_BUDGET_INVALID")
+
+
+def _read_input_budget(raw, default, *, label, code):
     if raw is None:
-        return DEFAULT_CHAPTER_INPUT_BUDGET
+        return default
     if isinstance(raw, str):
         raw = _EDGE_SPACE.sub("", raw)
         if not raw:
-            return DEFAULT_CHAPTER_INPUT_BUDGET
+            return default
         if _DECIMAL.fullmatch(raw):
             raw = float(raw)
         elif re.fullmatch(r"0(?:[xX][0-9a-fA-F]+|[oO][0-7]+|[bB][01]+)", raw):
@@ -36,8 +48,7 @@ def read_chapter_input_budget(raw=_UNSET):
         return None
     if isinstance(raw, (int, float)) and CHAPTER_INPUT_RESERVE < raw <= 2**53 - 1 and int(raw) == raw:
         return int(raw)
-    raise LLMError("写章输入预算必须是大于 1024 的整数，或设为 0 关闭。",
-                   code="CHAPTER_PROMPT_BUDGET_INVALID", status=400)
+    raise LLMError(f"{label}输入预算必须是大于 1024 的整数，或设为 0 关闭。", code=code, status=400)
 
 
 def _fit_text(text, from_end, fits):
@@ -87,16 +98,26 @@ def _utf16_length(text):
 
 
 def fit_chapter_prompt(*, render, slots, input_budget):
+    try:
+        return fit_prompt(render=render, slots=slots, input_budget=input_budget)
+    except LLMError as error:
+        if error.code == "CHAPTER_PROMPT_BUDGET_EXCEEDED":
+            error.status = 400  # Preserve the chapter prompt's existing error contract.
+        raise
+
+
+def fit_prompt(*, render, slots, input_budget, reserve=CHAPTER_INPUT_RESERVE,
+               code="CHAPTER_PROMPT_BUDGET_EXCEEDED", label="写章"):
     """Fit ordered text or entry slots using the final render to measure their cost."""
-    limit = input_budget - CHAPTER_INPUT_RESERVE
+    limit = input_budget - reserve
 
     def size(parts):
         return estimate_tokens(f"{parts['system']}\n{parts['prompt']}")
 
     def over_budget(tokens):
         return LLMError(
-            f"写章提示词需 {tokens} 个估算 Token，当前输入上限为 {limit}（已预留 {CHAPTER_INPUT_RESERVE}）。",
-            code="CHAPTER_PROMPT_BUDGET_EXCEEDED", status=400,
+            f"{label}提示词需 {tokens} 个估算 Token，当前输入上限为 {limit}（已预留 {reserve}）。",
+            code=code, status=422, retryable=False,
         )
 
     slots = list(slots)

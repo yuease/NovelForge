@@ -7,8 +7,8 @@ import re
 from string import Template
 
 from .arc_planning import (
-    CANON_LOCKS_MARKER, arc_chapter_span, character_name_registry, compact_arc_summaries, compact_used_beats,
-    normalize_canon_locks, normalize_character_name, prior_arc_summaries,
+    CANON_LOCKS_MARKER, SKELETON_CODES, arc_chapter_span, arc_rhythm, character_name_registry, compact_arc_summaries,
+    compact_used_beats, horizon_memory, normalize_canon_locks, normalize_character_name, prior_arc_summaries, theme_hits,
 )
 from .book_plan import (
     PLAN_VERSION_V2, PLAN_V2_MARKER, canon_locks_text, is_v2_book_plan, volume_card_text,
@@ -20,7 +20,7 @@ from .long_memory import (
     STORY_CHARACTER_FIELDS, active_memory_items, protagonist_name, relevant_memory_characters,
     story_ledger_events, story_ledger_view,
 )
-from .prompt_budget import read_chapter_input_budget, fit_chapter_prompt
+from .prompt_budget import ARC_PROMPT_BUDGET_EXCEEDED, fit_chapter_prompt, fit_prompt, read_chapter_input_budget
 
 POV_RULES = {
     "第一人称": "严格使用第一人称「我」进行叙事，所有心理活动、感官观察、信息获取必须严格受限于「我」的在场视野，禁止出现「我」不可能知道的他人内心独白或远方密谋。",
@@ -716,12 +716,14 @@ def build_chapter_outlines_prompt(*, book_plan=None, start_chapter=1, end_chapte
     return {"system": _CHAPTER_OUTLINES_SYSTEM, "prompt": prompt}
 
 
+_SKELETON_VOCABULARY = "、".join(f"{code}（{label}）" for code, label in SKELETON_CODES.items())
 _ARC_OUTLINES_SYSTEM = """[TASK:ARC_OUTLINES]
 你是剧情单元编剧。根据已经发生的正文事实与总纲路标，只规划当前单元。核心口径锁为不可变硬设定，动态数值与人物去向以有证据的前文为准。
-禁止重演已演桥段清单中的破局机制、大招和信息揭示；强化旧伏笔必须带来新的信息或后果。勿提前消耗终局破局。
+recentBeats 是最近单元的已演机制、大招和揭示，只供去重。themeLedger 是全书已解决的主题标签，再次触及时应推进后果或改变议题。patternStats 给出近期结构统计，遵守 allowedLengths，并主动更换高频或重复的骨架。
+可选 skeleton，按本单元剧情顺序列出 2–5 个功能代码。强化旧伏笔必须带来新的信息或后果。勿提前消耗终局破局。
 同一反派连续两个单元没有新增实质筹码，必须退场或转幕后。章名和断章方式要与近期章节有清晰差异。
 涉及疫病、医案、投毒、攻防或刑罚冲突时，仅采用常见风寒/细菌性热病、日常卫生防疫、普通化学杂质、机械装备或常规缉捕审讯等合规桥段，禁止设计烈性病原体播撒、芽孢/病菌提取、毒菌涂箭或药膏掺菌、水源投毒、气溶胶制毒、火药/炸药/起爆与延时自燃装置配比制法，或极端酷刑屠杀细节。
-只输出完整 JSON 对象。"""
+只输出完整 JSON 对象。""" + "\n功能代码：" + _SKELETON_VOCABULARY
 
 
 def _facts_before(facts, chapter):
@@ -750,14 +752,45 @@ def _facts_before(facts, chapter):
     return selected
 
 
+def _arc_fact_entries(facts, path=()):
+    for key, value in facts.items():
+        if isinstance(value, dict):
+            if key == "storyLedger":
+                yield from _arc_fact_entries(value, (*path, key))
+            else:
+                for name, record in value.items():
+                    yield (*path, key), name, record
+        elif isinstance(value, list):
+            for record in value:
+                yield (*path, key), None, record
+
+
+def _allocated_arc_facts(entries):
+    facts = {}
+    for path, name, value in entries:
+        section = facts
+        for key in path[:-1]:
+            section = section.setdefault(key, {})
+        if name is None:
+            section.setdefault(path[-1], []).append(value)
+        else:
+            section.setdefault(path[-1], {})[name] = value
+    return facts
+
+
 def build_arc_outlines_prompt(*, book_plan, canonical_facts, start_chapter, total_chapters, arc_index,
                               preceding_chapters=(), recent_titles=(), continuation_direction="", finalize_book=False,
-                              story_ledger=False, boundary_state=()):
+                              story_ledger=False, boundary_state=(), arc_plans=(), input_budget=None, rhythm=None,
+                              retry_note=""):
     minimum, maximum = arc_chapter_span(start_chapter, total_chapters)
     terminal = total_chapters - start_chapter + 1 <= 6
     plan = _dict(book_plan)
     facts = _dict(canonical_facts)
-    archives = prior_arc_summaries(facts, start_chapter)
+    horizon = horizon_memory(facts, arc_plans, start_chapter)
+    near = horizon["near"]
+    if rhythm is None:
+        rhythm = arc_rhythm(arc_plans, prior_arc_summaries(facts, start_chapter),
+                            start_chapter=start_chapter, total_chapters=total_chapters)
     past = _facts_before(facts, start_chapter)
     context = " ".join([str(plan.get("logline") or ""), continuation_direction,
                         *(str(row.get("summary") or "") for row in preceding_chapters[-5:])])
@@ -785,31 +818,23 @@ def build_arc_outlines_prompt(*, book_plan, canonical_facts, start_chapter, tota
         system += (_STORY_LEDGER_WRITE +
                    "新配角须避开 coreCharacterNames 中的已有全名，也不要与主角、核心反派高度撞名。"
                    "previousArcDriftChecks 是上一单元纠偏建议，以当前台账和正文为准，不改写已提交章节。")
-    if (story_ledger or v2) and archives and archives[0]["endChapter"] == start_chapter - 1:
+    corrections = []
+    if near and near[0]["endChapter"] == start_chapter - 1:
         corrections = [{key: row[key] for key in ("chapter", "kind", "issue", "fixHint") if key in row}
-                       for row in _records(archives[0].get("driftChecks")) if story_ledger or row.get("kind") == "canon"][:4]
-        if corrections:
-            selected["previousArcDriftChecks"] = corrections
+                       for row in _records(near[0].get("driftChecks")) if story_ledger or v2 and row.get("kind") == "canon"][:4]
     if v2:
         system += "\n按各章所属卷执行对应阶梯，允许跨卷的单元须保留跃迁条件；已核实的边界变更自标明章号生效。"
-        if not story_ledger and selected.get("previousArcDriftChecks"):
+        if not story_ledger and corrections:
             system += "previousArcDriftChecks 用于按锁和正文纠偏。"
-    legacy_volumes = [
-        {"endChapter": row["endChapter"], "mainline": _text_excerpt(row["mainline"], 180)}
-        for row in sorted((row for row in _records(facts.get("volumeSummaries")) if
-                           0 < _number(row.get("endChapter")) < start_chapter and row.get("mainline")),
-                          key=lambda row: _number(row["endChapter"]), reverse=True)[:2]
-    ]
+    clues = selected.pop("openForeshadowing")
+    priority = ("storyLedger", "coreCharacterNames", "constraints", "commitments")
+    fact_entries = list(_arc_fact_entries({**{key: selected[key] for key in priority if key in selected}, **selected}))
     material = {
         "bookPlan": _plan_for_outlines_and_audit(plan, rolling_arc_outlines=True),
-        "canonicalFacts": selected,
-        "arcSummaries": compact_arc_summaries(archives), "usedBeats": compact_used_beats(archives),
-        "legacyVolumes": legacy_volumes,
-        "recentChapters": [
-            {"chapter": row["chapterNumber"], "summary": _text_excerpt(row.get("summary") or "", 240),
-             **({"ending": _text_excerpt(row.get("content") or "", 350, from_end=True)} if row is preceding_chapters[-1] else {})}
-            for row in preceding_chapters[-5:]
-        ],
+        "patternStats": {key: value for key, value in rhythm.items() if key != "directive"},
+        "previousArcDriftChecks": corrections,
+        "lastEnding": _text_excerpt(preceding_chapters[-1].get("content") or "", 350, from_end=True)
+        if preceding_chapters else "",
         "recentTitles": list(recent_titles),
         "continuationDirection": continuation_direction,
     }
@@ -820,20 +845,52 @@ def build_arc_outlines_prompt(*, book_plan, canonical_facts, start_chapter, tota
             locks = text + "\n"
     finale = ""
     if terminal:
+        material["uncollectedForeshadowing"] = [
+            {key: _text_excerpt(clue[key], limit) for key, limit in (("id", 48), ("clue", 100), ("details", 72))
+             if clue.get(key)}
+            for clue in clues
+        ]
         finale = "\n本单元为终局收网单元，必须一次规划至终章，收束本轮核心危机并兑现所有未回收伏笔。"
         if finalize_book:
             finale += "作者要求彻底完结，终章给出明确结局，禁止开放性续作悬念。"
     example = {
-        "arcTitle": "单元标题", "arcGoal": "本单元的新推进目标与结局",
+        "arcTitle": "单元标题", "arcGoal": "本单元的新推进目标与结局", "skeleton": ["investigation", "confrontation"],
         "villainChips": [{"villain": "反派名", "newChips": ["确有新增的筹码"], "exitPlan": "retain|exit|background"}],
         "chapters": [{"chapterNumber": start_chapter, "title": "具体章名", "goal": "本章目标",
                       "summary": "具体因果推进", "keyEvents": ["实际事件"], "hook": "章末独有结果或终章收束"}],
     }
-    prompt = (f"当前单元：{arc_index}\n起始章节：{start_chapter}\n全书总章数：{total_chapters}\n"
+    header = (f"当前单元：{arc_index}\n起始章节：{start_chapter}\n全书总章数：{total_chapters}\n"
               f"最少章数：{minimum}\n最多章数：{maximum}\n剩余章节：{total_chapters - start_chapter + 1}{finale}\n"
-              f"从起始章起严格连续，按允许区间决定单元长度。无反派时 villainChips 返回空数组。\n"
-              f"【已发生事实与全书路标】\n{locks}{_json(material)}\n【输出结构】\n{_json(example)}")
-    return {"system": system, "prompt": prompt}
+              f"allowedLengths：{_json(rhythm['allowedLengths'])}\n{rhythm['directive']}\n"
+              "从起始章起严格连续，按 allowedLengths 选择单元长度。无反派时 villainChips 返回空数组。\n")
+    retry = f"\n上次校验未通过：{retry_note} 请纠正并完整重发本单元 JSON。" if retry_note else ""
+    slots = [
+        {"key": "nearArcs", "entries": compact_arc_summaries(near, include_beats=False), "share": 18,
+         "allocate_first": True},
+        {"key": "facts", "entries": fact_entries, "share": 22},
+        {"key": "themeLedger", "entries": [row["range"] + ":" + "｜".join(row["tags"]) for row in horizon["themes"]],
+         "share": 14},
+        {"key": "capsules", "entries": horizon["capsules"], "share": 12},
+        {"key": "volumes", "entries": horizon["volumes"], "share": 10},
+        {"key": "recentChapters", "entries": [
+            {"chapter": row["chapterNumber"], "summary": _text_excerpt(row.get("summary") or "", 240)}
+            for row in preceding_chapters[-5:]
+        ], "share": 10},
+        {"key": "recentBeats", "entries": horizon["recentBeats"], "share": 8},
+        {"key": "foreshadowing", "entries": [] if terminal else clues, "share": 6},
+    ]
+
+    def render(parts):
+        selected_facts = _allocated_arc_facts(parts["facts"])
+        if parts["foreshadowing"]:
+            selected_facts["openForeshadowing"] = parts["foreshadowing"]
+        memory = {key: value for key, value in parts.items() if key not in ("facts", "foreshadowing")}
+        body = _json({**material, "canonicalFacts": selected_facts, **memory})
+        return {"system": system, "prompt": f"{header}【已发生事实与全书路标】\n{locks}{body}\n【输出结构】\n{_json(example)}{retry}"}
+
+    if input_budget is None:
+        return render({slot["key"]: slot["entries"] for slot in slots})
+    return fit_prompt(render=render, slots=slots, input_budget=input_budget, code=ARC_PROMPT_BUDGET_EXCEEDED, label="滚纲")
 
 
 def _chapter_write_facts(canonical, relevant, context, *, current_chapter=None, story_ledger=False):
@@ -935,13 +992,10 @@ def _memory_slots(canonical, relevant, context, outline, lead, chapter_number, r
         for value in active_memory_items(canonical, kind, context)
     ]
     current = _number(chapter_number)
-    archives = sorted((item for item in _records(canonical.get("volumeSummaries"))
-                       if item.get("endChapter") is not None and _number(item["endChapter"]) < current),
-                      key=lambda item: _number(item["endChapter"]), reverse=True)[:2]
+    archives = _chapter_volume_summaries(canonical, current, arc_views)[:2]
     last_archive = _number(archives[0]["endChapter"]) if archives else 0
     if arc_views:
         last_archive = max(last_archive, arc_views[0]["endChapter"])
-        archives = []
     summaries = [entry for entry in _records(recent_summaries)
                  if last_archive < _number(entry.get("chapterNumber")) < current and entry.get("summary")]
     rolling = "\n".join(
@@ -968,6 +1022,13 @@ def _memory_slots(canonical, relevant, context, outline, lead, chapter_number, r
         hard_items, [{key: value for key, value in item.items() if key != "sourceHash"} for item in archives],
         rolling, characters, compact_lead if lead else None, payoffs[:4],
     )
+
+
+def _chapter_volume_summaries(canonical, current, arc_views):
+    before = min(row["startChapter"] for row in arc_views) if arc_views else current
+    return sorted((item for item in _records(canonical.get("volumeSummaries"))
+                   if item.get("endChapter") is not None and _number(item["endChapter"]) < before),
+                  key=lambda item: _number(item["endChapter"]), reverse=True)
 
 
 def _render_allocated_facts(parts, use_long_memory):
@@ -1122,14 +1183,37 @@ def build_chapter_write_prompt(*, book_plan=None, outline=None, prev_chapter_end
             {"key": "samples", "entries": samples, "share": 2},
         ]
 
+    continuity_slot = next(slot for slot in slots if slot["key"] == "continuity")
+    if rolling_arc_outlines:
+        current = _number(chapter_number)
+        horizon = horizon_memory(canonical, (), current)
+        theme_context = " ".join(str(value or "") for value in (
+            outline.get("title"), outline.get("goal"), outline.get("summary"), *_list(outline.get("keyEvents")),
+        ))
+        entries = [("themeHits", hit) for hit in theme_hits(horizon["themes"], theme_context)]
+        if earlier := _chapter_volume_summaries(canonical, current, arc_views):
+            volume = earlier[0]
+            entries.append(("earlierVolume", {key: volume[key] for key in ("volume", "startChapter", "endChapter") if key in volume}
+                            | {"mainline": _text_excerpt(volume.get("mainline") or "", 140)}))
+        continuity_slot["share"] -= 3
+        slots.insert(slots.index(continuity_slot), {"key": "horizon", "entries": entries, "share": 3})
+
     if volume_card:
-        next(slot for slot in slots if slot["key"] == "continuity")["share"] -= 4
+        continuity_slot["share"] -= 4
         slots.append({"key": "volumeCard", "text": volume_card, "share": 4})
 
     def render_budgeted(parts):
         rendered_facts = _render_allocated_facts(parts, use_long_memory)
         if parts.get("arcSummaries"):
             rendered_facts["arcSummaries"] = parts["arcSummaries"]
+        if parts.get("horizon"):
+            horizon_facts = {}
+            for kind, value in parts["horizon"]:
+                if kind == "themeHits":
+                    horizon_facts.setdefault(kind, []).append(value)
+                else:
+                    horizon_facts[kind] = value
+            rendered_facts["horizon"] = horizon_facts
         # A partial card could state a ban or transition without its qualifying condition.
         card = volume_card if parts.get("volumeCard") == volume_card else ""
         return render(parts["ending"], parts["summary"], rendered_facts, parts["samples"], parts.get("styleBible", []), card)
@@ -1268,9 +1352,11 @@ def build_volume_summary_prompt(chapters):
 
 _ARC_SUMMARY_SYSTEM = """[TASK:ARC_SUMMARY]
 从已提交章的正文提取真正发生的剧情，章纲式摘要只用于指路。needs_review 章里已写出的场景可以用于去重，待复核的数值与设定不得当成硬事实。
-只返回 JSON。mainline 最多280字，turningPoints 至多3条，usedBeats 至多4条，usedHooks 至多3条。
+只返回 JSON。mainline 最多280字，turningPoints 至多3条，usedHooks 至多3条。
 usedBeats 只记录实际消耗的核心破局机制、大招与揭示；usedHooks 只记录实际出现的断章方式。每项提供章号、60字内可辨认的机制描述、4–120字的本章连续原文 quote。
-villainStatus 最多120字，写清实际新增/失去的筹码和退场状态，说明无新增筹码；没有反派可留空。"""
+每章有实质桥段时先各记一条，再补第二条，同章类似器物或手段合并为一条。
+themes 给1–3个已解决议题、物件或场景的短名词短语，每条最多24字。skeleton 按已发生的顺序选择2–5个功能代码。shape 用一句不超过40字的话概括单元结构。
+villainStatus 最多120字，写清实际新增/失去的筹码和退场状态，说明无新增筹码；没有反派可留空。""" + "\n功能代码：" + _SKELETON_VOCABULARY
 
 
 def _arc_story_review(arc, chapters, canonical_facts, book_plan):
@@ -1303,8 +1389,9 @@ def build_arc_summary_prompt(arc, chapters, *, story_ledger=False, canonical_fac
         evidence.append(record)
     example = {"mainline": "实际主线进展", "turningPoints": [{"chapter": arc["startChapter"], "text": "转折"}],
                "usedBeats": [{"chapter": arc["startChapter"], "text": "实际破局机制", "quote": "逐字原文"}],
+               "themes": ["通行文书"], "skeleton": ["investigation", "confrontation"], "shape": "追查文书来历，迫使守门人交割。",
                "usedHooks": [], "villainStatus": "反派名：新增筹码、失去筹码、退场状态"}
-    system = _ARC_SUMMARY_SYSTEM
+    system = _ARC_SUMMARY_SYSTEM + f"\n本单元 usedBeats 最多 {min(6, max(4, len(chapters)))} 条。"
     review = ""
     v2 = is_v2_book_plan(book_plan)
     if v2:

@@ -7,7 +7,7 @@ import {
   Tag as TagIcon, TrendingUp, Users, Wrench,
 } from 'lucide-react'
 import { cn } from '../lib/cn'
-import { FORESHADOW_STATUS_LABEL, issueTypeLabel } from '../lib/format'
+import { FORESHADOW_STATUS_LABEL, SKELETON_CODE_LABEL, issueTypeLabel } from '../lib/format'
 import type { Tone } from '../lib/format'
 import { EASE_OUT, TAB_MOTION, boundedDelay } from '../lib/motion'
 import { navigate } from '../lib/router'
@@ -264,7 +264,7 @@ export default function FactsPage() {
     + (hasStoryClock(storyClock) ? 1 : 0)
     + ledgerBalances.length
     + Math.max(arcPlans.length, arcSummaries.length)
-    + (arcPlans.length === 0 && arcSummaries.length === 0 ? volumeSummaries.length : 0)
+    + volumeSummaries.length
 
   const tab: FactTab = selectedTab ?? (hasLedgerSection ? 'ledger' : 'items')
 
@@ -991,6 +991,33 @@ function LedgerAndArcsView({
                       <p className="mt-3 rounded-sm bg-surface/85 px-3.5 py-2.5 text-body text-ink">{summary.mainline}</p>
                     )}
 
+                    {/* Stage 2 Themes, Narrative Skeleton & Shape */}
+                    {((summary?.themes?.length ?? 0) > 0 || (summary?.skeleton?.length ?? plan?.skeleton?.length ?? 0) > 0 || summary?.shape) && (
+                      <div className="mt-2.5 flex flex-wrap items-center gap-2 text-caption">
+                        {summary?.themes && summary.themes.length > 0 && (
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            <span className="text-[11px] text-muted">已结主题</span>
+                            {summary.themes.map((topic, i) => (
+                              <Tag key={`${topic}-${i}`} className="h-auto bg-surface py-0.5 text-[11px] text-ink">{topic}</Tag>
+                            ))}
+                          </div>
+                        )}
+                        {(() => {
+                          const codes = summary?.skeleton?.length ? summary.skeleton : plan?.skeleton
+                          if (!codes?.length) return null
+                          return (
+                            <span className="inline-flex flex-wrap items-center gap-1 rounded-sm bg-surface px-2 py-0.5 text-[11px] text-body">
+                              <span className="text-muted">骨架</span>
+                              <span>{codes.map((c) => SKELETON_CODE_LABEL[c] ?? c).join(' → ')}</span>
+                            </span>
+                          )
+                        })()}
+                        {summary?.shape && (
+                          <span className="text-[11px] text-muted">{summary.shape}</span>
+                        )}
+                      </div>
+                    )}
+
                     {/* Volume Escalation Progress (V2) */}
                     {summary?.volumeProgress && (summary.volumeProgress.escalation || summary.volumeProgress.cost || summary.volumeProgress.retiredReused?.length) && (
                       <div className="mt-2.5 flex flex-wrap items-center gap-2 text-caption">
@@ -1125,11 +1152,11 @@ function LedgerAndArcsView({
         </section>
       )}
 
-      {/* 4. Legacy Volume Summaries Fallback */}
-      {arcRecords.length === 0 && volumeSummaries.length > 0 && (
+      {/* 4. Ten-Chapter Horizon Volume Summaries (also populated under rolling mode after WF-03) */}
+      {volumeSummaries.length > 0 && (
         <section>
-          <SectionLabel actions={<span className="text-caption tabular-nums text-muted">共 {volumeSummaries.length} 卷</span>}>
-            卷摘要归档
+          <SectionLabel actions={<span className="text-caption tabular-nums text-muted">共 {volumeSummaries.length} 段</span>}>
+            {arcRecords.length > 0 ? '十章远景卷摘要' : '卷摘要归档'}
           </SectionLabel>
           <div className="grid gap-3">
             {volumeSummaries.map((vol, idx) => (

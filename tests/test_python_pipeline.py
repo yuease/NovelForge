@@ -170,7 +170,9 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first_written, [1, 2, 3, 4, 5])
         self.assertEqual([row[:3] for row in scheduled], [(1, 0, 0), (6, 5, 5), (11, 10, 10), (16, 15, 15)])
         self.assertIn("第1章的证据交接与当面拆招", scheduled[1][3])
-        self.assertIn("第1章的证据交接与当面拆招", scheduled[3][3])
+        self.assertNotIn("第1章的证据交接与当面拆招", scheduled[3][3])
+        self.assertIn("1-5:第1章交割凭证", scheduled[3][3])
+        self.assertIn("第15章的证据交接与当面拆招", scheduled[3][3])
         self.assertIn("终局收网单元", scheduled[3][3])
         self.assertIn("canonLocks", job["bookPlan"])
         self.assertEqual([(arc["startChapter"], arc["endChapter"]) for arc in job["arcPlans"]],

@@ -3,7 +3,9 @@
 import re
 import unicodedata
 from decimal import Decimal
+from itertools import islice
 
+from .arc_planning import normalize_skeleton
 from .text_evidence import locate_quote, normalize_quote
 
 _ITEM_TYPES = {
@@ -559,19 +561,31 @@ def normalize_arc_summary(raw, chapters, *, story_ledger=False, plan_canon=False
             return {"chapter": number, "quote": quote.strip()}
         return None
 
-    def evidenced(key, limit):
-        entries = []
+    def evidenced(key):
         for entry in _list(raw.get(key)):
             entry = _record(entry)
             text = _clean_text(entry.get("text"), 60)
             if text and (proof := source_reference(entry)):
-                entries.append({"chapter": proof["chapter"], "text": text, "quote": proof["quote"]})
-                if len(entries) == limit:
-                    break
-        return entries
+                yield {"chapter": proof["chapter"], "text": text, "quote": proof["quote"]}
 
-    result = {**meta, "usedBeats": evidenced("usedBeats", 4), "usedHooks": evidenced("usedHooks", 3),
+    beats_by_chapter = {}
+    for beat in evidenced("usedBeats"):
+        beats = beats_by_chapter.setdefault(beat["chapter"], [])
+        if len(beats) < 2:
+            beats.append(beat)
+    cap = min(6, max(4, len(chapters)))
+    beat_groups = [beats_by_chapter[number] for number in sorted(beats_by_chapter)]
+    used_beats = [beats[index] for index in range(2) for beats in beat_groups
+                  if index < len(beats)][:cap]
+    result = {**meta, "usedBeats": used_beats, "usedHooks": list(islice(evidenced("usedHooks"), 3)),
               "villainStatus": _clean_text(raw.get("villainStatus"), 120)}
+    if themes := list(dict.fromkeys(text for value in _list(raw.get("themes"))
+                                   if (text := _clean_text(value, 24))))[:3]:
+        result["themes"] = themes
+    if skeleton := normalize_skeleton(raw.get("skeleton")):
+        result["skeleton"] = skeleton
+    if shape := _clean_text(raw.get("shape"), 40):
+        result["shape"] = shape
     progress = _record(raw.get("volumeProgress"))
     if progress:
         normalized = {key: text for key, limit in (("escalation", 40), ("cost", 30))

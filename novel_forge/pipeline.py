@@ -11,7 +11,10 @@ from contextlib import aclosing
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 
-from .arc_planning import legacy_outline_placeholder, prior_arc_summaries, saved_arc_plans, validate_arc_plan
+from .arc_planning import (
+    arc_plan_soft_feedback, arc_rhythm, horizon_memory, legacy_outline_placeholder, prior_arc_summaries,
+    saved_arc_plans, validate_arc_plan,
+)
 from .book_plan import (
     PLAN_VERSION_V2, BookPlanValidationError, collect_boundary_state, is_v2_book_plan, validate_book_plan, volume_for_chapter,
     verified_boundary_changes,
@@ -24,6 +27,7 @@ from .hotspots import HotspotsFeed, select_or_generate_concept
 from .llm import DEFAULT_MAX_TOKENS, LLMError, build_mock_volume_summary, call_llm, output_was_truncated, protected_output_budget
 from .long_memory import normalize_volume_summary
 from .memes import MemeStore
+from .prompt_budget import ARC_PROMPT_BUDGET_EXCEEDED, DEFAULT_ARC_INPUT_BUDGET, read_arc_input_budget
 from .prompts import (
     STYLE_PRESETS,
     build_arc_outlines_prompt,
@@ -36,7 +40,7 @@ from .prompts import (
     build_volume_summary_prompt,
     build_word_count_adjust_prompt,
     extract_relevant_facts,
-    read_writing_options,
+    read_writing_options as read_prompt_writing_options,
 )
 from .providers import get_provider_definition, is_masked_api_key, same_endpoint_origin
 from .storage import _is_committed, arc_context_version, count_chinese_words, public_job, volume_source_hash
@@ -55,10 +59,14 @@ _TRANSIENT_ERRORS = {
     "ECONNRESET", "ETIMEDOUT", "UND_ERR_CONNECT_TIMEOUT",
 }
 _MANUAL_RESUME = {"QUOTA_EXCEEDED", "CIRCUIT_OPEN", "OUTPUT_TRUNCATED", "OPENAI_RATE_LIMIT", "OUTLINE_PARSE_FAILED",
-                  "ARC_SUMMARY_INVALID", "ARC_SOURCE_CHANGED", "CONTENT_BLOCKED", "BOOK_PLAN_INVALID"}
+                  "ARC_SUMMARY_INVALID", "ARC_SOURCE_CHANGED", "CONTENT_BLOCKED", "BOOK_PLAN_INVALID", ARC_PROMPT_BUDGET_EXCEEDED}
 _COMEDY = re.compile(r"吐槽|搞笑|反差|打脸|震惊|直播|吃瓜|反转|嘴替|荒诞|尴尬|发疯")
 _PLACEHOLDERS = re.compile(r"【待补充|\[TODO\]|TBD|placeholder", re.I)
 _MARKDOWN_HEADING = re.compile(r"^#{1,6}\s*")
+
+
+def read_writing_options(job=None):
+    return {**read_prompt_writing_options(job), "arc_input_budget": read_arc_input_budget()}
 
 
 class PipelineError(RuntimeError):
@@ -559,7 +567,7 @@ class PipelineRuntime:
                 stage = _dict(updated.get("checkpoint")).get("stage") or updated.get("stage")
                 await self._log(job_id, "warn", updated.get("stage"), f"检测到服务重启前的未完成任务，从断点恢复（stage={stage}）")
                 if auto_resume and _dict(updated.get("error")).get("code") not in (
-                    "OUTLINE_PARSE_FAILED", "ARC_SUMMARY_INVALID", "ARC_SOURCE_CHANGED", "BOOK_PLAN_INVALID",
+                    "OUTLINE_PARSE_FAILED", "ARC_SUMMARY_INVALID", "ARC_SOURCE_CHANGED", "BOOK_PLAN_INVALID", ARC_PROMPT_BUDGET_EXCEEDED,
                 ):
                     await self._launch(updated)
         return recovered
@@ -911,21 +919,25 @@ class PipelineRuntime:
         self._publish(job_id, "job:progress", stage="chapter_outlines", progress=15)
         return saved
 
-    async def _plan_arc(self, job, arcs, outlines, start, config, archive_config, *, story_ledger=False):
+    async def _plan_arc(self, job, arcs, outlines, start, config, archive_config, *, story_ledger=False,
+                        long_memory=False, arc_input_budget=DEFAULT_ARC_INPUT_BUDGET):
         job_id, total = job["id"], job["totalChapters"]
         checkpoint = {"stage": "chapter_outlines", "nextChapter": start, "nextOutlineChapter": start,
                       "completedChapter": start - 1}
-        await self._set_stage(job_id, "chapter_outlines")
         await self._checkpoint(job_id, **checkpoint)
         await self._refresh_arc_archives(job_id, arcs, start, archive_config,
                                          story_ledger=story_ledger, book_plan=job.get("bookPlan"))
         plan = job["bookPlan"]
         preceding = await asyncio.to_thread(self.store.get_chapters, job_id, end_chapter=start - 1)
         preceding = [row for row in preceding if _is_committed(row)]
+        if long_memory:
+            await self._catch_up_volumes(job_id, start - 1, {row["chapterNumber"]: row for row in preceding}, archive_config)
+        await self._set_stage(job_id, "chapter_outlines")
         boundary_state = collect_boundary_state(preceding, before_chapter=start, book_plan=plan)
         facts = await asyncio.to_thread(self.store.get_canonical_facts, job_id)
         source = arc_context_version(facts, preceding, start, boundary_state=boundary_state)
-        available = {(row.get("arc"), row["startChapter"], row["endChapter"]) for row in prior_arc_summaries(facts, start)}
+        archives = prior_arc_summaries(facts, start)
+        available = {(row.get("arc"), row["startChapter"], row["endChapter"]) for row in archives}
         if any((arc["arcIndex"], arc["startChapter"], arc["endChapter"]) not in available
                for arc in arcs if arc["endChapter"] < start):
             raise LLMError("已有单元的正文在规划前发生变化，请从断点重新归档。",
@@ -934,26 +946,30 @@ class PipelineRuntime:
         prior_arcs = [arc for arc in arcs if arc["endChapter"] < start][-2:]
         title_floor = prior_arcs[0]["startChapter"] if prior_arcs else max(1, start - 12)
         titles = [outlines[n].get("title") for n in sorted(outlines) if title_floor <= n < start]
-        prompt = build_arc_outlines_prompt(
-            book_plan=plan, canonical_facts=facts, start_chapter=start, total_chapters=total,
-            arc_index=arc_index, preceding_chapters=preceding[-5:], recent_titles=titles,
-            continuation_direction=job.get("continuationDirection") or "", finalize_book=bool(job.get("finalizeBook")),
-            story_ledger=story_ledger, boundary_state=boundary_state,
-        )
+        rhythm = arc_rhythm(arcs, archives, start_chapter=start, total_chapters=total)
+        horizon = horizon_memory(facts, arcs, start)
         await self._log(job_id, "info", "chapter_outlines", f"从第 {start} 章规划第 {arc_index} 剧情单元。")
         error = ""
         for attempt in range(2):
-            request = prompt if not attempt else {**prompt, "prompt": (
-                f"{prompt['prompt']}\n上次校验未通过：{error} 请纠正并完整重发本单元 JSON。"
-            )}
+            request = build_arc_outlines_prompt(
+                book_plan=plan, canonical_facts=facts, start_chapter=start, total_chapters=total,
+                arc_index=arc_index, preceding_chapters=preceding[-5:], recent_titles=titles,
+                continuation_direction=job.get("continuationDirection") or "", finalize_book=bool(job.get("finalizeBook")),
+                story_ledger=story_ledger, boundary_state=boundary_state, arc_plans=arcs, input_budget=arc_input_budget,
+                rhythm=rhythm, retry_note=error,
+            )
             reply = await self._llm(job_id, "chapter_outlines", config, request, 0.6, retries=attempt)
             try:
                 arc, batch = validate_arc_plan(parse_json_from_llm(reply.get("text")), arc_index=arc_index,
-                                               start=start, total=total, recent_titles=titles)
+                                               start_chapter=start, total_chapters=total, recent_titles=titles,
+                                               allowed_lengths=rhythm["allowedLengths"], rhythm=rhythm,
+                                               themes=horizon["themes"], soft=attempt == 0)
             except ValueError as issue:
                 error = str(issue)
                 await self._log(job_id, "warn", "chapter_outlines", f"第 {start} 章单元章纲第 {attempt + 1} 次校验未通过：{error}")
                 continue
+            if attempt and (feedback := arc_plan_soft_feedback({**arc, "chapters": batch}, rhythm=rhythm, themes=horizon["themes"])):
+                await self._log(job_id, "warn", "chapter_outlines", f"第 {start} 章单元章纲重试后保留，仍需留意：{feedback}")
             next_outline = arc["endChapter"] + 1
             saved = await _write(self.store.save_arc_plan, job_id, arc, batch, total=total, expected_context=source,
                                  checkpoint={**checkpoint, "stage": "chapter_writing", "nextOutlineChapter": next_outline})
@@ -1011,13 +1027,12 @@ class PipelineRuntime:
         running_words = sum(_word_count(chapter) for chapter in committed.values())
         first_missing = next((number for number in range(1, total + 1) if number not in committed), total + 1)
         arcs = saved_arc_plans(job) if rolling else []
+        if options["long_memory"] and committed:
+            await self._catch_up_volumes(job_id, max(committed), committed, auxiliary)
+        arc_options = {key: options[key] for key in ("story_ledger", "long_memory", "arc_input_budget")}
         if not rolling:
             yield {"phase": "outlines"}
             outlines = await self._outlines(job, config)
-            if options["long_memory"] and (last_full_volume := (first_missing - 1) // 10 * 10):
-                if await self._needs_volume_archive(job_id, last_full_volume, committed):
-                    yield {"phase": "archive", "chapter": last_full_volume}
-                    await self._archive(job_id, last_full_volume, committed, auxiliary)
             job = await self._set_stage(job_id, "chapter_writing")
         else:
             existing = _saved_outlines(job)
@@ -1042,7 +1057,7 @@ class PipelineRuntime:
             if first_missing <= total and first_missing not in outlines:
                 if not in_outlines:
                     yield {"phase": "outlines", **({"chapter": first_missing} if first_missing > 1 else {})}
-                await self._plan_arc(job, arcs, outlines, first_missing, config, archive_config, story_ledger=story_ledger)
+                await self._plan_arc(job, arcs, outlines, first_missing, config, archive_config, **arc_options)
             elif not in_outlines and not pending_archives:
                 yield {"phase": "outlines"}
             job = await self._set_stage(job_id, "chapter_writing", 15 if _number(job.get("progress")) < 15 else None)
@@ -1052,7 +1067,7 @@ class PipelineRuntime:
                 continue
             if rolling and number not in outlines:
                 yield {"phase": "outlines", "chapter": number}
-                await self._plan_arc(job, arcs, outlines, number, config, archive_config, story_ledger=story_ledger)
+                await self._plan_arc(job, arcs, outlines, number, config, archive_config, **arc_options)
                 await self._set_stage(job_id, "chapter_writing")
             outline = outlines[number]
             next_outline = max(outlines) + 1 if rolling else None
@@ -1180,19 +1195,20 @@ class PipelineRuntime:
                 used_samples.add(meme_title)
             committed[number] = saved
             running_words += _word_count(saved)
-            if rolling and number < total:
-                arc = next((arc for arc in arcs if arc["endChapter"] == number), None)
-                if arc is not None and any(n not in committed for n in range(number + 1, total + 1)):
-                    yield {"phase": "archive", "chapter": number}
-                    await self._archive_arc(job_id, arc, archive_config, story_ledger=story_ledger, book_plan=job.get("bookPlan"))
-                    if (number + 1) in outlines:
-                        await self._set_stage(job_id, "chapter_writing")
-            elif not rolling and options["long_memory"] and number % 10 == 0:
-                if await self._needs_volume_archive(job_id, number, committed):
-                    yield {"phase": "archive", "chapter": number}
-                    await self._archive(job_id, number, committed, auxiliary)
-                    if number < total:
-                        await self._set_stage(job_id, "chapter_writing")
+            arc = next((arc for arc in arcs if arc["endChapter"] == number), None)
+            archive_arc = arc is not None and any(n not in committed for n in range(number + 1, total + 1))
+            volume_end = (number + 9) // 10 * 10
+            archive_volume = options["long_memory"] and all(
+                n in committed for n in range(volume_end - 9, volume_end + 1)
+            )
+            if archive_arc or archive_volume:
+                yield {"phase": "archive", "chapter": number if archive_arc else volume_end}
+            if archive_arc:
+                await self._archive_arc(job_id, arc, archive_config, story_ledger=story_ledger, book_plan=job.get("bookPlan"))
+            if options["long_memory"]:
+                await self._catch_up_volumes(job_id, volume_end if archive_volume else number, committed, auxiliary)
+            if (archive_arc or archive_volume) and number < total and number + 1 in outlines:
+                await self._set_stage(job_id, "chapter_writing")
 
         yield {"phase": "calibrate"}
         word_range = (_round(job["targetWords"] * 0.9), _round(job["targetWords"] * 1.18))
@@ -1265,14 +1281,19 @@ class PipelineRuntime:
                     if row.get("sourceHash")}
         return [arc for arc in preceding if (arc["arcIndex"], arc["startChapter"], arc["endChapter"]) not in archived]
 
-    async def _needs_volume_archive(self, job_id, end, committed):
-        start = end - 9
-        if end < 10 or not all(number in committed for number in range(start, end + 1)):
-            return False
-        source_hash = volume_source_hash([committed[number] for number in range(start, end + 1)])
+    async def _needs_volume_archive(self, job_id, start, end, chapters):
+        source_hash = volume_source_hash(chapters)
         facts = await asyncio.to_thread(self.store.get_canonical_facts, job_id)
-        return not any(summary["endChapter"] == end and summary.get("sourceHash") == source_hash
+        return not any(summary.get("startChapter", start) == start and summary["endChapter"] == end
+                       and summary.get("sourceHash") == source_hash
                        for summary in facts["volumeSummaries"])
+
+    async def _catch_up_volumes(self, job_id, through, committed, config):
+        for end in range(10, through + 1, 10):
+            start = end - 9
+            volume = [committed[number] for number in range(start, end + 1) if number in committed]
+            if len(volume) == 10 and await self._needs_volume_archive(job_id, start, end, volume):
+                await self._archive(job_id, start, end, volume, config)
 
     async def _refresh_arc_archives(self, job_id, arcs, before, config, *, story_ledger=False, book_plan=None):
         for arc in await self._pending_arc_archives(job_id, arcs, before):
@@ -1311,11 +1332,7 @@ class PipelineRuntime:
             raise LLMError(source_error, code="ARC_SOURCE_CHANGED", status=409, retryable=True)
         await self._log(job_id, "info", "arc_archive", f"已完成第 {start}–{end} 章单元归档。")
 
-    async def _archive(self, job_id, end, committed, config):
-        start = end - 9
-        if not all(number in committed for number in range(start, end + 1)):
-            return
-        volume = [committed[number] for number in range(start, end + 1)]
+    async def _archive(self, job_id, start, end, volume, config):
         source_hash = volume_source_hash(volume)
         facts = await asyncio.to_thread(self.store.get_canonical_facts, job_id)
         if any(summary["endChapter"] == end and summary.get("sourceHash") == source_hash

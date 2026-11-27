@@ -592,6 +592,7 @@ export interface ArcPlan {
   endChapter: number
   arcTitle: string
   arcGoal: string
+  skeleton?: string[]
   villainChips?: ArcVillainChip[]
 }
 
@@ -665,6 +666,9 @@ export interface ArcSummary {
   endChapter: number
   sourceHash?: string
   mainline: string
+  themes?: string[]
+  skeleton?: string[]
+  shape?: string
   volumeProgress?: ArcVolumeProgress | null
   turningPoints?: Array<{ chapter?: number; text?: string }>
   usedBeats?: ArcEvidenceItem[]

@@ -119,6 +119,25 @@ export const ISSUE_TYPE_LABEL: Record<string, string> = {
   issue: '待核对问题',
 }
 
+export const SKELETON_CODE_LABEL: Record<string, string> = {
+  betrayal: '内部背叛',
+  deadline: '限时危机',
+  investigation: '调查解谜',
+  confrontation: '正面对决',
+  negotiation: '交易博弈',
+  showcase: '公开展示',
+  acquisition: '获取资源',
+  reward: '结算升级',
+  reveal: '秘密揭露',
+  pursuit: '追逃潜入',
+  relationship: '情感羁绊',
+  loss: '代价挫败',
+  scheme: '布局反转',
+  respite: '日常喘息',
+  expansion: '舞台扩张',
+  trial: '审讯对质',
+}
+
 export function issueTypeLabel(raw: string | undefined): string {
   if (!raw) return '待核对问题'
   return ISSUE_TYPE_LABEL[raw] ?? ISSUE_TYPE_LABEL[raw.toLowerCase()] ?? raw
@@ -175,6 +194,13 @@ export function friendlyError(err: string | JobErrorObject | null | undefined): 
     return {
       title: '全书分卷已达上限',
       summary: '当前作品总纲已达到 24 卷上限，无法继续追加新卷。',
+    }
+  }
+  if (code === 'ARC_PROMPT_BUDGET_EXCEEDED' || /滚纲提示词需/.test(raw)) {
+    return {
+      title: '剧情规划参考内容超出上限',
+      summary: cleanHead || '本段剧情规划需要附带的硬设定与未回收伏笔超出单次预算上限，已安全停在断点。可适当精简续写方向或放宽规划预算后继续。',
+      detail: hasRawTech || raw !== cleanHead ? raw : undefined,
     }
   }
   if (code === 'OUTLINE_PARSE_FAILED' || /章纲未通过校验/.test(raw)) {
