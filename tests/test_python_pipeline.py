@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 import httpx
 
+from novel_forge.arc_planning import CANON_LOCKS_MARKER
 from novel_forge.llm import LLMError, call_mock_llm, reset_mock_state, reset_provider_circuit_state
 from novel_forge.pipeline import PipelineRuntime, compute_dynamic_chapter_target, review_action
 from novel_forge.prompts import build_chapter_write_prompt
@@ -298,6 +299,8 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
 
         runtime, calls = await self.transport(respond)
         job_id = self.book(12, provider="deepseek", autoResumeOnRateLimit=False)
+        legacy = await call_mock_llm(system=f"[TASK:BOOK_PLAN]\n{CANON_LOCKS_MARKER}", prompt="总章数：12")
+        self.store.update_job(job_id, {"bookPlan": json.loads(legacy["text"])})
         with patch.dict(os.environ, {"NOVEL_FORGE_ROLLING_ARC_OUTLINES": "1"}):
             await self.walk(job_id, runtime)
         before = self.saved_job(job_id)

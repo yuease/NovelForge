@@ -375,19 +375,7 @@ export interface JobRecord {
   } | null
   evaluationReport?: BookEvaluationReport | null
   arcPlans?: ArcPlan[]
-  bookPlan?: {
-    title?: string
-    synopsis?: string
-    canonLocks?: CanonLocks | null
-    volumes?: Array<{
-      volumeNumber?: number
-      title?: string
-      startChapter?: number
-      endChapter?: number
-      summary?: string
-    }>
-    [key: string]: unknown
-  } | null
+  bookPlan?: BookPlan | null
   createdAt?: string
   updatedAt?: string
   llmConfig?: LLMConfig
@@ -488,6 +476,19 @@ export interface CandidateEvaluationRound {
   isMock?: boolean
 }
 
+export interface BoundaryChangeRecord {
+  planRef: string
+  result: string
+  quote: string
+}
+
+export interface ChapterVerification {
+  passed?: boolean
+  summary?: string
+  boundaryChanges?: BoundaryChangeRecord[]
+  [key: string]: unknown
+}
+
 export interface ChapterRecord {
   chapterNumber: number
   title?: string
@@ -496,6 +497,7 @@ export interface ChapterRecord {
   summary?: string
   status?: string
   verified?: boolean
+  verification?: ChapterVerification | null
   repairCount?: number
   issues?: string[]
   updatedAt?: string
@@ -515,11 +517,67 @@ export interface FactEntry {
   [key: string]: unknown
 }
 
+export interface IdentityAliasLock {
+  character: string
+  scope: string
+  alias: string
+}
+
+export interface BoundaryLock {
+  subject: string
+  rule: string
+  changeWhen: string | null
+}
+
+export interface AssetSetLock {
+  name: string
+  members: string[]
+}
+
 export interface CanonLocks {
   powerScale?: string
   currencyAndEra?: string
   worldTaboos?: string[]
   keyAssets?: string[]
+  identityAliases?: IdentityAliasLock[]
+  boundaries?: BoundaryLock[]
+  assetSets?: AssetSetLock[]
+}
+
+export interface RetiredTactic {
+  tactic: string
+  whyFails: string
+}
+
+export interface VolumeEscalation {
+  pressure?: string
+  costAtRisk?: string
+  retiredTactics?: RetiredTactic[]
+  stageTransition?: string | null
+}
+
+export interface BookPlanVolume {
+  volume?: number
+  volumeNumber?: number
+  title?: string
+  chapters?: [number, number]
+  startChapter?: number
+  endChapter?: number
+  summary?: string
+  escalation?: VolumeEscalation | null
+  [key: string]: unknown
+}
+
+export interface BookPlan {
+  planVersion?: number
+  title?: string
+  logline?: string
+  synopsis?: string
+  canonLocks?: CanonLocks | null
+  volumes?: BookPlanVolume[]
+  volumeLadderStatus?: 'partial' | string
+  degraded?: boolean
+  [key: string]: unknown
 }
 
 export interface ArcVillainChip {
@@ -595,12 +653,19 @@ export interface ArcDriftCheck {
   quote: string
 }
 
+export interface ArcVolumeProgress {
+  escalation?: string
+  cost?: string
+  retiredReused?: string[]
+}
+
 export interface ArcSummary {
   arc?: number
   startChapter: number
   endChapter: number
   sourceHash?: string
   mainline: string
+  volumeProgress?: ArcVolumeProgress | null
   turningPoints?: Array<{ chapter?: number; text?: string }>
   usedBeats?: ArcEvidenceItem[]
   usedHooks?: ArcEvidenceItem[]

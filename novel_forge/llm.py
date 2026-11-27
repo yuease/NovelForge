@@ -19,6 +19,7 @@ from urllib.parse import quote
 import httpx
 
 from .arc_planning import CANON_LOCKS_MARKER
+from .book_plan import PLAN_VERSION_V2, PLAN_V2_MARKER
 from .openai_responses import call_responses
 from .openai_siwc import PROVIDER as SIWC, RESOURCE as SIWC_RESOURCE, SiwcError, all_stages as siwc_all_stages
 from .providers import get_provider_definition, is_masked_api_key, provider_requires_key, same_endpoint_origin
@@ -1574,6 +1575,8 @@ async def call_mock_llm(*, system="", prompt="", timeout_ms=DEFAULT_TIMEOUT_MS, 
     combined = f"{system}\n{prompt}"
     task = _detect_mock_task(combined)
     chapter_match = re.search(r"第\s*(\d+)\s*章", prompt) or re.search(r"第\s*(\d+)\s*章", system)
+    if task == "chapter_write" and "不可变核心口径锁（初始值仅为历史基线）：\n" in prompt:
+        chapter_match = re.search(r"^请撰写第(\d+)(?:/\d+)?章正文", prompt, re.M) or chapter_match
     chapter = int(chapter_match[1]) if chapter_match else 1
     mode = scenario.get("mode")
     story_ledger = STORY_LEDGER_MARKER in system
@@ -1592,13 +1595,32 @@ async def call_mock_llm(*, system="", prompt="", timeout_ms=DEFAULT_TIMEOUT_MS, 
         text = _mock_json(_mock_topic_candidates(combined))
     elif task == "book_plan":
         plan = _mock_book_plan(combined, scenario, system.endswith(STYLE_BIBLE_MARKER))
-        if CANON_LOCKS_MARKER in system:
+        v2 = PLAN_V2_MARKER in system
+        if v2 or CANON_LOCKS_MARKER in system:
             plan["canonLocks"] = {
                 "powerScale": "没有经验值或充值升级机制，人物依靠现有技能和情报推进。",
                 "currencyAndEra": "现代都市使用人民币，按实际到账和资产估值分别记账。",
                 "worldTaboos": ["重生仅属于主角的既有经历；世界里不存在穿书或任务系统。"],
                 "keyAssets": ["青铜钥匙背刻玄天七号。"] if _mock_foreshadowing(scenario) else ["核心信物是黑色玉佩。"],
             }
+        if v2:
+            plan["planVersion"] = PLAN_VERSION_V2
+            plan["canonLocks"].update(
+                identityAliases=[{"character": "林渊", "scope": "旧案档案", "alias": "林渊"}],
+                boundaries=[{"subject": "钟楼密室", "rule": "未经守门人许可不得进入", "changeWhen": "守门人当面授予进入许可"}],
+                assetSets=[{"name": "旧案档案", "members": ["交接单", "证人名单", "钟楼图纸"]}],
+            )
+            plan["volumes"] = [row for row in plan["volumes"] if row["chapters"][0] <= row["chapters"][1]]
+            plan["volumes"][0]["escalation"] = {
+                "pressure": "旧案卷宗即将被转移", "costAtRisk": "调查暴露会失去老宅的立足点",
+                "retiredTactics": [], "stageTransition": None,
+            }
+            if len(plan["volumes"]) > 1:
+                plan["volumes"][1]["escalation"] = {
+                    "pressure": "财阀切断证人联络并接管档案", "costAtRisk": "败诉将失去林家的产业与声誉",
+                    "retiredTactics": [{"tactic": "私下复制卷宗", "whyFails": "卷宗已移交并启用双人交接"}],
+                    "stageTransition": "核对交接单并取得证人同意后才能公开旧案",
+                }
         text = _mock_json(plan)
     elif task == "chapter_outlines":
         text = _mock_json(_mock_outlines(combined, scenario))

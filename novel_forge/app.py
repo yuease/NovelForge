@@ -15,6 +15,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 from .acceptance import run_acceptance
+from .book_plan import collect_boundary_state, is_v2_book_plan
 from .candidate_rounds import CandidateRounds
 from .editor_desk import EditorDesk
 from .evaluator import EvaluationError, de_ai_rewrite_chapters, is_book_evaluation_running, recover_interrupted_evaluations, start_book_evaluation
@@ -456,10 +457,14 @@ def create_app(data_dir: Path | None = None, *, client=None):
             facts = await asyncio.to_thread(store.get_canonical_facts, job_id)
             pending = existing.get("status") == "needs_review"
             outline = next((item for item in outlines if str(item.get("chapterNumber")) == str(chapter_number)), {})
+            boundary_state = ()
+            if is_v2_book_plan(job.get("bookPlan")) and chapter_number > 1:
+                prior = await asyncio.to_thread(store.get_chapters, job_id, end_chapter=chapter_number - 1)
+                boundary_state = collect_boundary_state(prior, before_chapter=chapter_number, book_plan=job.get("bookPlan"))
             verification = await verify_chapter(
                 chapter_number=chapter_number, chapter_text=draft["content"], outline=outline, canonical_facts=facts,
                 strict_review_result=pending, chapter_ai_gate=pending and os.getenv("NOVEL_FORGE_WRITE_AI_GATE") != "0",
-                **settings,
+                boundary_state=boundary_state, **settings,
             )
             if pending and verification["passed"]:
                 draft["status"] = "verified"

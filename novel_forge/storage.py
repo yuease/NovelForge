@@ -15,6 +15,7 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 
 from .arc_planning import legacy_outline_placeholder, prior_arc_summaries, saved_arc_plans
+from .book_plan import collect_boundary_state
 from .long_memory import empty_long_memory, normalize_arc_summary, normalize_memory_delta, normalize_volume_summary, replay_long_memory
 from .openai_siwc import PROVIDER as SIWC, RESOURCE as SIWC_RESOURCE
 from .providers import (
@@ -168,13 +169,14 @@ def volume_source_hash(chapters):
     ])
 
 
-def arc_context_version(facts, preceding, before):
+def arc_context_version(facts, preceding, before, *, boundary_state=()):
     return (
         tuple((row.get("arc"), row["startChapter"], row["endChapter"], row.get("sourceHash"))
               for row in prior_arc_summaries(facts, before)),
         tuple((row.get("endChapter"), row.get("sourceHash")) for row in _list(facts.get("volumeSummaries"))
               if isinstance(row, dict) and _number(row.get("endChapter"), math.inf) < before),
         volume_source_hash(preceding[-5:]),
+        *([_json(list(boundary_state))] if boundary_state else []),
     )
 
 
@@ -667,7 +669,8 @@ class Store:
             preceding = [row for row in self._get_chapters(db, job_id)
                          if row["chapterNumber"] < start and _is_committed(row)]
             facts = _dict(job.get("canonicalFacts"))
-            if arc_context_version(facts, preceding, start) != expected_context:
+            boundary_state = collect_boundary_state(preceding, before_chapter=start, book_plan=job.get("bookPlan"))
+            if arc_context_version(facts, preceding, start, boundary_state=boundary_state) != expected_context:
                 return False
             plans = saved_arc_plans(job)
             if any(record["arcIndex"] == arc["arcIndex"] or
@@ -691,7 +694,7 @@ class Store:
                                  "checkpoint": {**checkpoint, "savedAt": now}, "updatedAt": now})
             return True
 
-    def save_arc_summary(self, job_id, arc, source_hash, summary, *, story_ledger=False):
+    def save_arc_summary(self, job_id, arc, source_hash, summary, *, story_ledger=False, plan_canon=False):
         start, end = arc["startChapter"], arc["endChapter"]
         index = arc["arcIndex"]
         with self._write() as db:
@@ -709,7 +712,7 @@ class Store:
             archives = _list(facts["arcSummaries"])
             if any(_dict(row).get("arc") == index and row.get("sourceHash") == source_hash for row in archives):
                 return True
-            normalized = normalize_arc_summary(summary, chapters, story_ledger=story_ledger)
+            normalized = normalize_arc_summary(summary, chapters, story_ledger=story_ledger, plan_canon=plan_canon)
             if normalized is None:
                 return False
             review = [row["chapterNumber"] for row in chapters if row.get("status") == "needs_review"]

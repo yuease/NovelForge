@@ -110,6 +110,10 @@ export const ISSUE_TYPE_LABEL: Record<string, string> = {
   word_count: '字数偏差',
   style_rule: '文风问题',
   canon_conflict: '设定冲突',
+  world_rule_conflict: '世界观硬设定冲突',
+  hard_value_conflict: '硬数值 / 口径冲突',
+  core_scene_repetition: '核心桥段重复',
+  character_name_collision: '角色重名冲突',
   continuity: '前后衔接问题',
   fact_conflict: '事实冲突',
   issue: '待核对问题',
@@ -158,6 +162,19 @@ export function friendlyError(err: string | JobErrorObject | null | undefined): 
       title: '模型服务暂时繁忙',
       summary: cleanHead || '上游连接连续异常，系统已自动冷却保护。等待片刻后继续，或切换到其他已配置模型。',
       detail: hasRawTech ? raw : undefined,
+    }
+  }
+  if (code === 'BOOK_PLAN_INVALID' || /全书总纲未通过校验/.test(raw)) {
+    return {
+      title: '全书总纲未通过检查',
+      summary: cleanHead || '模型生成的全书总纲缺少关键设定或分卷不连续，已安全停在断点。点击「继续创作」即可重新生成总纲。',
+      detail: hasRawTech || raw !== cleanHead ? raw : undefined,
+    }
+  }
+  if (code === 'BOOK_PLAN_VOLUME_LIMIT' || /全书总纲已达24卷/.test(raw)) {
+    return {
+      title: '全书分卷已达上限',
+      summary: '当前作品总纲已达到 24 卷上限，无法继续追加新卷。',
     }
   }
   if (code === 'OUTLINE_PARSE_FAILED' || /章纲未通过校验/.test(raw)) {

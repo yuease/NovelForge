@@ -2,8 +2,9 @@ import { useMemo, useState } from 'react'
 import type { ReactNode } from 'react'
 import { AnimatePresence, motion } from 'motion/react'
 import {
-  AlertTriangle, Archive, BookOpen, Brain, Clock, Coins, EyeOff, HeartPulse, Layers,
-  Lock, MapPin, Package, ShieldAlert, ShieldCheck, Sparkles, Tag as TagIcon, Users, Wrench,
+  AlertTriangle, Archive, ArrowUpRight, Ban, BookOpen, Brain, CheckCircle2, Clock, Coins, Compass,
+  EyeOff, HeartPulse, Layers, Lock, MapPin, Package, ShieldAlert, ShieldCheck, Sparkles,
+  Tag as TagIcon, TrendingUp, Users, Wrench,
 } from 'lucide-react'
 import { cn } from '../lib/cn'
 import { FORESHADOW_STATUS_LABEL, issueTypeLabel } from '../lib/format'
@@ -13,7 +14,10 @@ import { navigate } from '../lib/router'
 import type {
   ArcPlan,
   ArcSummary,
+  BookPlan,
+  BookPlanVolume,
   CanonLocks,
+  ChapterRecord,
   CharacterRelationshipChange,
   CharacterStateEntry,
   FactEntry,
@@ -133,7 +137,57 @@ const Row = ({ label, children }: { label: string; children: ReactNode }) => (
 
 function hasCanonLocks(locks?: CanonLocks | null): locks is CanonLocks {
   if (!locks) return false
-  return Boolean(locks.powerScale || locks.currencyAndEra || locks.worldTaboos?.length || locks.keyAssets?.length)
+  return Boolean(
+    locks.powerScale
+    || locks.currencyAndEra
+    || locks.worldTaboos?.length
+    || locks.keyAssets?.length
+    || locks.identityAliases?.length
+    || locks.boundaries?.length
+    || locks.assetSets?.length,
+  )
+}
+
+function volumeSpan(vol: BookPlanVolume): [number, number] | null {
+  if (Array.isArray(vol.chapters) && vol.chapters.length === 2) {
+    return [vol.chapters[0], vol.chapters[1]]
+  }
+  if (typeof vol.startChapter === 'number' && typeof vol.endChapter === 'number') {
+    return [vol.startChapter, vol.endChapter]
+  }
+  return null
+}
+
+function hasEscalationContent(vol: BookPlanVolume): boolean {
+  const e = vol.escalation
+  if (!e) return false
+  return Boolean(e.pressure || e.costAtRisk || e.stageTransition || e.retiredTactics?.length)
+}
+
+interface VerifiedBoundaryState {
+  chapter: number
+  result: string
+  quote: string
+}
+
+const COMMITTED_STATUSES = new Set(['completed', 'verified', 'repaired'])
+
+function resolveBoundaryStates(chapters: ChapterRecord[], plan: BookPlan | null): Map<string, VerifiedBoundaryState> {
+  const map = new Map<string, VerifiedBoundaryState>()
+  if (!plan || plan.planVersion !== 2 || !plan.canonLocks?.boundaries?.length) return map
+  const ordered = [...chapters]
+    .filter((ch) => typeof ch.chapterNumber === 'number' && COMMITTED_STATUSES.has(ch.status ?? 'completed'))
+    .sort((a, b) => a.chapterNumber - b.chapterNumber)
+  for (const ch of ordered) {
+    const v = ch.verification
+    if (v?.passed !== true || !Array.isArray(v.boundaryChanges)) continue
+    for (const change of v.boundaryChanges) {
+      if (change?.planRef && change.result) {
+        map.set(change.planRef, { chapter: ch.chapterNumber, result: change.result, quote: change.quote || '' })
+      }
+    }
+  }
+  return map
 }
 
 function hasStoryClock(clock?: StoryClock | null): clock is StoryClock {
@@ -147,7 +201,7 @@ function isHealedInjury(entry: FactEntry): boolean {
 }
 
 export default function FactsPage() {
-  const { facts, repairLogs, activeJob } = useStudio()
+  const { facts, repairLogs, activeJob, chapters } = useStudio()
   const [selectedTab, setSelectedTab] = useState<FactTab | null>(null)
 
   const characters = normalize(facts?.characters)
@@ -159,7 +213,15 @@ export default function FactsPage() {
   const foreshadowing = normalize(facts?.foreshadowing)
   const title = activeJob?.title || activeJob?.bookPlan?.title
 
-  const canonLocks = activeJob?.bookPlan?.canonLocks ?? null
+  const bookPlan = activeJob?.bookPlan ?? null
+  const canonLocks = bookPlan?.canonLocks ?? null
+  const planVolumes = useMemo(() => (Array.isArray(bookPlan?.volumes) ? bookPlan.volumes : []), [bookPlan?.volumes])
+  const hasVolumeLadder = Boolean(
+    bookPlan?.planVersion === 2
+    && planVolumes.length > 0
+    && (planVolumes.some(hasEscalationContent) || bookPlan.volumeLadderStatus === 'partial'),
+  )
+  const boundaryStates = useMemo(() => resolveBoundaryStates(chapters, bookPlan), [chapters, bookPlan])
   const storyClock = facts?.storyClock ?? null
   const ledgerBalances = useMemo(() => (Array.isArray(facts?.ledgerBalances) ? facts.ledgerBalances : []), [facts?.ledgerBalances])
   const arcPlans = useMemo(() => (Array.isArray(activeJob?.arcPlans) ? [...activeJob.arcPlans].sort((a, b) => a.startChapter - b.startChapter) : []), [activeJob?.arcPlans])
@@ -189,6 +251,7 @@ export default function FactsPage() {
 
   const hasLedgerSection =
     hasCanonLocks(canonLocks)
+    || hasVolumeLadder
     || hasStoryClock(storyClock)
     || ledgerBalances.length > 0
     || arcPlans.length > 0
@@ -197,6 +260,7 @@ export default function FactsPage() {
 
   const ledgerCount =
     (hasCanonLocks(canonLocks) ? 1 : 0)
+    + (hasVolumeLadder ? planVolumes.length : 0)
     + (hasStoryClock(storyClock) ? 1 : 0)
     + ledgerBalances.length
     + Math.max(arcPlans.length, arcSummaries.length)
@@ -257,7 +321,11 @@ export default function FactsPage() {
             {tab === 'ledger' && (
               hasLedgerSection ? (
                 <LedgerAndArcsView
+                  bookPlan={bookPlan}
                   canonLocks={canonLocks}
+                  planVolumes={planVolumes}
+                  hasVolumeLadder={hasVolumeLadder}
+                  boundaryStates={boundaryStates}
                   storyClock={storyClock}
                   ledgerBalances={ledgerBalances}
                   arcPlans={arcPlans}
@@ -506,14 +574,22 @@ export default function FactsPage() {
 /* ---------------- Phase 3–4 Ledger & Arcs View ---------------- */
 
 function LedgerAndArcsView({
+  bookPlan,
   canonLocks,
+  planVolumes,
+  hasVolumeLadder,
+  boundaryStates,
   storyClock,
   ledgerBalances,
   arcPlans,
   arcSummaries,
   volumeSummaries,
 }: {
+  bookPlan: BookPlan | null
   canonLocks: CanonLocks | null
+  planVolumes: BookPlanVolume[]
+  hasVolumeLadder: boolean
+  boundaryStates: Map<string, VerifiedBoundaryState>
   storyClock: StoryClock | null
   ledgerBalances: LedgerBalance[]
   arcPlans: ArcPlan[]
@@ -541,6 +617,10 @@ function LedgerAndArcsView({
     })
   }, [arcPlans, arcSummaries])
 
+  const identityAliases = canonLocks?.identityAliases ?? []
+  const boundaries = canonLocks?.boundaries ?? []
+  const assetSets = canonLocks?.assetSets ?? []
+
   return (
     <div className="grid gap-8">
       {/* 1. Core Canon Locks */}
@@ -551,27 +631,34 @@ function LedgerAndArcsView({
           transition={{ duration: 0.22, ease: EASE_OUT }}
         >
           <SectionLabel
-            actions={<Badge tone="primary" icon={<Lock />}>不可变硬基准</Badge>}
+            actions={(
+              <div className="flex flex-wrap items-center gap-1.5">
+                {bookPlan?.degraded && <Badge tone="warning">临时降级总纲</Badge>}
+                <Badge tone="primary" icon={<Lock />}>不可变硬基准</Badge>
+              </div>
+            )}
           >
             全书硬设定
           </SectionLabel>
           <div className="rounded-md border border-primary/15 bg-[image:var(--nf-gradient-soft)] p-5">
-            <div className="grid gap-4 md:grid-cols-2">
-              {canonLocks.powerScale && (
-                <div className="rounded-md bg-surface/85 p-3.5 shadow-card">
-                  <div className="text-caption font-medium text-muted">战力与体系标尺</div>
-                  <p className="mt-1 text-body text-ink">{canonLocks.powerScale}</p>
-                </div>
-              )}
-              {canonLocks.currencyAndEra && (
-                <div className="rounded-md bg-surface/85 p-3.5 shadow-card">
-                  <div className="text-caption font-medium text-muted">货币与时代口径</div>
-                  <p className="mt-1 text-body text-ink">{canonLocks.currencyAndEra}</p>
-                </div>
-              )}
-            </div>
+            {(canonLocks.powerScale || canonLocks.currencyAndEra) && (
+              <div className="grid gap-4 md:grid-cols-2">
+                {canonLocks.powerScale && (
+                  <div className="rounded-md bg-surface/85 p-3.5 shadow-card">
+                    <div className="text-caption font-medium text-muted">战力与体系标尺</div>
+                    <p className="mt-1 text-body text-ink">{canonLocks.powerScale}</p>
+                  </div>
+                )}
+                {canonLocks.currencyAndEra && (
+                  <div className="rounded-md bg-surface/85 p-3.5 shadow-card">
+                    <div className="text-caption font-medium text-muted">货币与时代口径</div>
+                    <p className="mt-1 text-body text-ink">{canonLocks.currencyAndEra}</p>
+                  </div>
+                )}
+              </div>
+            )}
             {(canonLocks.worldTaboos?.length || canonLocks.keyAssets?.length) ? (
-              <div className="mt-4 grid gap-3 md:grid-cols-2">
+              <div className={cn('grid gap-3 md:grid-cols-2', (canonLocks.powerScale || canonLocks.currencyAndEra) && 'mt-4')}>
                 {canonLocks.worldTaboos && canonLocks.worldTaboos.length > 0 && (
                   <div>
                     <div className="mb-1.5 flex items-center gap-1.5 text-caption font-medium text-danger">
@@ -602,6 +689,97 @@ function LedgerAndArcsView({
                 )}
               </div>
             ) : null}
+
+            {/* V2 Structured Locks: Identity Aliases, Closed Asset Sets, Space/Rule Boundaries */}
+            {(identityAliases.length > 0 || assetSets.length > 0) && (
+              <div className="mt-4 grid gap-4 border-t border-primary/10 pt-4 md:grid-cols-2">
+                {identityAliases.length > 0 && (
+                  <div>
+                    <div className="mb-2 flex items-center gap-1.5 text-caption font-medium text-primary">
+                      <Users className="size-3.5" />固定称呼与身份别名
+                    </div>
+                    <div className="flex flex-wrap gap-1.5">
+                      {identityAliases.map((row, i) => (
+                        <span
+                          key={`${row.character}-${row.scope}-${i}`}
+                          className="inline-flex flex-wrap items-center gap-1 rounded-sm bg-surface/90 px-2.5 py-1 text-caption text-ink shadow-card"
+                        >
+                          <span className="font-medium">{row.character}</span>
+                          <span className="text-muted">· {row.scope}</span>
+                          <span className="text-primary">「{row.alias}」</span>
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                )}
+                {assetSets.length > 0 && (
+                  <div>
+                    <div className="mb-2 flex items-center gap-1.5 text-caption font-medium text-primary">
+                      <Package className="size-3.5" />核心系列清单（全员口径）
+                    </div>
+                    <div className="grid gap-2">
+                      {assetSets.map((set, i) => (
+                        <div key={`${set.name}-${i}`} className="rounded-md bg-surface/90 p-3 shadow-card">
+                          <div className="flex items-center justify-between gap-2 text-caption">
+                            <span className="font-medium text-ink">{set.name}</span>
+                            <span className="tabular-nums text-[11px] text-muted">共 {set.members.length} 项</span>
+                          </div>
+                          <div className="mt-1.5 flex flex-wrap gap-1.5">
+                            {set.members.map((member, j) => (
+                              <Tag key={`${member}-${j}`} className="h-auto bg-surface-2 py-0.5 text-[11px] text-ink">
+                                {member}
+                              </Tag>
+                            ))}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {boundaries.length > 0 && (
+              <div className="mt-4 border-t border-primary/10 pt-4">
+                <div className="mb-2 flex items-center gap-1.5 text-caption font-medium text-ink">
+                  <Compass className="size-3.5 text-primary" />舞台空间与规则边界
+                </div>
+                <div className="grid gap-3 md:grid-cols-2">
+                  {boundaries.map((b, i) => {
+                    const isAbsolute = b.changeWhen === null || b.changeWhen === undefined || b.changeWhen === ''
+                    const activeChange = boundaryStates.get(`canonLocks.boundaries[${i}]`)
+                    return (
+                      <div key={`${b.subject}-${i}`} className="rounded-md bg-surface/90 p-3.5 shadow-card">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <span className="text-body font-medium text-ink">{b.subject}</span>
+                          {isAbsolute ? (
+                            <Badge tone="danger" className="h-5 px-2 text-[11px]">绝对禁制</Badge>
+                          ) : activeChange ? (
+                            <Badge tone="success" icon={<CheckCircle2 />} className="h-5 px-2 text-[11px]">
+                              第 {activeChange.chapter} 章起已变更
+                            </Badge>
+                          ) : (
+                            <Badge tone="neutral" className="h-5 px-2 text-[11px]">可按条件变更</Badge>
+                          )}
+                        </div>
+                        <p className="mt-1 text-caption text-body">{b.rule}</p>
+                        {!isAbsolute && (
+                          <p className="mt-1 text-[11px] text-muted">变更条件：{b.changeWhen}</p>
+                        )}
+                        {activeChange && (
+                          <div
+                            title={activeChange.quote ? `原文引证：「${activeChange.quote}」` : undefined}
+                            className="mt-2 rounded-sm bg-success-soft/80 px-2.5 py-1.5 text-caption text-success"
+                          >
+                            当前生效：{activeChange.result}
+                          </div>
+                        )}
+                      </div>
+                    )
+                  })}
+                </div>
+              </div>
+            )}
           </div>
         </motion.section>
       )}
@@ -678,6 +856,95 @@ function LedgerAndArcsView({
         </div>
       )}
 
+      {/* 2.5 Volume Escalation Ladder (V2 BookPlan) */}
+      {hasVolumeLadder && (
+        <section>
+          <SectionLabel
+            actions={(
+              <div className="flex flex-wrap items-center gap-2">
+                {bookPlan?.volumeLadderStatus === 'partial' && (
+                  <Badge tone="warning">部分卷阶梯待补全</Badge>
+                )}
+                <span className="text-caption tabular-nums text-muted">共 {planVolumes.length} 卷</span>
+              </div>
+            )}
+          >
+            分卷升级阶梯
+          </SectionLabel>
+          <div className="grid gap-3 md:grid-cols-2">
+            {planVolumes.map((vol, idx) => {
+              const span = volumeSpan(vol)
+              const volNo = vol.volume ?? vol.volumeNumber ?? idx + 1
+              const ladder = vol.escalation
+              const retired = ladder?.retiredTactics ?? []
+              return (
+                <StaggerItem key={volNo} index={idx}>
+                  <div className="flex h-full flex-col rounded-md bg-surface-2 p-4 transition-colors hover:bg-surface-3/70">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="flex min-w-0 flex-wrap items-center gap-2">
+                        <span className="font-display text-body font-medium text-ink">
+                          第 {volNo} 卷{vol.title ? ` · ${vol.title}` : ''}
+                        </span>
+                      </div>
+                      {span && (
+                        <Badge tone="neutral" className="shrink-0 tabular-nums">
+                          第 {span[0]}–{span[1]} 章
+                        </Badge>
+                      )}
+                    </div>
+                    {ladder && hasEscalationContent(vol) ? (
+                      <div className="mt-3 grid gap-2 text-caption">
+                        {ladder.pressure && (
+                          <div className="rounded-sm bg-surface/85 px-3 py-2">
+                            <div className="mb-0.5 flex items-center gap-1 text-[11px] font-medium text-primary">
+                              <TrendingUp className="size-3" />新增压迫
+                            </div>
+                            <p className="text-ink">{ladder.pressure}</p>
+                          </div>
+                        )}
+                        {ladder.costAtRisk && (
+                          <div className="rounded-sm bg-surface/85 px-3 py-2">
+                            <div className="mb-0.5 flex items-center gap-1 text-[11px] font-medium text-warning">
+                              <AlertTriangle className="size-3" />真实代价
+                            </div>
+                            <p className="text-ink">{ladder.costAtRisk}</p>
+                          </div>
+                        )}
+                        {ladder.stageTransition && (
+                          <div className="flex items-start gap-1.5 rounded-sm bg-primary-soft/65 px-2.5 py-1.5 text-primary">
+                            <ArrowUpRight className="mt-0.5 size-3.5 shrink-0" />
+                            <span>跃迁条件：{ladder.stageTransition}</span>
+                          </div>
+                        )}
+                        {retired.length > 0 && (
+                          <div className="mt-0.5">
+                            <div className="mb-1 flex items-center gap-1 text-[11px] font-medium text-danger">
+                              <Ban className="size-3" />已退役手段（本卷禁复刻）
+                            </div>
+                            <div className="grid gap-1">
+                              {retired.map((item, j) => (
+                                <div key={`${item.tactic}-${j}`} className="rounded-sm bg-danger-soft/75 px-2.5 py-1.5">
+                                  <span className="font-medium text-danger">{item.tactic}</span>
+                                  {item.whyFails && (
+                                    <span className="ml-1.5 text-[11px] text-body">· {item.whyFails}</span>
+                                  )}
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    ) : (
+                      <p className="mt-2 text-caption text-muted">{vol.summary || '本卷尚未补充升级阶梯'}</p>
+                    )}
+                  </div>
+                </StaggerItem>
+              )
+            })}
+          </div>
+        </section>
+      )}
+
       {/* 3. Rolling Arc Plans + Archives & Drift Checks */}
       {arcRecords.length > 0 && (
         <section>
@@ -722,6 +989,30 @@ function LedgerAndArcsView({
 
                     {summary?.mainline && (
                       <p className="mt-3 rounded-sm bg-surface/85 px-3.5 py-2.5 text-body text-ink">{summary.mainline}</p>
+                    )}
+
+                    {/* Volume Escalation Progress (V2) */}
+                    {summary?.volumeProgress && (summary.volumeProgress.escalation || summary.volumeProgress.cost || summary.volumeProgress.retiredReused?.length) && (
+                      <div className="mt-2.5 flex flex-wrap items-center gap-2 text-caption">
+                        {summary.volumeProgress.escalation && (
+                          <span className="inline-flex items-center gap-1 rounded-sm bg-primary-soft/70 px-2.5 py-1 text-primary">
+                            <TrendingUp className="size-3 shrink-0" />
+                            <span>升级：{summary.volumeProgress.escalation}</span>
+                          </span>
+                        )}
+                        {summary.volumeProgress.cost && (
+                          <span className="inline-flex items-center gap-1 rounded-sm bg-surface px-2.5 py-1 text-body">
+                            <span className="text-muted">代价：</span>
+                            <span>{summary.volumeProgress.cost}</span>
+                          </span>
+                        )}
+                        {summary.volumeProgress.retiredReused && summary.volumeProgress.retiredReused.length > 0 && (
+                          <span className="inline-flex items-center gap-1 rounded-sm bg-warning-soft px-2.5 py-1 text-warning">
+                            <Ban className="size-3 shrink-0" />
+                            <span>退役复演：{summary.volumeProgress.retiredReused.join('、')}</span>
+                          </span>
+                        )}
+                      </div>
                     )}
 
                     {/* Turning points */}

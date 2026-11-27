@@ -76,8 +76,9 @@ def normalize_canon_locks(raw):
         text = _text(value)
         limit = min(limit, remaining)
         if len(text) > limit:
-            stops = list(re.finditer(r"[。！？!?](?![”’」』])|[。！？!?][”’」』]", text[:limit]))
-            text = text[:stops[-1].end()] if stops else ""
+            end = max((stop.end() for stop in re.finditer(r"[。！？!?][”’」』]?", text) if stop.end() <= limit),
+                      default=0)
+            text = text[:end]
         identity = _key(text)
         if not identity or identity in seen:
             return None
@@ -219,6 +220,7 @@ def compact_used_beats(archives, limit=None):
 def compact_arc_summaries(archives):
     return [
         {"startChapter": row["startChapter"], "endChapter": row["endChapter"], "mainline": row.get("mainline", ""),
+         **({"volumeProgress": row["volumeProgress"]} if "volumeProgress" in row else {}),
          "turningPoints": [{"chapter": point.get("chapter"), "text": point.get("text")}
                            for point in (row.get("turningPoints") or [])[:2] if isinstance(point, dict)],
          "usedBeats": compact_used_beats([row]),

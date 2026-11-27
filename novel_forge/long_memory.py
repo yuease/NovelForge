@@ -543,7 +543,7 @@ def normalize_volume_summary(raw, start_chapter, end_chapter, *, mainline_limit=
     return {"mainline": mainline, "turningPoints": turns}
 
 
-def normalize_arc_summary(raw, chapters, *, story_ledger=False):
+def normalize_arc_summary(raw, chapters, *, story_ledger=False, plan_canon=False):
     if not chapters:
         return None
     sources = {row["chapterNumber"]: normalize_quote(row.get("content") or "") for row in chapters}
@@ -572,14 +572,25 @@ def normalize_arc_summary(raw, chapters, *, story_ledger=False):
 
     result = {**meta, "usedBeats": evidenced("usedBeats", 4), "usedHooks": evidenced("usedHooks", 3),
               "villainStatus": _clean_text(raw.get("villainStatus"), 120)}
-    if story_ledger:
+    progress = _record(raw.get("volumeProgress"))
+    if progress:
+        normalized = {key: text for key, limit in (("escalation", 40), ("cost", 30))
+                      if (text := _clean_text(progress.get(key), limit))}
+        if isinstance(progress.get("retiredReused"), list):
+            normalized["retiredReused"] = list(dict.fromkeys(
+                text for value in progress["retiredReused"] if (text := _clean_text(value, 24))
+            ))[:2]
+        if normalized:
+            result["volumeProgress"] = normalized
+    if story_ledger or plan_canon:
         drifts, seen = [], set()
+        allowed = ("value", "clock", "canon", "character_ooc") if story_ledger else ("canon",)
         for entry in _list(raw.get("driftChecks")):
             entry = _record(entry)
             kind = entry.get("kind")
             issue = _clean_text(entry.get("issue"), 61)
             fix_hint = _clean_text(entry.get("fixHint"), 81)
-            if (kind not in ("value", "clock", "canon", "character_ooc")
+            if (kind not in allowed
                     or not (1 <= len(issue) <= 60 and 1 <= len(fix_hint) <= 80)):
                 continue
             if proof := source_reference(entry):
@@ -591,7 +602,8 @@ def normalize_arc_summary(raw, chapters, *, story_ledger=False):
                                "fixHint": fix_hint, "quote": proof["quote"]})
                 if len(drifts) == 4:
                     break
-        result["driftChecks"] = drifts
+        if story_ledger or drifts:
+            result["driftChecks"] = drifts
     return result
 
 

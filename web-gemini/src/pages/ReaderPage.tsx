@@ -320,13 +320,21 @@ function Volumes({ volumes }: { volumes: NonNullable<NonNullable<import('../lib/
       <AnimatePresence initial={false}>
         {open && (
           <motion.ul {...COLLAPSE_MOTION} className="overflow-hidden px-4">
-            {volumes.map((v, i) => (
-              <li key={i} className="pb-3 text-caption">
-                <span className="font-medium text-primary">第{v.volumeNumber ?? i + 1}卷 {v.title}</span>
-                {v.startChapter && v.endChapter && <span className="ml-1.5 text-muted">第{v.startChapter}–{v.endChapter}章</span>}
-                {v.summary && <p className="mt-0.5 line-clamp-2 text-muted">{v.summary}</p>}
-              </li>
-            ))}
+            {volumes.map((v, i) => {
+              const volNo = v.volume ?? v.volumeNumber ?? i + 1
+              const start = Array.isArray(v.chapters) ? v.chapters[0] : v.startChapter
+              const end = Array.isArray(v.chapters) ? v.chapters[1] : v.endChapter
+              return (
+                <li key={i} className="pb-3 text-caption">
+                  <span className="font-medium text-primary">第{volNo}卷 {v.title}</span>
+                  {start && end && <span className="ml-1.5 text-muted">第{start}–{end}章</span>}
+                  {v.summary && <p className="mt-0.5 line-clamp-2 text-muted">{v.summary}</p>}
+                  {v.escalation?.pressure && (
+                    <p title={v.escalation.pressure} className="mt-0.5 truncate text-[11px] text-body">压迫：{v.escalation.pressure}</p>
+                  )}
+                </li>
+              )
+            })}
           </motion.ul>
         )}
       </AnimatePresence>

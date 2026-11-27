@@ -11,7 +11,11 @@ from contextlib import aclosing
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 
-from .arc_planning import legacy_outline_placeholder, normalize_canon_locks, prior_arc_summaries, saved_arc_plans, validate_arc_plan
+from .arc_planning import legacy_outline_placeholder, prior_arc_summaries, saved_arc_plans, validate_arc_plan
+from .book_plan import (
+    PLAN_VERSION_V2, BookPlanValidationError, collect_boundary_state, is_v2_book_plan, validate_book_plan, volume_for_chapter,
+    verified_boundary_changes,
+)
 from .chapter_style import can_save_unverified_draft
 from .docx_export import DOCX_CONTENT_TYPE, FANQIE_SIZE_LIMIT, build_fanqie_docx, format_fanqie_chapter_title, split_fanqie_paragraphs
 from .draft_quality import clean_chapter_draft, normalize_style_bible, strip_draft_headings
@@ -51,7 +55,7 @@ _TRANSIENT_ERRORS = {
     "ECONNRESET", "ETIMEDOUT", "UND_ERR_CONNECT_TIMEOUT",
 }
 _MANUAL_RESUME = {"QUOTA_EXCEEDED", "CIRCUIT_OPEN", "OUTPUT_TRUNCATED", "OPENAI_RATE_LIMIT", "OUTLINE_PARSE_FAILED",
-                  "ARC_SUMMARY_INVALID", "ARC_SOURCE_CHANGED", "CONTENT_BLOCKED"}
+                  "ARC_SUMMARY_INVALID", "ARC_SOURCE_CHANGED", "CONTENT_BLOCKED", "BOOK_PLAN_INVALID"}
 _COMEDY = re.compile(r"吐槽|搞笑|反差|打脸|震惊|直播|吃瓜|反转|嘴替|荒诞|尴尬|发疯")
 _PLACEHOLDERS = re.compile(r"【待补充|\[TODO\]|TBD|placeholder", re.I)
 _MARKDOWN_HEADING = re.compile(r"^#{1,6}\s*")
@@ -119,6 +123,44 @@ def _summary(outline, chapter_text):
     tail = " ... " + _excerpt(clean, 70, tail=True) if _utf16_length(clean) > 180 else ""
     base = str(_dict(outline).get("summary") or "").strip()
     return f"{base} [正文节选: {head}{tail}]".strip()
+
+
+def _plan_audit_evidence(plan, chapters):
+    if not is_v2_book_plan(plan):
+        return []
+    locks = _dict(plan.get("canonLocks"))
+    terms = {
+        "identityAliases": {row["alias"] for row in locks.get("identityAliases", [])},
+        "assetSets": {term for row in locks.get("assetSets", []) for term in (row["name"], *row["members"])},
+        "boundaries": {row["subject"] for row in locks.get("boundaries", [])},
+    }
+    patterns = {key: re.compile("|".join(re.escape(term) for term in sorted(values, key=lambda term: (-len(term), term))))
+                for key, values in terms.items() if values}
+    matches = {}
+    for chapter in chapters:
+        number = chapter["chapterNumber"]
+        body = chapter.get("content") or ""
+        if not (volume := volume_for_chapter(plan, number)):
+            continue
+        verification = _dict(chapter.get("verification"))
+        changes = []
+        if verification.get("passed") is True and chapter.get("status") != "needs_review":
+            changes = verified_boundary_changes(verification.get("boundaryChanges"), book_plan=plan, chapter_text=body)
+        for category, pattern in patterns.items():
+            if category == "boundaries" and changes:
+                quote = changes[0]["quote"]
+            elif hit := pattern.search(body):
+                start = max(0, hit.start() - 40)
+                quote = body[start:start + 120].strip()
+            else:
+                continue
+            snippet = {"volume": volume["volume"], "category": category, "chapter": number, "quote": quote}
+            pair = matches.setdefault((volume["volume"], category), [])
+            if len(pair) < 2:
+                pair.append(snippet)
+            else:
+                pair[1] = snippet
+    return [snippet for pair in matches.values() for snippet in pair]
 
 
 def _safe_job(job):
@@ -459,11 +501,30 @@ class PipelineRuntime:
             direction = str(direction or "").strip()
             old_plan = _dict(job.get("bookPlan"))
             volumes = _list(old_plan.get("volumes"))
+            v2 = is_v2_book_plan(old_plan)
+            if v2 and len(volumes) >= 24:
+                raise PipelineError("全书总纲已达24卷，无法追加新卷。", "BOOK_PLAN_VOLUME_LIMIT")
             notes = _list(old_plan.get("continuationNotes"))
             title = "终局完结篇" if finalize_book else "续章新篇"
+            escalation = {}
+            if v2:
+                previous_ladder = _dict(volumes[-1].get("escalation")) if volumes else {}
+                previous_tactics = _list(previous_ladder.get("retiredTactics"))
+                cost = "关键承诺落空，主角将失去现有盟友的支持"
+                if previous_ladder.get("costAtRisk") == cost:
+                    cost = "若处置失败，主角将失去继续调查的资格"
+                escalation = {"escalation": {
+                    "pressure": " ".join(direction.split())[:64] or "旧冲突的后果引来新的对手与阻力",
+                    "costAtRisk": cost,
+                    "retiredTactics": previous_tactics or [
+                        {"tactic": "照搬前卷破局方案", "whyFails": "对手已掌握前卷公开的破局手段并作出防备"},
+                    ],
+                    "stageTransition": None,
+                }}
             plan = {**old_plan, "volumes": [*volumes, {
                 "volume": len(volumes) + 1, "title": f"第{len(volumes) + 1}卷 {title}", "chapters": [previous + 1, total],
-                "summary": direction or f"承接前{previous}章剧情与未回收伏笔继续推进主线冲突",
+                "summary": (direction[:240] if v2 else direction) or f"承接前{previous}章剧情与未回收伏笔继续推进主线冲突",
+                **escalation,
             }], "continuationNotes": [*notes, *([f"[第{previous + 1}-{total}章续写方向] {direction}"] if direction else [])]}
             if llm_config is not None:
                 await self._patch_llm(job, _dict(llm_config))
@@ -498,7 +559,7 @@ class PipelineRuntime:
                 stage = _dict(updated.get("checkpoint")).get("stage") or updated.get("stage")
                 await self._log(job_id, "warn", updated.get("stage"), f"检测到服务重启前的未完成任务，从断点恢复（stage={stage}）")
                 if auto_resume and _dict(updated.get("error")).get("code") not in (
-                    "OUTLINE_PARSE_FAILED", "ARC_SUMMARY_INVALID", "ARC_SOURCE_CHANGED",
+                    "OUTLINE_PARSE_FAILED", "ARC_SUMMARY_INVALID", "ARC_SOURCE_CHANGED", "BOOK_PLAN_INVALID",
                 ):
                     await self._launch(updated)
         return recovered
@@ -677,7 +738,8 @@ class PipelineRuntime:
         await self._boundary_interrupt(job_id, config.get("testScenario"), "topic_locked")
         return job
 
-    async def _book_plan(self, job, config, meme_level, meme_samples, draft_quality, *, rolling_arc_outlines=False):
+    async def _book_plan(self, job, config, meme_level, meme_samples, draft_quality, *, rolling_arc_outlines=False,
+                         options=None):
         if job.get("bookPlan") is not None:
             return job
         job_id = job["id"]
@@ -688,24 +750,79 @@ class PipelineRuntime:
             pov=job.get("pov") or "第三人称限知", target_words=job["targetWords"], total_chapters=job["totalChapters"],
             hotspot_context=job.get("hotspotContext"), topic_package=job.get("topicPackage"), meme_level=meme_level,
             meme_samples=meme_samples, draft_quality=draft_quality, rolling_arc_outlines=rolling_arc_outlines,
+            plan_version=PLAN_VERSION_V2,
         )
-        reply = await self._llm(job_id, "book_plan", config, prompt, 0.7)
-        fallback = {
-            "title": job.get("title"), "genre": job.get("genre"), "pov": job.get("pov"),
-            "logline": job.get("premise") or "主角逆袭破局", "foreshadowingPlan": [],
-            "volumes": [{"volume": 1, "title": "第一卷", "chapters": [1, job["totalChapters"]], "summary": "主线推进"}],
-        }
-        parsed = parse_json_from_llm(reply.get("text"))
-        plan = parsed if isinstance(parsed, dict) else fallback
-        locks = plan.pop("canonLocks", None)
-        if rolling_arc_outlines and (locks := normalize_canon_locks(locks)):
-            plan["canonLocks"] = locks
+        total = job["totalChapters"]
+        feedback = ""
+        for attempt in range(2):
+            request = prompt if not feedback else {**prompt, "prompt": (
+                f"{prompt['prompt']}\n上次总纲校验：{feedback}。请逐项纠正并完整重发 JSON。"
+            )}
+            try:
+                try:
+                    reply = await self._llm(job_id, "book_plan", config, request, 0.7, retries=attempt)
+                    truncated = output_was_truncated(reply.get("finishReason"))
+                except LLMError as error:
+                    if error.code == "EMPTY_RESPONSE" and not output_was_truncated(error.finish_reason):
+                        raise BookPlanValidationError(["bookPlan: 响应为空，须返回完整 JSON"]) from error
+                    if error.code != "OUTPUT_TRUNCATED" and not output_was_truncated(error.finish_reason):
+                        raise
+                    truncated = True
+                if truncated:
+                    raise BookPlanValidationError(["bookPlan: 输出被截断，压缩措辞并返回完整 JSON"])
+                plan, warnings, ladder_issues = validate_book_plan(
+                    parse_json_from_llm(reply.get("text")), total_chapters=total, rolling_arc_outlines=rolling_arc_outlines,
+                )
+            except BookPlanValidationError as error:
+                feedback = str(error)
+                await self._log(job_id, "warn", "book_plan", f"第{attempt + 1}次总纲校验未通过：{feedback}")
+                continue
+            for warning in warnings:
+                await self._log(job_id, "warn", "book_plan", warning)
+            if ladder_issues:
+                feedback = "；".join(ladder_issues)
+                if not attempt:
+                    await self._log(job_id, "warn", "book_plan", f"分卷阶梯待补齐：{feedback}")
+                    continue
+                plan["volumeLadderStatus"] = "partial"
+                await self._log(job_id, "warn", "book_plan", f"分卷阶梯仍有缺项，已保存为 partial：{feedback}")
+            else:
+                plan.pop("volumeLadderStatus", None)
+            plan.pop("degraded", None)
+            break
+        else:
+            if os.environ.get("NOVEL_FORGE_BOOK_PLAN_DEGRADED_OK") != "1":
+                raise LLMError(f"全书总纲未通过校验：{feedback}", code="BOOK_PLAN_INVALID", status=502, retryable=True)
+            plan, _, _ = validate_book_plan({
+                "title": job.get("title") or _UNTITLED, "genre": job.get("genre"), "pov": job.get("pov"),
+                "logline": job.get("premise") or "主角应对核心冲突",
+                "worldview": {"setting": job.get("premise") or "按选题梗概铺设舞台"},
+                "mainCharacters": [{"name": "主角", "role": "主角"}],
+                "volumes": [{"volume": 1, "title": "第一卷", "chapters": [1, total], "summary": "承接选题推进主线"}],
+            }, total_chapters=total)
+            plan.update(degraded=True, volumeLadderStatus="partial")
+            await self._log(job_id, "warn", "book_plan", "已启用总纲降级开关，保存临时总纲。")
         if draft_quality and "styleBible" in plan:
             style = normalize_style_bible(plan["styleBible"])
             if style is None:
                 plan.pop("styleBible")
             else:
                 plan["styleBible"] = style
+        options = read_writing_options(job) if options is None else options
+        if options["input_budget"] is not None:
+            try:
+                build_chapter_write_prompt(
+                    book_plan=plan, outline={"chapterNumber": 1}, total_chapters=total,
+                    input_budget=options["input_budget"], draft_quality=draft_quality,
+                    long_memory=options["long_memory"], chapter_ai_gate=options["chapter_ai_gate"],
+                    rolling_arc_outlines=rolling_arc_outlines, story_ledger=options["story_ledger"],
+                    pov=job.get("pov") or "第三人称限知", target_words=job["wordsPerChapter"],
+                    style_guide=job.get("styleGuide") or STYLE_PRESETS["番茄爽文"],
+                )
+            except LLMError as error:
+                if error.code != "CHAPTER_PROMPT_BUDGET_EXCEEDED":
+                    raise
+                await self._log(job_id, "warn", "book_plan", f"第1章空上下文预算检查：{error}")
         title = (plan.get("title") or _UNTITLED) if job.get("title") == _UNTITLED else job.get("title")
         job = await self._update(job_id, {"bookPlan": plan, "title": title, "progress": 10})
         await self._checkpoint(job_id, "chapter_outlines", nextOutlineChapter=1)
@@ -744,13 +861,16 @@ class PipelineRuntime:
         message = f"开始生成 {total} 章连续章纲..." if through is None else f"补齐历史章纲缺口（至第 {through} 章）。"
         await self._log(job_id, "info", "chapter_outlines", message)
         facts = extract_relevant_facts(await asyncio.to_thread(self.store.get_canonical_facts, job_id)) if missing[0] > 1 else None
+        plan = job["bookPlan"]
+        history = await asyncio.to_thread(self.store.get_chapters, job_id, end_chapter=missing[-1] - 1) if is_v2_book_plan(plan) else []
 
         async def fill(start, end):
             prompt = build_chapter_outlines_prompt(
-                book_plan=job["bookPlan"], start_chapter=start, end_chapter=end, total_chapters=total,
+                book_plan=plan, start_chapter=start, end_chapter=end, total_chapters=total,
                 existing_outlines=[saved[n] for n in sorted(saved) if n < start], target_words_per_chapter=job["wordsPerChapter"],
                 topic_package=job.get("topicPackage"), relevant_facts=facts, continuation_direction=job.get("continuationDirection") or "",
                 finalize_book=bool(job.get("finalizeBook")),
+                boundary_state=collect_boundary_state(history, before_chapter=start, book_plan=plan),
             )
             reply = await self._llm(job_id, "chapter_outlines", config, prompt, 0.6)
             decoded = parse_json_from_llm(reply.get("text"), [])
@@ -799,10 +919,12 @@ class PipelineRuntime:
         await self._checkpoint(job_id, **checkpoint)
         await self._refresh_arc_archives(job_id, arcs, start, archive_config,
                                          story_ledger=story_ledger, book_plan=job.get("bookPlan"))
+        plan = job["bookPlan"]
         preceding = await asyncio.to_thread(self.store.get_chapters, job_id, end_chapter=start - 1)
-        preceding = [row for row in preceding if _is_committed(row)][-5:]
+        preceding = [row for row in preceding if _is_committed(row)]
+        boundary_state = collect_boundary_state(preceding, before_chapter=start, book_plan=plan)
         facts = await asyncio.to_thread(self.store.get_canonical_facts, job_id)
-        source = arc_context_version(facts, preceding, start)
+        source = arc_context_version(facts, preceding, start, boundary_state=boundary_state)
         available = {(row.get("arc"), row["startChapter"], row["endChapter"]) for row in prior_arc_summaries(facts, start)}
         if any((arc["arcIndex"], arc["startChapter"], arc["endChapter"]) not in available
                for arc in arcs if arc["endChapter"] < start):
@@ -813,10 +935,10 @@ class PipelineRuntime:
         title_floor = prior_arcs[0]["startChapter"] if prior_arcs else max(1, start - 12)
         titles = [outlines[n].get("title") for n in sorted(outlines) if title_floor <= n < start]
         prompt = build_arc_outlines_prompt(
-            book_plan=job["bookPlan"], canonical_facts=facts, start_chapter=start, total_chapters=total,
-            arc_index=arc_index, preceding_chapters=preceding, recent_titles=titles,
+            book_plan=plan, canonical_facts=facts, start_chapter=start, total_chapters=total,
+            arc_index=arc_index, preceding_chapters=preceding[-5:], recent_titles=titles,
             continuation_direction=job.get("continuationDirection") or "", finalize_book=bool(job.get("finalizeBook")),
-            story_ledger=story_ledger,
+            story_ledger=story_ledger, boundary_state=boundary_state,
         )
         await self._log(job_id, "info", "chapter_outlines", f"从第 {start} 章规划第 {arc_index} 剧情单元。")
         error = ""
@@ -879,7 +1001,9 @@ class PipelineRuntime:
                     job = await self._update(job_id, {"memeSamplePool": {"mode": mode, "limit": limit, "samples": samples}})
         used_samples = set(title for title in _list(job.get("usedMemeTitles")) if isinstance(title, str))
         yield {"phase": "plan"}
-        job = await self._book_plan(job, config, meme_level, samples[:4], options["draft_quality"], rolling_arc_outlines=rolling)
+        job = await self._book_plan(job, config, meme_level, samples[:4], options["draft_quality"],
+                                    rolling_arc_outlines=rolling, options=options)
+        plan = job["bookPlan"]
         committed = {
             chapter["chapterNumber"]: chapter for chapter in await asyncio.to_thread(self.store.get_chapters, job_id)
             if _is_committed(chapter)
@@ -961,14 +1085,15 @@ class PipelineRuntime:
             sample = None
             if number <= 3 or number % 3 == 0 or _COMEDY.search(f"{context} {outline.get('goal') or ''}"):
                 sample = next((entry for entry in samples if _meme_title(entry) not in used_samples), None)
+            boundary_state = collect_boundary_state(committed.values(), before_chapter=number, book_plan=plan)
             prompt = build_chapter_write_prompt(
-                book_plan=job["bookPlan"], outline=outline, prev_chapter_ending=prev, recent_summaries=summaries,
+                book_plan=plan, outline=outline, prev_chapter_ending=prev, recent_summaries=summaries,
                 canonical_facts=facts, relevant_facts=relevant, input_budget=options["input_budget"],
                 draft_quality=options["draft_quality"], long_memory=options["long_memory"], pov=pov,
                 chapter_ai_gate=options["chapter_ai_gate"],
                 rolling_arc_outlines=rolling, story_ledger=story_ledger,
                 target_words=target, total_chapters=total, style_guide=style, meme_level=meme_level,
-                meme_samples=[sample] if sample is not None else [],
+                meme_samples=[sample] if sample is not None else [], boundary_state=boundary_state,
             )
             meme_title = _meme_title(sample) if sample and any(
                 line.startswith(f"- 【{sample['title']}】") for line in prompt["system"].splitlines()
@@ -1001,7 +1126,7 @@ class PipelineRuntime:
 
             async with aclosing(review_chapter_stages(
                 job_id=job_id, chapter_number=number, chapter_text=chapter_text, outline=outline, canonical_facts=facts,
-                book_plan=job.get("bookPlan"), recent_chapters=recent_chapters, rolling_arc_outlines=rolling,
+                book_plan=plan, recent_chapters=recent_chapters, rolling_arc_outlines=rolling, boundary_state=boundary_state,
                 story_ledger=story_ledger, extract_missing_facts=extract_missing_facts if story_ledger else None,
                 prev_chapter_ending=prev, pov=pov, target_words=target, min_words=minimum, max_words=maximum,
                 llm_config=config, verify_llm_config=auxiliary, test_scenario=config.get("testScenario"),
@@ -1169,7 +1294,11 @@ class PipelineRuntime:
         await self._set_stage(job_id, "arc_archive")
         arc_label = f"「{arc['arcTitle']}」" if arc.get("arcTitle") else ""
         await self._log(job_id, "info", "arc_archive", f"正在归档第 {start}–{end} 章剧情单元{arc_label}...")
-        prompt = build_arc_summary_prompt(arc, chapters, story_ledger=story_ledger, book_plan=book_plan, canonical_facts=facts)
+        plan_canon = is_v2_book_plan(book_plan)
+        history = await asyncio.to_thread(self.store.get_chapters, job_id, end_chapter=start - 1) if plan_canon else []
+        boundary_state = collect_boundary_state(history, before_chapter=start, book_plan=book_plan)
+        prompt = build_arc_summary_prompt(arc, chapters, story_ledger=story_ledger, book_plan=book_plan,
+                                          canonical_facts=facts, boundary_state=boundary_state)
         reply = await self._llm(job_id, "arc_archive", config, prompt, 0.15,
                                 max_tokens=protected_output_budget(16_384, DEFAULT_MAX_TOKENS))
         raw = None if output_was_truncated(reply.get("finishReason")) else parse_json_from_llm(reply.get("text"))
@@ -1177,7 +1306,8 @@ class PipelineRuntime:
         if not isinstance(mainline, str) or not mainline.strip():
             raise LLMError(f"第 {start}–{end} 章单元摘要无效。正文已保存，从断点继续会先补归档。",
                            code="ARC_SUMMARY_INVALID", status=502, retryable=True)
-        if not await _write(self.store.save_arc_summary, job_id, arc, source_hash, raw, story_ledger=story_ledger):
+        if not await _write(self.store.save_arc_summary, job_id, arc, source_hash, raw,
+                            story_ledger=story_ledger, plan_canon=plan_canon):
             raise LLMError(source_error, code="ARC_SOURCE_CHANGED", status=409, retryable=True)
         await self._log(job_id, "info", "arc_archive", f"已完成第 {start}–{end} 章单元归档。")
 
@@ -1252,7 +1382,8 @@ class PipelineRuntime:
     async def _repair_audit_chapters(self, job, outlines, chapters, issues, config, auxiliary, long_memory, *,
                                      rolling_arc_outlines=False, story_ledger=False):
         job_id, pov = job["id"], job.get("pov")
-        for chapter in chapters:
+        plan = job.get("bookPlan")
+        for index, chapter in enumerate(chapters):
             number = chapter["chapterNumber"]
             if number not in issues:
                 continue
@@ -1261,7 +1392,8 @@ class PipelineRuntime:
                 job_id=job_id, chapter_number=number, chapter_text=chapter["content"], outline=outlines.get(number),
                 canonical_facts=facts, pov=pov, target_words=job["wordsPerChapter"], llm_config=config,
                 verify_llm_config=auxiliary, long_memory=long_memory, max_retries=1, store=self.store, client=self.client,
-                book_plan=job.get("bookPlan"), rolling_arc_outlines=rolling_arc_outlines, story_ledger=story_ledger,
+                book_plan=plan, rolling_arc_outlines=rolling_arc_outlines, story_ledger=story_ledger,
+                boundary_state=collect_boundary_state(chapters, before_chapter=number, book_plan=plan),
             )
             if not result["passed"]:
                 continue
@@ -1271,13 +1403,14 @@ class PipelineRuntime:
                 "summary": _summary(outlines.get(number), text), "status": "repaired",
                 "verification": result["verification"], "repairCount": _number(chapter.get("repairCount")) + result["repairCount"],
             }, result["factsDelta"], long_memory=long_memory, story_ledger=story_ledger)
+            chapters[index] = saved["chapter"]
             try:
                 await recheck_downstream_chapters(
                     changed_from_chapter=number, chapters=[ch for ch in chapters if number < ch["chapterNumber"] <= number + 3],
                     outlines=list(outlines.values()), canonical_facts=saved["canonicalFacts"], pov=pov,
                     target_words=job["wordsPerChapter"], llm_config=auxiliary, store=self.store, client=self.client,
                     book_plan=job.get("bookPlan"), long_memory=long_memory, rolling_arc_outlines=rolling_arc_outlines,
-                    story_ledger=story_ledger,
+                    story_ledger=story_ledger, boundary_history=chapters,
                 )
             except Exception as error:
                 await self._log(job_id, "warn", "full_audit", f"第{number}章复修后的下游复核中断：{error}")
@@ -1289,6 +1422,7 @@ class PipelineRuntime:
         await self._boundary_interrupt(job_id, config.get("testScenario"), "full_audit")
         await self._log(job_id, "info", "full_audit", "开始全书定稿一致性终审与四重门禁校验...")
         attempts = max(1, int(_number(job.get("maxAuditRetries"), 2)) + 1)
+        plan = job["bookPlan"]
         for attempt in range(1, attempts + 1):
             detail = await asyncio.to_thread(self.store.job_detail, job_id)
             chapters = detail["chapters"]
@@ -1302,9 +1436,12 @@ class PipelineRuntime:
                 **({"status": "needs_review"} if chapter["status"] == "needs_review" else {}),
             } for chapter in chapters]
             facts = await asyncio.to_thread(self.store.get_canonical_facts, job_id)
+            committed = [row for row in chapters if _is_committed(row)]
+            boundary_state = collect_boundary_state(committed, before_chapter=next_chapter, book_plan=plan)
             prompt = build_full_book_audit_prompt(
-                book_plan=job["bookPlan"], chapters_summary=summaries, chapter_evidence=evidence, canonical_facts=facts,
-                rolling_arc_outlines=rolling_arc_outlines,
+                book_plan=plan, chapters_summary=summaries, chapter_evidence=evidence, canonical_facts=facts,
+                rolling_arc_outlines=rolling_arc_outlines, boundary_state=boundary_state,
+                plan_evidence=_plan_audit_evidence(plan, committed),
                 word_stats={"targetWords": target, "totalWords": words, "totalChapters": job["totalChapters"],
                             "completedChapters": len(chapters), "deviationPct": round((words - target) / target * 100, 2) if target else 0},
             )
