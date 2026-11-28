@@ -83,9 +83,10 @@
 
 ## 六、完本终审（`full_audit`）
 
-- [ ] **WF-15 `[P0]` 终审视野残缺且未接入 `driftChecks`，沦为“98 分橡皮图章”**
+- [x] **WF-15 `[P0]` 终审视野残缺且未接入 `driftChecks`，沦为“98 分橡皮图章”**
   - **现象**：99 条 P0 硬伤的成稿在 `full_audit` 获评 **98 分、0 阻塞直接完本**；同期逐批读正文的 `evaluator` 判 `revise_recommended`、世界观与节奏仅 2.5 分。
   - **代码位置**：`novel_forge/prompts.py` `build_full_book_audit_prompt()`（仅看摘要、`items[-30:]`、头 5 尾 10 条时间线、全量 213 角色表，未读取 83 条 `driftChecks`）。
+  - **已落地**：新增 `novel_forge/book_diagnostics.py`（零调用全书确定性扫描：未解 `driftLedger`、元文本、账目硬错、非风格 `needs_review`、连续骨架克隆、反应过热、退场角色复现与 `scoreCap`）与 `novel_forge/audit_judge.py`（模型引文实证校验 + 双层裁决 + 有界复修挑选）；`build_full_book_audit_prompt` 接入 `24,576` Token 预算与 8 弹性槽；`pipeline.py` 接入终审前本地改题、`auditCache` 同版零调用复用、结构化局部复修与本地下游检验；`app.py` 新增 `POST /api/jobs/{id}/audit/accept` 人工确认带问题完本出口；前端 `MonitorPage.tsx` 升级完本检查卡片展示三态结论、原评→封顶分、硬阻断清单与操作入口。
 
 ---
 

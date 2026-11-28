@@ -1549,16 +1549,30 @@ def _mock_verify(text, chapter, scenario, *, story_ledger=False):
             "summary": f"发现 {len(issues)} 处一致性问题" if issues else f"第{chapter}章一致性审校通过"}
 
 
-def _mock_full_audit(scenario):
+def _mock_full_audit(scenario, prompt):
+    budgeted = "【localDiagnostics】" in prompt
     if scenario.get("mode") == "audit-fail-once" and _first_mock_attempt("audit", scenario):
+        material = prompt.partition("【末三章结尾】")[2]
+        try:
+            endings, _ = json.JSONDecoder().raw_decode(material.lstrip())
+        except ValueError:
+            endings = []
+        blocker = []
+        if endings:
+            finale = endings[-1]
+            if match := re.search(r"[^。！？\n]{4,180}[。！？]\s*$", finale["ending"]):
+                blocker = [{"type": "ending", "chapterNumber": finale["chapterNumber"], "quote": match[0].strip(),
+                            "message": "模拟终审：末句补明人物下一步的安排。"}]
         return {
             "passed": False, "score": 58, "summary": "终审未通过：部分伏笔回收缺少明确章节证据引用。",
+            **({"blockingIssues": blocker, "issueChapters": [row["chapterNumber"] for row in blocker]} if budgeted else {}),
             "mainConflictChapter": 1, "protagonistChoiceChapter": 2, "foreshadowingPayoffs": [], "evidence": [],
             "issues": ["第18章伏笔回收证据引用缺失"], "consistencySummary": "需补全终章证据链后复审",
             "recommendations": ["补全关键章节证据引用"],
         }
     return {
-        "passed": True, "score": 95, "summary": "全书主线完整，主角选择后果明确，人物行为与伤势/物品/秘密边界一致，核心伏笔回收闭环。",
+        "passed": True, "score": 92 if budgeted else 95, **({"blockingIssues": []} if budgeted else {}),
+        "summary": "全书主线完整，主角选择后果明确，人物行为与伤势/物品/秘密边界一致，核心伏笔回收闭环。",
         "mainConflictChapter": 1, "protagonistChoiceChapter": 2,
         "foreshadowingPayoffs": [{"clue": "核心伏笔线索", "plantedChapter": 2, "payoffChapter": 18, "status": "paid_off"}],
         "evidence": [{"claim": "主线冲突确立", "chapter": 1, "quote": "重生回十年前并当场反制暗算"},
@@ -1609,6 +1623,13 @@ def _mock_drift_patch(prompt):
         if quote == _MOCK_UNPOSTED_DRIFT and quote in drift["window"]:
             patches.append({"driftId": drift["id"], "confirmed": True, "find": quote,
                             "replace": "账房把尚未到账的款项单列为待到账。", "reason": "待到账款项单列"})
+        elif drift["issue"] == "模拟终审：末句补明人物下一步的安排。" and quote in drift["window"]:
+            patches.append({"driftId": drift["id"], "confirmed": True, "find": quote,
+                            "replace": quote + "这件事要在天亮前办妥。", "reason": "补明下一步的时间"})
+        elif (drift["kind"] == "clock" and "倒计时缺少衔接" in drift["issue"]
+              and "沿用" in drift["fixHint"] and quote in drift["window"]):
+            patches.append({"driftId": drift["id"], "confirmed": True, "find": quote,
+                            "replace": "账册上标出的交割日期没有变。" + quote, "reason": "补明倒计时的前文依据"})
     return {"patches": patches}
 
 
@@ -1688,7 +1709,7 @@ async def call_mock_llm(*, system="", prompt="", timeout_ms=DEFAULT_TIMEOUT_MS, 
         _, marker, body = combined.partition("【待润色正文】")
         text = body.strip() if marker else combined
     elif task == "full_audit":
-        text = _mock_json(_mock_full_audit(scenario))
+        text = _mock_json(_mock_full_audit(scenario, prompt))
     elif task == "volume_summary":
         text = _mock_json(_mock_volume_prompt(prompt))
     elif task == "drift_patch":

@@ -361,6 +361,19 @@ def create_app(data_dir: Path | None = None, *, client=None):
         entry = await asyncio.to_thread(app.state.store.set_drift_status, job_id, drift_id, status, reason.strip())
         return entry if entry is not None else error_response("Job or drift not found", 404)
 
+    @app.post("/api/jobs/{job_id}/audit/accept")
+    async def accept_audit(job_id: str, request: Request):
+        store = app.state.store
+        note = (await job_payload(request)).get("note", "")
+        if not isinstance(note, str):
+            return error_response("Expected note to be a string", 400)
+        updated = await _write(store.accept_audit_override, job_id, note)
+        if updated is not None:
+            return {"job": public_job(updated)}
+        if await asyncio.to_thread(store.get_job_record, job_id) is None:
+            return error_response("Job not found", 404)
+        return error_response("Audit override requires a blocked audit and all manuscript integrity gates", 409)
+
     @app.get("/api/jobs/{job_id}/workflow")
     async def workflow_snapshot(job_id: str):
         frame = await app.state.worker.read_progress(job_id)

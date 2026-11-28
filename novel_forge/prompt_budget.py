@@ -11,6 +11,7 @@ DEFAULT_CHAPTER_INPUT_BUDGET = 16_384
 DEFAULT_ARC_INPUT_BUDGET = 16_384
 DEFAULT_VERIFY_INPUT_BUDGET = 14_336
 DEFAULT_REPAIR_INPUT_BUDGET = 12_288
+DEFAULT_AUDIT_INPUT_BUDGET = 24_576
 CHAPTER_INPUT_RESERVE = 1_024
 ARC_PROMPT_BUDGET_EXCEEDED = "ARC_PROMPT_BUDGET_EXCEEDED"
 _SPACE = "\u0009-\u000d\u0020\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff"
@@ -31,6 +32,12 @@ def read_arc_input_budget(raw=_UNSET):
     if raw is _UNSET:
         raw = os.environ.get("NOVEL_FORGE_ARC_INPUT_BUDGET")
     return _read_input_budget(raw, DEFAULT_ARC_INPUT_BUDGET, label="滚纲", code="ARC_PROMPT_BUDGET_INVALID")
+
+
+def read_audit_input_budget(raw=_UNSET):
+    if raw is _UNSET:
+        raw = os.environ.get("NOVEL_FORGE_AUDIT_INPUT_BUDGET")
+    return _read_input_budget(raw, DEFAULT_AUDIT_INPUT_BUDGET, label="终审", code="AUDIT_PROMPT_BUDGET_INVALID")
 
 
 def read_review_input_budget(kind="verify", raw=_UNSET):

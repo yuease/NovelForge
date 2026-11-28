@@ -49,6 +49,7 @@ _CJK = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf]")
 _ASCII_WORD = re.compile(r"[a-zA-Z0-9_]+")
 _SURROGATE = re.compile(r"[\ud800-\udfff]")
 _COMMITTED = frozenset(("completed", "verified", "repaired", "needs_review"))
+_COMPLETION_PLACEHOLDERS = re.compile(r"【待补充|\[TODO\]|TBD|placeholder", re.I)
 
 
 class StorageError(RuntimeError):
@@ -155,6 +156,13 @@ def _is_committed(chapter):
     return (chapter or {}).get("status") in _COMMITTED
 
 
+def completion_chapters_valid(chapters, total):
+    return type(total) is int and total > 0 and [row["chapterNumber"] for row in chapters] == list(range(1, total + 1)) and all(
+        _is_committed(row) and (row.get("content") or "").strip() and not _COMPLETION_PLACEHOLDERS.search(row["content"])
+        for row in chapters
+    )
+
+
 def manuscript_fingerprint(chapters):
     version = []
     for chapter in chapters:
@@ -209,6 +217,27 @@ def _invalidate_archives(facts, chapters):
         **facts, **{kind: [row for row in _list(facts.get(kind)) if not _archive_touches(row, chapters)]
                    for kind in ("volumeSummaries", "arcSummaries") if kind in facts},
     }
+
+
+def _refresh_audit_arc(archive, chapters, revised):
+    rows = [row for row in chapters if archive["startChapter"] <= row["chapterNumber"] <= archive["endChapter"]]
+    if volume_source_hash(rows) != archive.get("sourceHash"):
+        return None
+    number = revised["chapterNumber"]
+    rows = [revised if row["chapterNumber"] == number else row for row in rows]
+    source = normalize_quote(revised["content"])
+    refreshed = {**archive, "sourceHash": volume_source_hash(rows)}
+    review = [row["chapterNumber"] for row in rows if row.get("status") == "needs_review"]
+    if review:
+        refreshed["needsReviewChapters"] = review
+    else:
+        refreshed.pop("needsReviewChapters", None)
+    for field in ("usedBeats", "usedHooks", "driftChecks"):
+        if field in refreshed:
+            refreshed[field] = [
+                row for row in refreshed[field] if row["chapter"] != number or locate_quote(row["quote"], source)
+            ]
+    return refreshed
 
 
 def _refresh_drift_ledger(facts, changed_chapters_map):
@@ -278,6 +307,8 @@ def _job_record(data, config, now):
     }
     if isinstance(data.get("degradeOnVerifyExhausted"), bool):
         job["degradeOnVerifyExhausted"] = data["degradeOnVerifyExhausted"]
+    if data.get("maxAuditRetries") is not None:
+        job["maxAuditRetries"] = _number(data["maxAuditRetries"], 2)
     cooldown = _first_non_null(data.get("autoResumeCooldownMs"), raw.get("autoResumeCooldownMs"))
     if cooldown is not None:
         job["autoResumeCooldownMs"] = _number(cooldown, None)
@@ -538,11 +569,52 @@ class Store:
             self._write_job(db, updated)
         return updated
 
-    def job_detail(self, job_id: str):
+    def job_detail(self, job_id: str, *, public=True):
         with self._connection() as db:
             db.execute("BEGIN")
             job = self._get_job(db, job_id)
-            return {"job": public_job(job), "chapters": self._get_chapters(db, job_id)} if job is not None else None
+            return {"job": public_job(job) if public else job,
+                    "chapters": self._get_chapters(db, job_id)} if job is not None else None
+
+    def claim_audit_repair(self, job_id, chapter):
+        with self._write() as db:
+            job = self._get_job(db, job_id, required=True)
+            ledger = _dict(job.get("auditRepairs"))
+            number = chapter["chapterNumber"]
+            key = str(number)
+            if _number(ledger.get(key)) >= 1 or self._get_chapter(db, job_id, number) != chapter:
+                return False
+            self._write_job(db, {**job, "auditRepairs": {**ledger, key: 1}, "updatedAt": _now()})
+            return True
+
+    def accept_audit_override(self, job_id, note="") -> dict | None:
+        with self._write() as db:
+            job = self._get_job(db, job_id)
+            if job is None:
+                return None
+            gate = _dict(job.get("auditGate"))
+            allowed = all(gate.get(key) is True for key in ("chaptersComplete", "wordCountInRange", "exportValid"))
+            blocked = gate.get("verdict") == "blocked" or gate.get("auditPassed") is False
+            if not (allowed and blocked) or job.get("status") not in ("failed", "completed"):
+                return None
+            chapters = self._get_chapters(db, job_id)
+            bounds = gate.get("allowedRange") or [
+                math.floor(job["targetWords"] * 0.9 + 0.5), math.floor(job["targetWords"] * 1.18 + 0.5),
+            ]
+            words = sum(count_chinese_words(row.get("content")) for row in chapters)
+            if not completion_chapters_valid(chapters, job["totalChapters"]) or not bounds[0] <= words <= bounds[1]:
+                return None
+            if gate.get("override"):
+                return job
+            now = _now()
+            override = {"at": now, "note": note[:240], "hardBlockerCount": gate.get(
+                "hardBlockerCount", len(_list(_dict(job.get("auditReport")).get("blockingIssues")))
+            )}
+            checkpoint = {**_dict(job.get("checkpoint")), "stage": "completed", "updatedAt": now}
+            updated = {**job, "status": "completed", "stage": "completed", "progress": 100, "error": None, "checkpoint": checkpoint,
+                       "auditGate": {**gate, "verdict": "blocked", "override": override}, "updatedAt": now}
+            self._write_job(db, updated)
+            return updated
 
     @staticmethod
     def _get_chapters(db, job_id):
@@ -576,7 +648,7 @@ class Store:
                    (job_id, chapter["chapterNumber"], _json(chapter)))
 
     def _save_chapter(self, job_id, number, data, facts_delta, long_memory, *, meme_title=None, story_ledger=False,
-                      track_author_edit=False):
+                      track_author_edit=False, expected_chapter=None, audit_repair=None):
         number = _number(number, None)
         if type(number) is not int or number < 1:
             raise ValueError("Chapter number must be a positive integer")
@@ -585,6 +657,11 @@ class Store:
             now = _now()
             chapter = _chapter_record(number, data, now)
             previous = self._get_chapter(db, job_id, number) or {}
+            if expected_chapter is not None and previous != expected_chapter:
+                return None, _canonical_facts(job.get("canonicalFacts"))
+            current = _canonical_facts(job.get("canonicalFacts"))
+            if audit_repair is not None and current != audit_repair["facts"]:
+                return None, current
             if track_author_edit and previous and any(previous.get(key) != chapter[key] for key in ("title", "content")):
                 chapter["authorEdited"] = True
                 chapter.pop("titleCheck", None)
@@ -597,11 +674,13 @@ class Store:
                        "totalWords": sum(_number(item.get("wordCount")) for item in index.values())}
             if meme_title and _is_committed(chapter):
                 updated["usedMemeTitles"] = _unique_strings([*_list(job.get("usedMemeTitles")), meme_title])
-            if facts_delta is not None and chapter["status"] != "needs_review":
+            if audit_repair is not None and facts_delta is not None:
+                updated["canonicalFacts"] = replace_drift_fact_deltas(current, {number: facts_delta}, timestamp=now,
+                                                                      book_plan=job.get("bookPlan"))
+            elif facts_delta is not None and chapter["status"] != "needs_review":
                 updated["canonicalFacts"] = _merge_chapter_facts(job.get("canonicalFacts"), number, facts_delta,
                                                                long_memory, chapter["content"], now, story_ledger=story_ledger,
                                                                book_plan=job.get("bookPlan"))
-            current = _dict(job.get("canonicalFacts"))
             content_changed = previous and previous.get("content") != chapter["content"]
             if content_changed and drift_ledger(current):
                 updated["canonicalFacts"] = _refresh_drift_ledger(updated["canonicalFacts"], {number: chapter})
@@ -612,15 +691,36 @@ class Store:
                         or (_is_committed(previous) and not _is_committed(chapter))):
                     facts = _refresh_drift_ledger(_dict(updated.get("canonicalFacts")), {})
                     updated["canonicalFacts"] = _invalidate_archives(facts, [number])
+            if audit_repair is not None and audit_repair["driftIds"]:
+                facts = _canonical_facts(updated["canonicalFacts"])
+                facts["driftLedger"] = [
+                    {**row, "status": "repaired", "reason": "audit_repair", "resolution": {"by": "auto", "at": now}}
+                    if row["id"] in audit_repair["driftIds"] and (
+                        row.get("status") in ("open", "deferred") or row.get("reason") == "source_changed"
+                    ) else row
+                    for row in drift_ledger(facts)
+                ]
+                affected = [row for row in _list(current.get("arcSummaries")) if _archive_touches(row, [number])]
+                if affected:
+                    chapters = self._get_chapters(db, job_id)
+                    refreshed = [arc for row in affected if (arc := _refresh_audit_arc(row, chapters, chapter))]
+                    unaffected = [row for row in facts["arcSummaries"] if not _archive_touches(row, [number])]
+                    facts["arcSummaries"] = sorted([*unaffected, *refreshed], key=lambda row: row["startChapter"])
+                updated["canonicalFacts"] = facts
             self._write_chapter(db, job_id, chapter)
             self._write_job(db, updated)
         return chapter, _canonical_facts(updated.get("canonicalFacts"))
 
     def save_chapter(self, job_id, number, data, *, facts_delta=None, long_memory=False, story_ledger=False,
-                     track_author_edit=True):
+                     track_author_edit=True, expected_chapter=None):
         chapter, _ = self._save_chapter(job_id, number, data, facts_delta, long_memory, story_ledger=story_ledger,
-                                        track_author_edit=track_author_edit)
+                                        track_author_edit=track_author_edit, expected_chapter=expected_chapter)
         return chapter
+
+    def save_audit_repair(self, job_id, chapter, updated, *, facts, delta=None, drift_ids=()):
+        saved, _ = self._save_chapter(job_id, chapter["chapterNumber"], updated, delta, False, expected_chapter=chapter,
+                                      audit_repair={"facts": facts, "driftIds": set(drift_ids)})
+        return saved
 
     def save_verified_chapter(self, job_id, number, data, facts_delta=None, *, long_memory=False, meme_title=None,
                               story_ledger=False):
@@ -959,6 +1059,8 @@ class Store:
 
 
 def public_job(job: dict):
+    if "auditCache" in job:
+        job = {key: value for key, value in job.items() if key != "auditCache"}
     facts = _dict(job.get("canonicalFacts"))
     if not facts.get("driftLedger") and (ledger := drift_ledger(facts)):
         job = {**job, "canonicalFacts": {**facts, "driftLedger": ledger}}

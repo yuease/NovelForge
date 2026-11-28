@@ -16,6 +16,8 @@ from .arc_planning import (
     _title_key, arc_plan_soft_feedback, arc_rhythm, horizon_memory, legacy_outline_placeholder, prior_arc_summaries,
     saved_arc_plans, validate_arc_plan,
 )
+from .audit_judge import adjudicate_audit, select_audit_repairs
+from .book_diagnostics import audit_input_hash, collect_book_diagnostics
 from .book_plan import (
     PLAN_VERSION_V2, BookPlanValidationError, collect_boundary_state, is_v2_book_plan, validate_book_plan, volume_for_chapter,
     verified_boundary_changes,
@@ -24,14 +26,17 @@ from .chapter_style import can_save_unverified_draft, normalize_mock_chapter_pro
 from .chapter_title import clean_retitle, local_retitle, strip_conflicting_number, title_body_conflicts
 from .docx_export import DOCX_CONTENT_TYPE, FANQIE_SIZE_LIMIT, build_fanqie_docx, format_fanqie_chapter_title, split_fanqie_paragraphs
 from .draft_quality import clean_chapter_draft, normalize_style_bible, strip_draft_headings
-from .drift_repair import apply_text_patches, classify_drifts, downstream_light_check, identity_alias_conflicts, touches_fact_evidence
+from .drift_repair import apply_text_patches, classify_drifts, downstream_light_check, identity_alias_conflicts, quote_span, touches_fact_evidence
 from .evaluator import evaluate_book
 from .hotspots import HotspotsFeed, select_or_generate_concept
 from .ledger_checks import assess_ledger_delta
 from .llm import DEFAULT_MAX_TOKENS, LLMError, build_mock_volume_summary, call_llm, output_was_truncated, protected_output_budget
 from .long_memory import drift_ledger, normalize_memory_delta, normalize_volume_summary, story_ledger_view
 from .memes import MemeStore
-from .prompt_budget import ARC_PROMPT_BUDGET_EXCEEDED, DEFAULT_ARC_INPUT_BUDGET, read_arc_input_budget, read_review_input_budget
+from .prompt_budget import (
+    ARC_PROMPT_BUDGET_EXCEEDED, DEFAULT_ARC_INPUT_BUDGET, read_arc_input_budget, read_audit_input_budget,
+    read_review_input_budget,
+)
 from .prompts import (
     STYLE_PRESETS,
     build_arc_outlines_prompt,
@@ -49,11 +54,14 @@ from .prompts import (
     read_writing_options as read_prompt_writing_options,
 )
 from .providers import get_provider_definition, is_masked_api_key, same_endpoint_origin, thinking_capability
-from .storage import _archive_touches, _is_committed, arc_context_version, count_chinese_words, public_job, replace_drift_fact_deltas, volume_source_hash
+from .storage import (
+    _archive_touches, _canonical_facts, _is_committed, arc_context_version, completion_chapters_valid,
+    count_chinese_words, public_job, replace_drift_fact_deltas, volume_source_hash,
+)
+from .text_evidence import locate_quote, normalize_quote
 from .thinking_policy import resolve_writing_thinking, writing_profile
 from .verifier import (
-    _llm_options, parse_json_from_llm, recheck_downstream_chapters,
-    review_chapter_stages, verify_and_repair_chapter,
+    _llm_options, parse_json_from_llm, review_chapter_stages, verify_and_repair_chapter,
 )
 
 
@@ -1072,6 +1080,13 @@ class PipelineRuntime:
                 running_words = sum(_word_count(chapter) for chapter in committed.values())
 
         first_missing = next((number for number in range(1, total + 1) if number not in committed), total + 1)
+        cached_hash = _dict(job.get("auditCache")).get("auditInputHash")
+        resume_cached_audit = (
+            first_missing > total and bool(cached_hash)
+            and _dict(job.get("checkpoint")).get("stage") in ("full_audit", "audit_revising")
+            and cached_hash == audit_input_hash(job, list(committed.values()), _canonical_facts(job.get("canonicalFacts")),
+                                                _saved_outlines(job), saved_arc_plans(job))
+        )
         profile = job.get("writingProfile")
         if thinking_warnings is None:
             thinking_warnings = set()
@@ -1093,7 +1108,7 @@ class PipelineRuntime:
 
         write_config = await configure_writing(first_missing, _dict(job.get("canonicalFacts")))
         arcs = saved_arc_plans(job) if rolling else []
-        if options["long_memory"] and committed:
+        if options["long_memory"] and committed and not resume_cached_audit:
             await self._catch_up_volumes(job_id, max(committed), committed, auxiliary)
         arc_options = {key: options[key] for key in ("story_ledger", "long_memory", "arc_input_budget")}
         if not rolling:
@@ -1107,8 +1122,9 @@ class PipelineRuntime:
                 n not in existing or (legacy_outline_placeholder(existing[n], n) and n not in committed)
                 for n in range(1, historical_tail + 1)
             ))
-            pending_archives = await self._pending_arc_archives(job_id, arcs, first_missing,
-                                                               pending_only=first_missing > total)
+            pending_archives = [] if resume_cached_audit else await self._pending_arc_archives(
+                job_id, arcs, first_missing, pending_only=first_missing > total
+            )
             in_outlines = False
             if need_historical:
                 yield {"phase": "outlines"}
@@ -1301,19 +1317,22 @@ class PipelineRuntime:
 
         yield {"phase": "calibrate"}
         word_range = (_round(job["targetWords"] * 0.9), _round(job["targetWords"] * 1.18))
-        await self._calibrate(job, outlines, committed, running_words, word_range, auxiliary)
+        if not resume_cached_audit:
+            await self._calibrate(job, outlines, committed, running_words, word_range, auxiliary)
         yield {"phase": "audit"}
         facts = await asyncio.to_thread(self.store.get_canonical_facts, job_id)
         write_config = await configure_writing(total + 1, facts)
         report = await self._audit(job, outlines, config, auxiliary, options["long_memory"], rolling_arc_outlines=rolling,
                                    story_ledger=story_ledger, write_config=write_config)
-        gate = await self._completion_gate(job, report, word_range)
+        gate = await self._completion_gate(job, report, word_range, outlines=outlines)
         if not gate["passed"]:
             await self._checkpoint(job_id, "full_audit", nextChapter=total + 1)
             reasons = [reason for test, reason in (
                 ("chaptersComplete", "章节不完整或含空章/占位符"),
                 ("wordCountInRange", f"总字数 {gate['totalWords']} 超出目标区间 [{word_range[0]}, {word_range[1]}]"),
-                ("auditPassed", f"全书终审未通过：{report.get('summary') or '无效响应'}"),
+                ("auditPassed", "全书终审未通过：" + (
+                    f"发现 {gate['hardBlockerCount']} 项阻塞问题" if gate["hardBlockerCount"] else report["summary"]
+                )),
                 ("exportValid", "TXT/MD 导出校验失败"),
             ) if not gate[test]]
             await self._failed(job_id, "error", "AUDIT_GATE_FAILED", f"完本四重门禁未通过：{'；'.join(reasons)}",
@@ -1743,42 +1762,154 @@ class PipelineRuntime:
                 "repairCount": _number(chapter.get("repairCount")) + 1,
             }, track_author_edit=False)
 
-    async def _repair_audit_chapters(self, job, outlines, chapters, issues, config, auxiliary, long_memory, *,
-                                     rolling_arc_outlines=False, story_ledger=False):
-        job_id, pov = job["id"], job.get("pov")
+    async def _audit_surgical_patch(self, job, chapter, outline, facts, findings, config, *, boundary_state,
+                                    story_ledger, long_memory, verify_budget):
+        job_id, number, original = job["id"], chapter["chapterNumber"], chapter["content"]
         plan = job.get("bookPlan")
-        for index, chapter in enumerate(chapters):
-            number = chapter["chapterNumber"]
-            if number not in issues:
-                continue
-            facts = await asyncio.to_thread(self.store.get_canonical_facts, job_id)
-            result = await verify_and_repair_chapter(
-                job_id=job_id, chapter_number=number, chapter_text=chapter["content"], outline=outlines.get(number),
-                canonical_facts=facts, pov=pov, target_words=job["wordsPerChapter"], llm_config=config,
-                verify_llm_config=auxiliary, long_memory=long_memory, max_retries=1, store=self.store, client=self.client,
-                book_plan=plan, rolling_arc_outlines=rolling_arc_outlines, story_ledger=story_ledger,
-                boundary_state=collect_boundary_state(chapters, before_chapter=number, book_plan=plan),
+        drifts = {}
+        for item in findings:
+            quote = item.get("quote")
+            if quote_span(quote, original):
+                identifier = item.get("driftId") or f"audit-{number}-{len(drifts) + 1}"
+                drifts.setdefault(identifier, {"id": identifier, "kind": item.get("kind") or item["code"],
+                                               "issue": item.get("message") or "", "fixHint": item.get("fixHint")
+                                               or item.get("suggestion") or "", "quote": quote})
+            if len(drifts) == 3:
+                break
+        if not drifts:
+            return None
+        view = story_ledger_view(facts, chapter_number=number, book_plan=plan)
+        prompt = build_drift_patch_prompt(chapter=chapter, drifts=list(drifts.values()), book_plan=plan,
+                                         ledger_view=view, boundary_state=boundary_state)
+        started = time.monotonic()
+        reply = await self._request_drift_patch(job_id, config, prompt)
+        await self._record_usage(job_id, "drift_patch", reply.get("usage"), reply.get("durationMs") or _elapsed(started),
+                                 model=config.get("model") or config.get("provider"))
+        raw = _dict(parse_json_from_llm(reply.get("text"))) if not output_was_truncated(reply.get("finishReason")) else {}
+        body, accepted, _ = apply_text_patches(original, _list(raw.get("patches")), drifts,
+                                               chapter_number=number, book_plan=plan)
+        if not accepted:
+            return None
+        args = {"chapter_number": number, "canonical_facts": facts, "pov": job.get("pov") or "第三人称限知",
+                "min_words": 0, "book_plan": plan}
+        if _new_hard_conflicts(run_deterministic_checks(chapter_text=original, **args)["issues"],
+                               run_deterministic_checks(chapter_text=body, **args)["issues"]):
+            return None
+        original_delta = next((_dict(row.get("delta")) for row in _list(facts.get("factHistory"))
+                               if row.get("chapter") == number), {})
+        delta = None
+        rewritten_spans = [row for row in accepted if original[row["start"]:row["end"]] not in row["replace"]]
+        if rewritten_spans and touches_fact_evidence(original, rewritten_spans, original_delta):
+            prompt = build_fact_extraction_prompt(
+                chapter_number=number, chapter_text=body, outline=outline, canonical_facts=facts, book_plan=plan,
+                story_ledger=story_ledger, long_memory=long_memory, input_budget=verify_budget,
             )
-            if not result["passed"]:
+            reply = await self._llm(job_id, "fact_extraction", config, prompt, 0.2)
+            revised_delta = parse_json_from_llm(reply.get("text")) if not output_was_truncated(reply.get("finishReason")) else None
+            if not isinstance(revised_delta, dict):
+                return None
+            assessment = assess_ledger_delta(revised_delta, body, view, book_plan=plan)
+            before = assess_ledger_delta(original_delta, original, view, book_plan=plan)
+            if _new_hard_conflicts(before["issues"], assessment["issues"]):
+                return None
+            delta = assessment["cleanedDelta"]
+        ids = {row["driftId"] for row in accepted}
+        verification, status = chapter.get("verification"), chapter["status"]
+        if status == "needs_review" and isinstance(verification, dict):
+            proofs = {normalize_quote(drifts[identifier]["quote"]) for identifier in ids}
+            source = normalize_quote(body)
+            issues = _list(verification.get("issues"))
+            remaining = [item for item in issues if not (
+                isinstance(quote := _dict(item).get("quote"), str)
+                and normalize_quote(quote) in proofs and not locate_quote(quote, source)
+            )]
+            if len(remaining) < len(issues):
+                verification = {**verification, "issues": remaining}
+                if (all(item.get("severity") == "warning" for item in remaining)
+                        and not any(item.get("priority") == "P0" for item in _list(verification.get("aiIssues")))):
+                    status = "repaired"
+                    verification["resolution"] = "audit_repair"
+        return {"body": body, "delta": delta, "driftIds": ids, "verification": verification,
+                "status": "needs_review" if status == "needs_review" else "repaired"}
+
+    async def _repair_audit_chapters(self, job, outlines, chapters, targets, config, auxiliary, long_memory, *,
+                                     rolling_arc_outlines=False, story_ledger=False):
+        job_id, plan = job["id"], job.get("bookPlan")
+        indices = {row["chapterNumber"]: index for index, row in enumerate(chapters)}
+        verify_budget, repair_budget = read_review_input_budget(), read_review_input_budget("repair")
+        if isinstance(targets, set):
+            targets = [{"chapterNumber": number, "findings": []} for number in sorted(targets & indices.keys())]
+        for target in targets:
+            number, findings = target["chapterNumber"], target["findings"]
+            index = indices[number]
+            chapter = chapters[index]
+            if not await _write(self.store.claim_audit_repair, job_id, chapter):
                 continue
-            text = result["chapterText"]
-            title_fields = await self._rewritten_title(job, chapter, text, chapters, auxiliary)
-            saved = await _write(self.store.save_verified_chapter, job_id, number, {
-                **chapter, **title_fields, "content": text, "wordCount": count_chinese_words(text),
-                "summary": _summary(outlines.get(number), text), "status": "repaired",
-                "verification": result["verification"], "repairCount": _number(chapter.get("repairCount")) + result["repairCount"],
-            }, result["factsDelta"], long_memory=long_memory, story_ledger=story_ledger)
-            chapters[index] = saved["chapter"]
+            outline = outlines.get(number)
+            facts = await asyncio.to_thread(self.store.get_canonical_facts, job_id)
+            boundary = collect_boundary_state(chapters, before_chapter=number, book_plan=plan)
             try:
-                await recheck_downstream_chapters(
-                    changed_from_chapter=number, chapters=[ch for ch in chapters if number < ch["chapterNumber"] <= number + 3],
-                    outlines=list(outlines.values()), canonical_facts=saved["canonicalFacts"], pov=pov,
-                    target_words=job["wordsPerChapter"], llm_config=auxiliary, store=self.store, client=self.client,
-                    book_plan=job.get("bookPlan"), long_memory=long_memory, rolling_arc_outlines=rolling_arc_outlines,
-                    story_ledger=story_ledger, boundary_history=chapters,
-                )
-            except Exception as error:
-                await self._log(job_id, "warn", "full_audit", f"第{number}章复修后的下游复核中断：{error}")
+                if any(item.get("quote") for item in findings):
+                    candidate = await self._audit_surgical_patch(
+                        job, chapter, outline, facts, findings, config, boundary_state=boundary,
+                        story_ledger=story_ledger, long_memory=long_memory, verify_budget=verify_budget,
+                    )
+                else:
+                    result = await verify_and_repair_chapter(
+                        job_id=job_id, chapter_number=number, chapter_text=chapter["content"], outline=outline,
+                        canonical_facts=facts, pov=job.get("pov") or "第三人称限知", target_words=job["wordsPerChapter"],
+                        llm_config=config, verify_llm_config=auxiliary, long_memory=long_memory, max_retries=1,
+                        store=self.store, client=self.client, book_plan=plan, rolling_arc_outlines=rolling_arc_outlines,
+                        story_ledger=story_ledger, boundary_state=boundary, chapter_title=chapter["title"],
+                        verify_input_budget=verify_budget, repair_input_budget=repair_budget, arc_plans=saved_arc_plans(job),
+                    )
+                    candidate = ({"body": result["chapterText"], "delta": result["factsDelta"], "driftIds": (),
+                                  "verification": result["verification"], "status": "repaired"} if result["passed"] else None)
+            except LLMError as error:
+                await self._log(job_id, "warn", "full_audit", f"第{number}章终审复修未完成：{error}")
+                continue
+            if not candidate or (candidate["body"] == chapter["content"] and chapter["status"] != "needs_review"):
+                continue
+            body, delta = candidate["body"], candidate["delta"]
+            count = count_chinese_words(body)
+            verification = candidate["verification"]
+            if isinstance(verification, dict):
+                verification = {**verification, "wordCount": count}
+            planned = _dict(chapter.get("titleCheck")).get("planned") or chapter["title"]
+            conflicts = title_body_conflicts(planned, body)
+            title = (local_retitle(planned, conflicts, body) if conflicts else planned) if not (
+                chapter.get("authorEdited") or number <= _number(job.get("importedChapterCount"))
+            ) else None
+            updated = {**chapter, "content": body, "wordCount": count, "summary": _summary(outline, body),
+                       "status": candidate["status"], "verification": verification,
+                       "repairCount": _number(chapter.get("repairCount")) + 1}
+            if title:
+                updated.update(title=title, titleCheck={"planned": planned, "final": title, "method": "local",
+                                                       "conflicts": conflicts} if conflicts else None)
+            next_facts = facts
+            if isinstance(delta, dict):
+                memory = normalize_memory_delta(delta.get("memory"), number, body, story_ledger=story_ledger,
+                                                long_memory=long_memory, book_plan=plan, history=facts["factHistory"])
+                delta = {key: value for key, value in delta.items() if key != "memory"}
+                if memory:
+                    delta["memory"] = memory
+                next_facts = replace_drift_fact_deltas(facts, {number: delta}, timestamp=_now(), book_plan=plan)
+            following = chapters[index + 1:] if next_facts is not facts else []
+            before = await asyncio.to_thread(downstream_light_check, [chapter, *following], facts, plan)
+            after = await asyncio.to_thread(downstream_light_check, [updated, *following], next_facts, plan)
+            if _new_hard_conflicts(before, after):
+                continue
+            saved = await _write(self.store.save_audit_repair, job_id, chapter, updated, facts=facts,
+                                 delta=delta, drift_ids=candidate["driftIds"])
+            if saved:
+                chapters[index] = saved
+
+    async def _audit_snapshot(self, job_id, outlines):
+        detail = await asyncio.to_thread(self.store.job_detail, job_id, public=False)
+        job, chapters = detail["job"], detail["chapters"]
+        facts = _canonical_facts(job.get("canonicalFacts"))
+        diagnostics = await asyncio.to_thread(collect_book_diagnostics, job, chapters, facts, outlines, saved_arc_plans(job))
+        return job, chapters, facts, diagnostics
 
     async def _audit(self, job, outlines, config, auxiliary, long_memory, *, rolling_arc_outlines=False, story_ledger=False,
                      write_config=None):
@@ -1787,54 +1918,68 @@ class PipelineRuntime:
         await self._set_stage(job_id, "full_audit", 95)
         await self._boundary_interrupt(job_id, config.get("testScenario"), "full_audit")
         await self._log(job_id, "info", "full_audit", "开始全书定稿一致性终审与四重门禁校验...")
+        for chapter in await asyncio.to_thread(self.store.get_chapters, job_id):
+            title, body = chapter["title"], chapter.get("content") or ""
+            conflicts = title_body_conflicts(title, body)
+            if conflicts and (fixed := local_retitle(title, conflicts, body)):
+                await _write(self.store.save_chapter, job_id, chapter["chapterNumber"], {
+                    **chapter, "title": fixed, "titleCheck": {"planned": title, "final": fixed, "method": "local",
+                                                            "conflicts": conflicts},
+                }, track_author_edit=False, expected_chapter=chapter)
+        job, chapters, facts, diagnostics = await self._audit_snapshot(job_id, outlines)
+        cache = _dict(job.get("auditCache"))
+        if cache.get("auditInputHash") == diagnostics["auditInputHash"] and isinstance(cache.get("report"), dict):
+            return cache["report"]
         attempts = max(1, int(_number(job.get("maxAuditRetries"), 2)) + 1)
-        plan = job["bookPlan"]
+        input_budget = read_audit_input_budget()
+        report = {}
         for attempt in range(1, attempts + 1):
-            detail = await asyncio.to_thread(self.store.job_detail, job_id)
-            chapters = detail["chapters"]
-            words = detail["job"]["totalWords"]
-            target = job["targetWords"]
-            summaries = [{key: chapter.get(key) for key in ("chapterNumber", "title", "wordCount", "summary")}
-                         for chapter in chapters]
-            evidence = [{
-                **{key: chapter.get(key) for key in ("chapterNumber", "title", "wordCount")},
-                "opening": _excerpt(chapter.get("content"), 120), "ending": _excerpt(chapter.get("content"), 120, tail=True),
-                **({"status": "needs_review"} if chapter["status"] == "needs_review" else {}),
-            } for chapter in chapters]
-            facts = await asyncio.to_thread(self.store.get_canonical_facts, job_id)
-            committed = [row for row in chapters if _is_committed(row)]
-            boundary_state = collect_boundary_state(committed, before_chapter=next_chapter, book_plan=plan)
-            prompt = build_full_book_audit_prompt(
-                book_plan=plan, chapters_summary=summaries, chapter_evidence=evidence, canonical_facts=facts,
-                rolling_arc_outlines=rolling_arc_outlines, boundary_state=boundary_state,
-                plan_evidence=_plan_audit_evidence(plan, committed),
-                word_stats={"targetWords": target, "totalWords": words, "totalChapters": job["totalChapters"],
-                            "completedChapters": len(chapters), "deviationPct": round((words - target) / target * 100, 2) if target else 0},
-            )
-            reply = await self._llm(job_id, "full_audit", config, prompt, 0.2, retries=int(attempt > 1))
-            report = _dict(parse_json_from_llm(reply.get("text"))) if not output_was_truncated(reply.get("finishReason")) else {}
-            blockers = _list(report.get("blockingIssues"))
-            if report.get("passed") is True and not blockers:
-                return report
-            report = {**(report or {"summary": "全书终审返回格式无效或未通过"}), "passed": False}
-            if attempt < attempts:
-                await self._checkpoint(job_id, "audit_revising", nextChapter=next_chapter, attempt=attempt)
-                await self._log(job_id, "warn", "full_audit", f"全书终审第 {attempt} 次存在阻塞问题，正在复修受影响章节...")
-                issues = {_number(value) for value in (
-                    *_list(report.get("issueChapters")), *(_dict(item).get("chapterNumber") for item in blockers),
-                )}
-                await self._repair_audit_chapters(job, outlines, chapters, issues, write_config or config, auxiliary, long_memory,
-                                                  rolling_arc_outlines=rolling_arc_outlines, story_ledger=story_ledger)
+            fingerprint = diagnostics["auditInputHash"]
+            if report.get("auditInputHash") != fingerprint:
+                plan, words, target = job.get("bookPlan"), job["totalWords"], job["targetWords"]
+                committed = [row for row in chapters if _is_committed(row)]
+                boundary_state = collect_boundary_state(committed, before_chapter=next_chapter, book_plan=plan)
+                prompt = build_full_book_audit_prompt(
+                    book_plan=plan, diagnostics=diagnostics, chapters=chapters, input_budget=input_budget,
+                    rolling_arc_outlines=rolling_arc_outlines,
+                    canonical_facts={**facts, "arcPlans": saved_arc_plans(job)}, boundary_state=boundary_state,
+                    plan_evidence=_plan_audit_evidence(plan, committed),
+                    word_stats={"targetWords": target, "totalWords": words, "totalChapters": job["totalChapters"],
+                                "completedChapters": len(committed),
+                                "deviationPct": round((words - target) / target * 100, 2) if target else 0},
+                )
+                if meta := prompt.pop("budgetMeta", None):
+                    await self._log(job_id, "warn", "full_audit", "终审保留必要证据，提示词超出配置预算。", meta=meta)
+                reply = await self._llm(job_id, "full_audit", config, prompt, 0.2, retries=int(attempt > 1))
+                raw = _dict(parse_json_from_llm(reply.get("text"))) if not output_was_truncated(reply.get("finishReason")) else {}
+                report = adjudicate_audit(raw, diagnostics, chapters)
+                await self._update(job_id, {"auditCache": {"auditInputHash": fingerprint, "diagnostics": diagnostics,
+                                                          "report": report}})
+            if report["passed"] or attempt == attempts:
+                break
+            targets = select_audit_repairs(report["blockingIssues"], _dict(job.get("auditRepairs")))
+            if not targets:
+                break
+            await self._checkpoint(job_id, "audit_revising", nextChapter=next_chapter, attempt=attempt)
+            await self._log(job_id, "warn", "full_audit", f"全书终审第 {attempt} 次存在阻塞问题，正在复修受影响章节...")
+            await self._repair_audit_chapters(job, outlines, chapters, targets, write_config or config, auxiliary, long_memory,
+                                              rolling_arc_outlines=rolling_arc_outlines, story_ledger=story_ledger)
+            job, chapters, facts, diagnostics = await self._audit_snapshot(job_id, outlines)
         return report
 
-    async def _completion_gate(self, job, report, word_range):
-        detail = await asyncio.to_thread(self.store.job_detail, job["id"])
+    async def _completion_gate(self, job, report, word_range, *, outlines=None):
+        detail = await asyncio.to_thread(self.store.job_detail, job["id"], public=False)
         job, chapters = detail["job"], detail["chapters"]
+        facts = _canonical_facts(job.get("canonicalFacts"))
+        outlines = _saved_outlines(job) if outlines is None else outlines
+        arcs = saved_arc_plans(job)
+        if report.get("auditInputHash") and report["auditInputHash"] != audit_input_hash(job, chapters, facts, outlines, arcs):
+            diagnostics = await asyncio.to_thread(collect_book_diagnostics, job, chapters, facts, outlines, arcs)
+            report.clear()
+            report.update(adjudicate_audit({"passed": False, "summary": "终审期间正文或事实发生变化，请重新终审。"},
+                                           diagnostics, chapters))
         words, target, total = job["totalWords"], job["targetWords"], job["totalChapters"]
-        complete = [chapter["chapterNumber"] for chapter in chapters] == list(range(1, total + 1)) and all(
-            _is_committed(chapter) and (chapter.get("content") or "").strip() and not _PLACEHOLDERS.search(chapter["content"])
-            for chapter in chapters
-        )
+        complete = completion_chapters_valid(chapters, total)
         export_valid = False
         try:
             export_valid = all(_export(job, chapters, fmt)["content"].strip() for fmt in ("txt", "md"))
@@ -1842,9 +1987,18 @@ class PipelineRuntime:
             pass
         checks = {"chaptersComplete": complete, "wordCountInRange": word_range[0] <= words <= word_range[1],
                   "auditPassed": report.get("passed") is True, "exportValid": export_valid}
+        local = report.get("localDiagnostics", {})
+        revision_chapters = report.get("issueChapters", [])
+        if report.get("verdict") == "revise_recommended" and not revision_chapters:
+            revision_chapters = sorted({item["chapterNumber"] for item in local.get("capItems", [])
+                                        if "chapterNumber" in item})
         return {"passed": all(checks.values()), **checks, "totalWords": words, "targetWords": target,
                 "allowedRange": list(word_range),
-                "needsReviewChapters": [ch["chapterNumber"] for ch in chapters if ch["status"] == "needs_review"]}
+                "needsReviewChapters": [ch["chapterNumber"] for ch in chapters if ch["status"] == "needs_review"],
+                "verdict": report.get("verdict"), "score": report.get("score"), "rawScore": report.get("rawScore"),
+                "scoreCap": report.get("auditScoreCap"), "hardBlockerCount": len(report.get("blockingIssues", [])),
+                "localDiagnostics": local, "unresolvedDrifts": report.get("unresolvedDrifts", []),
+                "revisionEntry": {"route": "evaluation", "chapters": revision_chapters}}
 
     async def _finish(self, job, config, report, gate):
         job_id = job["id"]

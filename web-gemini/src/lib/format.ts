@@ -81,6 +81,12 @@ export const READINESS_META: Record<string, { label: string; tone: Tone }> = {
   major_rework: { label: '建议大修结构', tone: 'danger' },
 }
 
+export const AUDIT_VERDICT_META: Record<string, { label: string; tone: Tone }> = {
+  ready: { label: '可准备投稿', tone: 'success' },
+  revise_recommended: { label: '建议精修', tone: 'warning' },
+  blocked: { label: '终审受阻', tone: 'danger' },
+}
+
 export const PRIORITY_META: Record<'P0' | 'P1' | 'P2', { label: string; short: string; tone: Tone }> = {
   P0: { label: '必须修', short: 'P0', tone: 'danger' },
   P1: { label: '建议改', short: 'P1', tone: 'warning' },
@@ -204,6 +210,13 @@ export function friendlyError(err: string | JobErrorObject | null | undefined): 
     return {
       title: '剧情规划参考内容超出上限',
       summary: cleanHead || '本段剧情规划需要附带的硬设定与未回收伏笔超出单次预算上限，已安全停在断点。可适当精简续写方向或放宽规划预算后继续。',
+      detail: hasRawTech || raw !== cleanHead ? raw : undefined,
+    }
+  }
+  if (code === 'AUDIT_GATE_FAILED' || /完本终审未通过|终审发现.*阻塞/.test(raw)) {
+    return {
+      title: '完本终审发现待处理硬伤',
+      summary: '所有章节与正文已安全保存，但终审检测到尚未解决的硬性矛盾。可在下方「完本检查」查看具体章节，前往修订工作台定向精修，或在确认无碍后选择带问题完本。',
       detail: hasRawTech || raw !== cleanHead ? raw : undefined,
     }
   }

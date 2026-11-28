@@ -14,6 +14,7 @@ from .book_plan import (
     PLAN_VERSION_V2, PLAN_V2_MARKER, canon_locks_text, is_v2_book_plan, volume_card_text,
     volume_ladder_text, volumes_for_range,
 )
+from .book_diagnostics import open_foreshadowing
 from .draft_quality import STYLE_BIBLE_MARKER, compact_style_bible
 from .drift_repair import quote_span
 from .entity_salience import _mentions, active_subplots_view, entity_index, ranked_entities, retired_character_status, retired_roster
@@ -23,7 +24,7 @@ from .long_memory import (
     STORY_CHARACTER_FIELDS, active_memory_items, protagonist_name, relevant_memory_characters,
     story_ledger_events, story_ledger_view, unresolved_drifts,
 )
-from .prompt_budget import ARC_PROMPT_BUDGET_EXCEEDED, fit_chapter_prompt, fit_prompt, read_chapter_input_budget
+from .prompt_budget import ARC_PROMPT_BUDGET_EXCEEDED, fit_chapter_prompt, fit_prompt, read_audit_input_budget, read_chapter_input_budget
 from .text_evidence import normalize_quote
 
 POV_RULES = {
@@ -395,9 +396,14 @@ _DE_AI_SYSTEM = Template("""[TASK:DE_AI]
 _DE_AI_PROMPT = Template("""【待润色正文】
 ${chapter_text}""")
 
-_FULL_BOOK_AUDIT_SYSTEM = """[TASK:FULL_AUDIT]
+_LEGACY_FULL_BOOK_AUDIT_SYSTEM = """[TASK:FULL_AUDIT]
 你是全书终审主编。请结合全书总纲、定稿正文提取的各章摘要与关键情节证据、篇幅统计与最终规范事实库，核实主线收束、主角选择后果、人物最终状态与核心伏笔回收。
 必须严格输出合法 JSON，并附带具体章节证据引用。"""
+
+_FULL_BOOK_AUDIT_SYSTEM = (
+    _LEGACY_FULL_BOOK_AUDIT_SYSTEM
+    + "\n本地诊断 hardBlockers 是已核实事实，不得否决。新增章节级阻塞问题必须给出 chapterNumber 和可在该章正文中定位的 quote 原句。"
+)
 
 _FULL_BOOK_AUDIT_PROMPT = Template("""请对全书进行定稿终审：
 【全书总纲】${book_plan}
@@ -1994,10 +2000,158 @@ def build_de_ai_prompt(*, chapter_text, pov=_DEFAULT_POV, style_guide=_DEFAULT_S
     }
 
 
+def _audit_volume_material(volume_summaries, arc_summaries):
+    def span(row):
+        start, end = row.get("startChapter"), row.get("endChapter")
+        return (start, end) if type(start) is int and type(end) is int and 0 < start <= end else None
+
+    volumes = [row for row in _records(volume_summaries) if span(row) and row.get("mainline")]
+    covered = sorted(map(span, volumes))
+
+    def missing(start, end):
+        for left, right in covered:
+            if left > start:
+                break
+            start = max(start, right + 1)
+            if start > end:
+                return False
+        return True
+
+    fallback = [row for row in _records(arc_summaries) if span(row) and missing(*span(row))]
+    return [{"range": list(span(row)), "mainline": _text_excerpt(row.get("mainline") or "", 280),
+             "turningPoints": [{"chapter": point.get("chapter"), "text": _text_excerpt(point.get("text") or "", 90)}
+                               for point in _records(row.get("turningPoints"))[:3]]}
+            for row in sorted([*volumes, *fallback], key=span) if row.get("mainline")]
+
+
+def _audit_risk_evidence(chapters, diagnostics):
+    by_chapter = {row["chapterNumber"]: row for row in chapters}
+    findings = [item for key in ("hardBlockers", "capItems", "advisories") for item in diagnostics.get(key, [])]
+    retired = [item["chapterNumber"] for item in findings if item.get("code") == "retired_character"]
+    numbers = list(dict.fromkeys([*diagnostics.get("highRiskChapters", []), *retired]))[:12]
+    evidence = []
+    for number in numbers:
+        if not (chapter := by_chapter.get(number)):
+            continue
+        body = chapter.get("content") or ""
+        windows = []
+        for item in findings:
+            quote = item.get("quote")
+            if item.get("chapterNumber") != number or not isinstance(quote, str) or not quote.strip():
+                continue
+            span = quote_span(quote, body)
+            if span is None and (start := body.find(quote)) >= 0:
+                span = start, start + len(quote)
+            if span:
+                start, end = span
+                windows.append({"code": item["code"], "window": body[max(0, start - 300):end + 300]})
+            if len(windows) == 2:
+                break
+        evidence.append({"chapterNumber": number, "title": _text_excerpt(chapter.get("title") or "", 80),
+                         "windows": windows or [{"window": body[-600:]}]})
+    return evidence
+
+
+def _budgeted_audit_prompt(book_plan, chapters, word_stats, facts, diagnostics, plan_evidence, boundary_state,
+                           volume_summaries, arc_summaries, input_budget, rolling_arc_outlines):
+    chapters = sorted(_records(chapters), key=lambda row: row["chapterNumber"])
+    plan = _dict(book_plan)
+    cast = _records(plan.get("coreCast") or plan.get("mainCharacters"))[:6]
+    compact_plan = {"title": _text_excerpt(plan.get("title") or "", 100),
+                    "logline": _text_excerpt(plan.get("logline") or "", 500),
+                    "coreCast": [{key: _text_excerpt(row[key], 100) for key in ("name", "role", "goal", "arc") if row.get(key)}
+                                 for row in cast]}
+    locks = (canon_locks_text(plan.get("canonLocks"), boundary_state=boundary_state)
+             if rolling_arc_outlines or is_v2_book_plan(plan) else "")
+    ladder = volume_ladder_text(plan)
+    blockers = diagnostics.get("hardBlockers", [])
+    protected_blockers = [
+        {key: _text_excerpt(value, 200) if isinstance(value, str) else value
+         for key in ("chapterNumber", "code", "rule", "message", "quote") if (value := item.get(key)) is not None}
+        for item in blockers[:12]
+    ]
+    local = {"coverage": diagnostics.get("coverage", {}), "stats": diagnostics.get("stats", {}),
+             "hardBlockerCount": len(blockers), "hardBlockersShown": len(protected_blockers),
+             "hardBlockers": protected_blockers, "scoreCap": diagnostics.get("scoreCap", 100)}
+    first = next((row for row in chapters if row["chapterNumber"] == 1), {})
+    opening = (first.get("content") or "")[:600]
+    endings = [{"chapterNumber": row["chapterNumber"], "ending": (row.get("content") or "")[-600:]} for row in chapters[-3:]]
+
+    before = (chapters[-1]["chapterNumber"] if chapters else 0) + 1
+    plans = _records(facts.get("arcPlans"))
+    index = entity_index(facts, before_chapter=before)
+    core = []
+    for name, tier, _, _ in ranked_entities("characters", index, book_plan=plan, arc_plans=plans, current_chapter=before):
+        if tier == "core":
+            entry = index["characters"][name]
+            state = entry["entry"] | entry["state"]
+            core.append({"name": name, **{key: _text_excerpt(state[key], 110)
+                                         for key in ("status", "currentGoal", "emotion", "stance", "stanceTier", "location")
+                                         if state.get(key)}})
+    retired = retired_roster(facts, index, book_plan=plan, arc_plans=plans, current_chapter=before)
+    retired = list(dict.fromkeys([*retired, *(item["character"] for item in diagnostics.get("advisories", [])
+                                             if item.get("code") == "retired_character")]))
+    themes = _list(facts.get("themeLedger"))
+    rhythm = {"maxSameLengthRun": local["stats"].get("maxSameLengthRun", 0),
+              "skeletonMaxSimilarRun": local["stats"].get("skeletonMaxSimilarRun", 0),
+              "themeLedger": {"entries": len(themes) or sum(bool(row.get("themes")) for row in _records(arc_summaries))}}
+    slots = [
+        {"key": "volumes", "share": 22, "entries": _audit_volume_material(volume_summaries, arc_summaries)},
+        {"key": "riskEvidence", "share": 25, "entries": _audit_risk_evidence(chapters, diagnostics)},
+        {"key": "planEvidence", "share": 10, "entries": list(plan_evidence), "allocate_first": True},
+        {"key": "foreshadowing", "share": 10, "entries": [
+            {"clue": _text_excerpt(row.get("clue") or "", 140),
+             "plantedChapter": row.get("plantedChapter") or row.get("sourceChapter")}
+            for row in open_foreshadowing(facts)
+        ]},
+        {"key": "finaleChapters", "share": 12, "entries": [
+            f"第{row['chapterNumber']}章 " + " ".join(str(row.get("summary") or row.get("title") or "").split())[:80]
+            for row in chapters[-15:]
+        ]},
+        {"key": "coreCast", "share": 10, "entries": [
+            {"retiredRoster": retired[:30]}, *core[:20],
+        ]},
+        {"key": "rhythm", "share": 6, "entries": [rhythm]},
+        {"key": "deferredDrifts", "share": 5, "entries": diagnostics.get("capItems", []) + [
+            {"code": "drift_deferred", "chapterNumber": row["chapter"], "message": _text_excerpt(row["issue"], 140)}
+            for row in diagnostics.get("unresolvedDrifts", [])
+            if row.get("status") == "deferred" and row["id"] not in {item.get("driftId") for item in blockers[:12]}
+        ]},
+    ]
+    _, _, output = _FULL_BOOK_AUDIT_PROMPT.template.partition("请严格输出以下 JSON：\n")
+    schema, note = output.split("\n注：", 1)
+    schema = _json({"auditProtocolVersion": 2, **json.loads(schema)})
+
+    def render(parts):
+        evidence = ("【总纲口径对应的正文证据】" + _json(parts["planEvidence"])
+                    + "\n按证据章号和边界生效章号核对口径，检查各卷压迫、代价、退役手段及跃迁条件。\n")
+        optional = [f"【{key}】{_json(value)}" for key, value in parts.items() if key != "planEvidence" and value]
+        prompt = "\n".join([
+            f"【全书总纲】{_json(compact_plan)}", locks, f"【全书分卷阶梯】{ladder}",
+            f"【篇幅统计】{_json(word_stats or {})}", f"【localDiagnostics】{_json(local)}",
+            f"【第1章开篇】{opening}", f"【末三章结尾】{_json(endings)}",
+            evidence, *optional, f"请严格输出以下 JSON：\n{schema}\n注：{note}",
+        ])
+        return {"system": _FULL_BOOK_AUDIT_SYSTEM, "prompt": prompt}
+
+    if input_budget in (None, 0):
+        return render({slot["key"]: slot["entries"] for slot in slots})
+    return fit_prompt(render=render, slots=slots, input_budget=input_budget, reserve=1024, on_overflow="expand",
+                      code="AUDIT_PROMPT_BUDGET_EXCEEDED", label="终审")
+
+
 def build_full_book_audit_prompt(*, book_plan=None, chapters_summary=None, chapter_evidence=None,
                                  word_stats=None, canonical_facts=None, rolling_arc_outlines=False,
-                                 plan_evidence=(), boundary_state=()):
+                                 plan_evidence=(), boundary_state=(), diagnostics=None, chapters=None,
+                                 volume_summaries=None, arc_summaries=None, input_budget=None):
     facts = canonical_facts or {}
+    if diagnostics is not None or input_budget is not None:
+        input_budget = read_audit_input_budget() if input_budget is None else input_budget
+        return _budgeted_audit_prompt(
+            book_plan, chapters, word_stats, facts, diagnostics or {}, plan_evidence, boundary_state,
+            volume_summaries if volume_summaries is not None else facts.get("volumeSummaries"),
+            arc_summaries if arc_summaries is not None else facts.get("arcSummaries"), input_budget, rolling_arc_outlines,
+        )
     timeline = _list(facts.get("timeline"))
     compact_facts = {
         "characters": _dict(facts.get("characters")), "injuries": _list(facts.get("injuries")),
@@ -2018,4 +2172,4 @@ def build_full_book_audit_prompt(*, book_plan=None, chapters_summary=None, chapt
         word_stats=_json(word_stats or {}, pretty=True), chapters_summary=_json(chapters_summary or [], pretty=True),
         chapter_evidence=_json(chapter_evidence or [], pretty=True), facts=_json(compact_facts, pretty=True),
     )
-    return {"system": _FULL_BOOK_AUDIT_SYSTEM, "prompt": prompt}
+    return {"system": _LEGACY_FULL_BOOK_AUDIT_SYSTEM, "prompt": prompt}

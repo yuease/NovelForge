@@ -5,11 +5,12 @@ import {
   AlertCircle, BookOpen, Check, CirclePause, CirclePlay, Clock, Coins, FileText,
   Hash, Layers, Plus, RefreshCw, Settings2, Sparkles, Terminal, Trash2,
 } from 'lucide-react'
+import { api } from '../lib/api'
 import { cn } from '../lib/cn'
 import { COLLAPSE_MOTION, EASE_OUT, TAB_MOTION } from '../lib/motion'
 import { navigate } from '../lib/router'
 import { estimateJobCostCny, formatCny } from '../lib/pricing'
-import { formatNumber, formatTokens, formatWords, friendlyError, messageOf } from '../lib/format'
+import { AUDIT_VERDICT_META, formatDateTime, formatNumber, formatTokens, formatWords, friendlyError, messageOf } from '../lib/format'
 import type { ChapterRecord, JobRecord, LLMConfig, LLMProvider, MemeLevel, SSELogItem, ThinkingMode } from '../lib/types'
 import { useStudio } from '../state/studio'
 import type { ExtendPayload } from '../state/studio'
@@ -142,7 +143,7 @@ function JobList({ jobs, activeId, onSelect, onRefresh }: { jobs: JobRecord[]; a
 /* ---------------- Focus ---------------- */
 
 function JobFocus({ job }: { job: JobRecord }) {
-  const { chapters, facts, sseLogs, sseConnected, pauseJob, resumeJob, updateJobConfig, extendJob, clearLogs } = useStudio()
+  const { chapters, facts, sseLogs, sseConnected, pauseJob, resumeJob, updateJobConfig, extendJob, clearLogs, loadJobDetails } = useStudio()
   const { frame, live } = useWorkflowMonitor(job.id)
   const toast = useToast()
   const [busy, setBusy] = useState(false)
@@ -281,13 +282,42 @@ function JobFocus({ job }: { job: JobRecord }) {
         )
       })()}
       {job.status === 'completed' && !errorMessage && (
-        <Alert tone="success" title="已保存全部章节" action={<Button size="sm" variant="secondary" onClick={() => navigate('reader')}>去阅读</Button>}>
-          可以在「成稿与导出」中阅读、修订并导出全书。
+        <Alert
+          tone={job.auditGate?.override || job.auditGate?.verdict === 'revise_recommended' ? 'warning' : 'success'}
+          title={
+            job.auditGate?.override
+              ? '已保存全部章节（作者确认带问题完本）'
+              : job.auditGate?.verdict === 'revise_recommended'
+                ? '已保存全部章节，终审建议局部精修'
+                : '已保存全部章节'
+          }
+          action={(
+            <div className="flex flex-wrap gap-2">
+              {(job.auditGate?.override || job.auditGate?.verdict === 'revise_recommended') && (
+                <Button size="sm" variant="secondary" onClick={() => navigate('evaluation')}>前往修订</Button>
+              )}
+              <Button size="sm" variant="secondary" onClick={() => navigate('reader')}>去阅读</Button>
+            </div>
+          )}
+        >
+          {job.auditGate?.override
+            ? '成稿已放行完本，随时可在「成稿与导出」中导出，或前往评估与修订逐章精修。'
+            : job.auditGate?.verdict === 'revise_recommended'
+              ? '全书主线完整且无硬性冲突，可直接在「成稿与导出」阅读，或前往评估与修订打磨节奏与细节。'
+              : '可以在「成稿与导出」中阅读、修订并导出全书。'}
         </Alert>
       )}
 
       <div className="grid min-w-0 grid-cols-1 gap-6 @[960px]/main:grid-cols-2">
-        <RunDetails job={job} chapters={chapters} />
+        <RunDetails
+          job={job}
+          chapters={chapters}
+          busy={busy}
+          onAcceptAudit={() => void handle(async () => {
+            await api.acceptAuditOverride(job.id)
+            await loadJobDetails(job.id)
+          }, '已确认带问题完本，可前往成稿与导出')}
+        />
         <Diagnostics job={job} logs={sseLogs} connected={sseConnected} onClear={clearLogs} />
       </div>
 
@@ -316,7 +346,18 @@ function Metric({ icon, label, value, suffix, title }: { icon: ReactNode; label:
   )
 }
 
-function RunDetails({ job, chapters: saved }: { job: JobRecord; chapters: ChapterRecord[] }) {
+function RunDetails({
+  job,
+  chapters: saved,
+  busy,
+  onAcceptAudit,
+}: {
+  job: JobRecord
+  chapters: ChapterRecord[]
+  busy: boolean
+  onAcceptAudit: () => void
+}) {
+  const [confirmAccept, setConfirmAccept] = useState(false)
   const audit = job.auditGate
   const stageStats = Object.entries(job.stageStats ?? {})
   const usage = job.tokenUsage
@@ -324,6 +365,21 @@ function RunDetails({ job, chapters: saved }: { job: JobRecord; chapters: Chapte
   const chapters = useMemo(() => [...saved].sort((a, b) => b.chapterNumber - a.chapterNumber).slice(0, 8), [saved])
   if (!audit && !stageStats.length && !usage && !chapters.length) return null
   const maxDuration = Math.max(1, ...stageStats.map(([, s]) => s.durationMs ?? 0))
+
+  const verdictMeta = audit?.verdict ? AUDIT_VERDICT_META[audit.verdict] : undefined
+  const hardBlockers = audit?.localDiagnostics?.hardBlockers?.length
+    ? audit.localDiagnostics.hardBlockers
+    : (job.auditReport?.blockingIssues ?? [])
+  const capItems = audit?.localDiagnostics?.capItems ?? []
+  const canOverrideAudit = Boolean(
+    audit
+    && audit.chaptersComplete
+    && audit.wordCountInRange
+    && audit.exportValid
+    && (audit.verdict === 'blocked' || audit.auditPassed === false)
+    && !audit.override
+    && job.status === 'failed',
+  )
 
   return (
     <Collapsible icon={<Layers />} title="任务详情" subtitle="最近章节、完本检查与模型调用">
@@ -347,7 +403,22 @@ function RunDetails({ job, chapters: saved }: { job: JobRecord; chapters: Chapte
         )}
         {audit && (
           <div>
-            <SectionLabel>完本检查</SectionLabel>
+            <SectionLabel
+              actions={(
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {verdictMeta && <Badge tone={verdictMeta.tone}>{verdictMeta.label}</Badge>}
+                  {typeof audit.score === 'number' && (
+                    <span className="text-caption tabular-nums text-muted">
+                      {typeof audit.rawScore === 'number' && audit.rawScore !== audit.score
+                        ? `${audit.score} 分（原评 ${audit.rawScore} → 封顶 ${audit.scoreCap ?? audit.score}）`
+                        : `${audit.score} 分`}
+                    </span>
+                  )}
+                </div>
+              )}
+            >
+              完本检查
+            </SectionLabel>
             <div className="grid grid-cols-2 gap-2">
               {([['章节完整', audit.chaptersComplete], ['篇幅达标', audit.wordCountInRange], ['全书终审', audit.auditPassed], ['导出验证', audit.exportValid]] as const).map(([label, ok]) => (
                 <div key={label} className={cn('flex items-center justify-between rounded-md px-3 py-2 text-body', ok ? 'bg-success-soft text-success' : 'bg-surface-2 text-body')}>
@@ -356,7 +427,63 @@ function RunDetails({ job, chapters: saved }: { job: JobRecord; chapters: Chapte
                 </div>
               ))}
             </div>
+            {audit.override && (
+              <p className="mt-2.5 rounded-sm bg-warning-soft/75 px-3 py-2 text-caption text-warning">
+                已于 {formatDateTime(audit.override.at)} 确认带问题完本（放行时待处理阻断 {audit.override.hardBlockerCount ?? 0} 项）。
+              </p>
+            )}
+            {hardBlockers.length > 0 && (
+              <div className="mt-3 rounded-md border border-danger/25 bg-danger-soft/50 p-3 text-caption">
+                <div className="mb-1.5 font-medium text-danger">
+                  硬性阻断问题（共 {audit.hardBlockerCount ?? hardBlockers.length} 项）
+                </div>
+                <ul className="grid gap-1.5">
+                  {hardBlockers.slice(0, 6).map((item, i) => (
+                    <li key={`${item.chapterNumber ?? 'x'}-${i}`} className="rounded-sm bg-surface/90 px-2.5 py-1.5">
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        {item.chapterNumber ? <Badge tone="danger" className="h-5 px-1.5 text-[11px] tabular-nums">第 {item.chapterNumber} 章</Badge> : null}
+                        <span className="text-ink">{item.message || item.code || '待核对硬伤'}</span>
+                      </div>
+                      {item.quote && <p className="mt-0.5 truncate text-[11px] text-muted" title={item.quote}>原文：「{item.quote}」</p>}
+                    </li>
+                  ))}
+                </ul>
+                {(audit.hardBlockerCount ?? hardBlockers.length) > 6 && (
+                  <p className="mt-1.5 text-[11px] text-muted">
+                    其余 {(audit.hardBlockerCount ?? hardBlockers.length) - 6} 项可在「评估与修订」中逐章查看。
+                  </p>
+                )}
+              </div>
+            )}
+            {capItems.length > 0 && (
+              <div className="mt-2.5 flex flex-wrap gap-1.5 text-[11px] text-muted">
+                {capItems.slice(0, 4).map((item, i) => (
+                  <span key={i} className="rounded-sm bg-surface-2 px-2 py-0.5">
+                    {item.chapterNumber ? `第${item.chapterNumber}章 · ` : ''}{item.message || item.code}
+                  </span>
+                ))}
+              </div>
+            )}
             {audit.reasons?.length ? <p className="mt-2 text-caption text-muted">{audit.reasons.join('；')}</p> : null}
+            {(canOverrideAudit || audit.verdict === 'blocked' || audit.verdict === 'revise_recommended') && (
+              <div className="mt-3 flex flex-wrap items-center gap-2">
+                <Button size="sm" variant="secondary" onClick={() => navigate('evaluation')}>
+                  前往评估与修订
+                </Button>
+                {canOverrideAudit && !confirmAccept && (
+                  <Button size="sm" variant="tonal" disabled={busy} onClick={() => setConfirmAccept(true)}>
+                    确认带问题完本
+                  </Button>
+                )}
+                {canOverrideAudit && confirmAccept && (
+                  <div className="flex flex-wrap items-center gap-2 rounded-sm bg-warning-soft/80 px-2.5 py-1.5 text-caption">
+                    <span className="text-warning">将跳过终审阻断直接标记完本，是否确认？</span>
+                    <Button size="sm" variant="primary" loading={busy} onClick={() => { setConfirmAccept(false); onAcceptAudit() }}>确认完本</Button>
+                    <Button size="sm" variant="secondary" disabled={busy} onClick={() => setConfirmAccept(false)}>取消</Button>
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         )}
         {(usage || stageStats.length > 0) && (

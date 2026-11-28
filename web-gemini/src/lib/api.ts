@@ -330,6 +330,13 @@ export const api = {
     })
   },
 
+  async acceptAuditOverride(jobId: string, note = ''): Promise<{ job: JobRecord }> {
+    return request(`/jobs/${encodeURIComponent(jobId)}/audit/accept`, {
+      method: 'POST',
+      body: JSON.stringify({ note }),
+    })
+  },
+
   getExportUrl(jobId: string, format: 'txt' | 'md' | 'docx'): string {
     return `${API_BASE}/jobs/${encodeURIComponent(jobId)}/export?format=${format}`
   },

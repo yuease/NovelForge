@@ -211,13 +211,80 @@ export interface StageStat {
   cacheHitTokens?: number
 }
 
+export type AuditVerdict = 'ready' | 'revise_recommended' | 'blocked'
+
+export interface AuditFinding {
+  code?: string
+  type?: string
+  rule?: string
+  source?: string
+  chapterNumber?: number
+  message?: string
+  quote?: string
+  fixHint?: string
+  penalty?: number
+  repairable?: boolean
+}
+
+export interface AuditLocalDiagnostics {
+  version?: number
+  coverage?: {
+    chaptersScanned?: number
+    totalChapters?: number
+    arcsWithSkeleton?: number
+    totalArcs?: number
+    trackedAccounts?: number
+    staleDriftsSkipped?: number
+  }
+  stats?: Record<string, number>
+  hardBlockerCount?: number
+  hardBlockers?: AuditFinding[]
+  capItems?: AuditFinding[]
+  advisories?: AuditFinding[]
+}
+
+export interface AuditGateOverride {
+  at?: string
+  note?: string
+  hardBlockerCount?: number
+}
+
+export interface AuditReport {
+  passed?: boolean
+  score?: number
+  rawScore?: number
+  auditScoreCap?: number
+  verdict?: AuditVerdict | string
+  summary?: string
+  blockingIssues?: AuditFinding[]
+  issueChapters?: number[]
+  recommendations?: string[]
+  auditInputHash?: string
+  localDiagnostics?: AuditLocalDiagnostics | null
+  unresolvedDrifts?: DriftLedgerEntry[]
+  [key: string]: unknown
+}
+
 export interface AuditGate {
   chaptersComplete?: boolean
   wordCountInRange?: boolean
   auditPassed?: boolean
   exportValid?: boolean
   allPassed?: boolean
+  passed?: boolean
   reasons?: string[]
+  verdict?: AuditVerdict | string
+  score?: number
+  rawScore?: number
+  scoreCap?: number
+  hardBlockerCount?: number
+  localDiagnostics?: AuditLocalDiagnostics | null
+  unresolvedDrifts?: DriftLedgerEntry[]
+  revisionEntry?: {
+    route?: string
+    chapters?: number[]
+  } | null
+  override?: AuditGateOverride | null
 }
 
 export interface TopicPackage {
@@ -356,7 +423,8 @@ export interface JobRecord {
   checkpoint?: Record<string, unknown> | null
   canonicalFacts?: CanonicalFacts | null
   repairLogs?: RepairLogEntry[]
-  auditReport?: unknown
+  auditReport?: AuditReport | null
+  auditRepairs?: Record<string, number> | null
   evaluationStatus?: 'running' | 'completed' | 'error' | null
   evaluationProgress?: string
   evaluationCheckpoint?: {
