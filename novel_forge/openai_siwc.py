@@ -18,6 +18,7 @@ from uuid import uuid4
 import httpx
 import jwt
 
+from .rate_limits import parse_reset_hint, quota_retry_at
 from .siwc_vault import SiwcVault
 
 
@@ -51,9 +52,13 @@ _QUOTA = "subscription_sharing_usage_limit_exceeded"
 
 
 class SiwcError(RuntimeError):
-    def __init__(self, code, status, message=None, *, retryable=False):
+    def __init__(self, code, status, message=None, *, retryable=False, retry_after_ms=None, retry_at=None,
+                 quota_scope=None, quota_kind=None, reset_source=None, no_replay=False):
         super().__init__(message or ERROR_MESSAGES[code])
-        self.status, self.code, self.retryable = status, code, retryable
+        self.status, self.code, self.retryable = status, code, retryable and not no_replay
+        self.retry_after_ms, self.retry_at = retry_after_ms, retry_at
+        self.quota_scope, self.quota_kind, self.reset_source = quota_scope, quota_kind, reset_source
+        self.no_replay = no_replay
 
 
 def enabled():
@@ -101,15 +106,18 @@ def _decode(response):
     return result if isinstance(result, dict) else {}
 
 
-def responses_error(status, payload):
+def responses_error(status, payload, *, headers=None, text="", now_utc=None):
     error = payload.get("error") if isinstance(payload.get("error"), dict) else payload
     code = error.get("code")
     if not isinstance(code, str):
         code = ""
-    if code == _QUOTA:
-        return SiwcError("SIWC_USAGE_LIMIT", 429)
+    hint = parse_reset_hint(headers=headers, text=text, payload=payload, now=now_utc)
+    metadata = dict(retry_after_ms=hint.retry_after_ms, quota_kind=hint.kind, reset_source=hint.source)
+    if code == _QUOTA or hint.scope == "long":
+        return SiwcError("SIWC_USAGE_LIMIT", 429, retry_at=quota_retry_at(hint, now_utc),
+                         quota_scope="long", **metadata)
     if status == 429 or code in ("rate_limit_exceeded", "rate_limit_error"):
-        return SiwcError("SIWC_RATE_LIMIT", 429)
+        return SiwcError("SIWC_RATE_LIMIT", 429, retryable=True, quota_scope=hint.scope, **metadata)
     if code in ("chatpass_v2_scope_not_authorized", "chatpass_v2_invalid_authorization_context"):
         return SiwcError("SIWC_PERMISSION_REQUIRED", 403)
     if status == 401 or code in ("invalid_token", "subscription_sharing_invalid_user"):
@@ -499,7 +507,8 @@ class OpenAISiwc:
                     raise SiwcError("SIWC_LOGIN_REQUIRED", 401)
                 if error == "invalid_client":
                     raise SiwcError("SIWC_INVALID_CLIENT", 400, "ChatGPT 注册已失效，请切换账号并重新注册。")
-                raise responses_error(response.status_code, data)
+                text = response.text.replace(profile["refresh_token"], "[已隐藏密钥]")
+                raise responses_error(response.status_code, data, headers=response.headers, text=text)
             updated = {**profile, **self._tokens(data, profile)}
             self._save({**self._state(), "profile": updated})
             self.rotate += 1
@@ -530,14 +539,18 @@ class OpenAISiwc:
                         if not response.is_success:
                             chunks = bytearray()
                             async for chunk in response.aiter_bytes():
-                                if len(chunks) + len(chunk) > 65_536:
+                                chunks.extend(chunk[:65_536 - len(chunks)])
+                                if len(chunks) >= 65_536:
                                     break
-                                chunks.extend(chunk)
+                            text = chunks.decode("utf-8", errors="replace").replace(bearer, "[已隐藏密钥]")
                             try:
                                 payload = json.loads(chunks)
                             except (ValueError, UnicodeError, RecursionError):
                                 payload = {}
-                            error = responses_error(response.status_code, payload if isinstance(payload, dict) else {})
+                            error = responses_error(
+                                response.status_code, payload if isinstance(payload, dict) else {},
+                                headers=response.headers, text=text,
+                            )
                             if error.code == "SIWC_LOGIN_REQUIRED" and response.status_code == 401 and not attempt:
                                 failed_version = version
                                 continue
@@ -550,10 +563,10 @@ class OpenAISiwc:
                         self._streams.discard(response)
                         await response.aclose()
             except httpx.TimeoutException:
-                raise SiwcError("TIMEOUT", 408, "ChatGPT 请求超时。", retryable=not accepted) from None
+                raise SiwcError("TIMEOUT", 408, "ChatGPT 请求超时。", retryable=True, no_replay=accepted) from None
             except (httpx.RequestError, httpx.StreamError):
                 self.require_epoch(epoch)
-                raise SiwcError("NETWORK_ERROR", 502, "ChatGPT 连接中断。", retryable=not accepted) from None
+                raise SiwcError("NETWORK_ERROR", 502, "ChatGPT 连接中断。", retryable=True, no_replay=accepted) from None
 
     def require_epoch(self, epoch):
         self._require_enabled()

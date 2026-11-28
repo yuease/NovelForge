@@ -276,7 +276,7 @@ export const api = {
     })
   },
 
-  async resumeJob(id: string, llmConfig?: Partial<LLMConfig>): Promise<{ job: JobRecord }> {
+  async resumeJob(id: string, llmConfig?: Partial<LLMConfig>): Promise<{ job: JobRecord; quotaPending?: { retryAt?: string } }> {
     return request(`/jobs/${encodeURIComponent(id)}/resume`, {
       method: 'POST',
       ...(llmConfig ? { body: JSON.stringify({ llmConfig }) } : {}),

@@ -23,6 +23,7 @@ from .book_plan import PLAN_VERSION_V2, PLAN_V2_MARKER
 from .openai_responses import call_responses
 from .openai_siwc import PROVIDER as SIWC, RESOURCE as SIWC_RESOURCE, SiwcError, all_stages as siwc_all_stages
 from .providers import get_provider_definition, is_masked_api_key, provider_requires_key, same_endpoint_origin
+from .rate_limits import is_long_quota, parse_reset_hint, quota_retry_at, seconds_until
 from .thinking_policy import resolve_vertex_thinking_config, strip_vertex_model_suffix
 
 
@@ -44,7 +45,8 @@ log = logging.getLogger(__name__)
 class LLMError(RuntimeError):
     def __init__(self, message, *, code="LLM_ERROR", status=500, retryable=False,
                  finish_reason=None, retry_after_ms=None, retry_at=None,
-                 circuit_retry_at=None, request_max_tokens=None, rejected_output_tokens=None):
+                 circuit_retry_at=None, request_max_tokens=None, rejected_output_tokens=None,
+                 quota_scope=None, quota_kind=None, reset_source=None, provider_code=None, no_replay=False):
         super().__init__(message)
         self.code = code
         self.status = status
@@ -55,6 +57,18 @@ class LLMError(RuntimeError):
         self.circuit_retry_at = circuit_retry_at
         self.request_max_tokens = request_max_tokens
         self.rejected_output_tokens = rejected_output_tokens
+        self.quota_scope = quota_scope
+        self.quota_kind = quota_kind
+        self.reset_source = reset_source
+        self.provider_code = provider_code
+        self.no_replay = no_replay
+
+
+def _siwc_llm_error(error):
+    return LLMError(str(error), code=error.code, status=error.status, retryable=error.retryable,
+                    retry_after_ms=error.retry_after_ms, retry_at=error.retry_at,
+                    quota_scope=error.quota_scope, quota_kind=error.quota_kind, reset_source=error.reset_source,
+                    no_replay=error.no_replay)
 
 
 def estimate_tokens(text=""):
@@ -152,7 +166,7 @@ def _is_local(base_url):
 
 
 def _circuit_key(creds):
-    if creds.provider == "mock" or os.environ.get("NOVEL_FORGE_PROVIDER_CIRCUIT") == "0":
+    if creds.provider == "mock":
         return None
     if not creds.base_url:
         return creds.provider, ""
@@ -178,7 +192,43 @@ class _Circuit:
 
 _circuits = {}
 _state_lock = threading.Lock()
+_quota_blocks: dict[tuple[tuple[str, str], str], dict] = {}
 _UNSUPPORTED_THINKING_KEYS: set[tuple[str, str, str]] = set()
+
+
+def reset_quota_blocks():
+    with _state_lock:
+        _quota_blocks.clear()
+
+
+def _check_quota_block(key):
+    if key is None:
+        return
+    with _state_lock:
+        block = _quota_blocks.get(key)
+        if block is None:
+            return
+        remaining = seconds_until(block["retry_at"])
+        if remaining is None or remaining <= 0:
+            _quota_blocks.pop(key)
+            return
+    error = LLMError("当前模型的用量额度暂未恢复，请等待恢复或切换模型后继续。",
+                     code="QUOTA_EXCEEDED", status=429, retry_after_ms=math.ceil(remaining * 1000),
+                     quota_scope="long", **block)
+    error.provider, error.model = key[0][0], key[1]
+    raise error
+
+
+def _remember_quota_block(key, error):
+    if key is None or (seconds_until(error.retry_at) or 0) <= 0:
+        return
+    with _state_lock:
+        existing = _quota_blocks.get(key)
+        if existing is None or error.retry_at > existing["retry_at"]:
+            _quota_blocks[key] = {
+                "retry_at": error.retry_at, "quota_kind": error.quota_kind, "reset_source": error.reset_source,
+                "provider_code": error.provider_code,
+            }
 
 
 def reset_thinking_fallback_cache():
@@ -273,7 +323,7 @@ def _settle_circuit(claim, error=None, *, cancelled=False):
         if _circuits.get(key) is not state or state.epoch != epoch:
             return
         state.probing = False
-        if cancelled:
+        if cancelled or (error is not None and is_long_quota(error)):
             _wake_probe_waiters(state)
             return
         if error is None or error.code in {"EMPTY_RESPONSE", "INVALID_RESPONSE", "UNEXPECTED_TOOL_CALL", "TOOLS_UNSUPPORTED", "CONTENT_BLOCKED"}:
@@ -339,7 +389,7 @@ async def _rate_slot(creds, transport, allow_parallel):
             held = False
         yield
     except LLMError as error:
-        if error.code == "HTTP_429":
+        if error.code == "HTTP_429" and not is_long_quota(error):
             penalty = max(15, (error.retry_after_ms or 0) / 1000)
             gate.cooldown_until = max(gate.cooldown_until, _clock() + penalty)
         raise
@@ -375,35 +425,20 @@ def _http_error(label, response, api_key, retry_rate_limit):
         return LLMError(f"{label} API error {status}: {snippet}", code=f"HTTP_{status}",
                         status=status, retryable=status >= 500)
 
-    quota_text = raw_text[:1000]
-    wait_match = re.search(r"try again in (\d+(?:\.\d+)?)\s*s\b", quota_text, re.I)
-    wait_seconds = float(wait_match.group(1)) if wait_match else None
-    short_retry_hint = bool(
-        re.search(r"per\s*minute|\brpm\b|\btpm\b", quota_text, re.I)
-        or (wait_seconds is not None and wait_seconds <= 300)
-    )
-    long_reset = bool(
-        re.search(r"resets in \d+\s*(?:hour|day)", quota_text, re.I)
-        or (wait_seconds is not None and wait_seconds > 300)
-    )
-    hard_quota = bool(
-        re.search(
-            r"insufficient_quota|exceeded your current quota|reached your usage limit|"
-            r"resets in \d+\s*(?:hour|day)|余额不足|quota.*exhausted|daily.*limit|到达?限额|额度.*用完",
-            quota_text, re.I,
-        )
-    ) and (long_reset or not short_retry_hint)
     try:
-        seconds = float(response.headers.get("retry-after", "nan"))
-        retry_after = min(60_000, seconds * 1000) if math.isfinite(seconds) and seconds >= 0 else None
-    except ValueError:
-        retry_after = None
-    if hard_quota:
+        payload = json.loads(raw_text)
+    except (ValueError, RecursionError):
+        payload = None
+    hint = parse_reset_hint(headers=response.headers, text=raw_text[:8000], payload=payload)
+    details = _object(_object(payload).get("error")) or _object(payload)
+    metadata = dict(retry_after_ms=hint.retry_after_ms, quota_scope=hint.scope, quota_kind=hint.kind,
+                    reset_source=hint.source, provider_code=_text(details.get("code")) or None)
+    if hint.scope == "long":
         return LLMError(f"{label} 额度已耗尽 (429): {snippet}（可在监控页切换模型或提供商后继续续跑）",
-                        code="QUOTA_EXCEEDED", status=429, retry_after_ms=retry_after)
+                        code="QUOTA_EXCEEDED", status=429, retry_at=quota_retry_at(hint), **metadata)
     return LLMError(f"{label} 触发限流 (429): {snippet}",
                     code="HTTP_429" if retry_rate_limit else "OPENAI_RATE_LIMIT",
-                    status=429, retryable=retry_rate_limit, retry_after_ms=retry_after)
+                    status=429, retryable=retry_rate_limit, **metadata)
 
 
 def _rejects_output_limit(error):
@@ -735,7 +770,7 @@ async def _call_transport(client, transport, creds, system, prompt, temperature,
         except SiwcError as error:
             if tools and error.code == "SIWC_CAPABILITY_UNSUPPORTED" and "（tools）" in str(error):
                 raise LLMError("ChatGPT 当前模型不支持原生工具调用。", code="TOOLS_UNSUPPORTED", status=400) from None
-            raise LLMError(str(error), code=error.code, status=error.status, retryable=error.retryable) from None
+            raise _siwc_llm_error(error) from None
         text = response["text"]
         finish = response["finishReason"]
         tool_calls = response.get("toolCalls") or []
@@ -979,7 +1014,7 @@ async def _call_transport(client, transport, creds, system, prompt, temperature,
 
 
 async def _provider_attempt(client, transport, creds, key, system, prompt, temperature, budget, timeout_ms, parallel, *,
-                            messages=None, tools=None, reasoning_effort=None, cache_key=None):
+                            messages=None, tools=None, reasoning_effort=None, cache_key=None, quota_key=None):
     while True:
         _, waiter = _enter_circuit(key)
         if waiter is not None:
@@ -988,6 +1023,7 @@ async def _provider_attempt(client, transport, creds, key, system, prompt, tempe
         claim = None
         try:
             async with asyncio.timeout(timeout_ms / 1000), _rate_slot(creds, transport, parallel):
+                _check_quota_block(quota_key)
                 # Recheck after pacing: a parallel call may have claimed the probe in the meantime.
                 claim, waiter = _enter_circuit(key, claim=True)
                 if waiter is None:
@@ -1018,7 +1054,8 @@ def _timeout_error(timeout_ms):
 
 def _backoff(creds, error, attempt):
     if error.retry_after_ms is not None:
-        return min(60, error.retry_after_ms / 1000)
+        delay = error.retry_after_ms / 1000
+        return delay + min(5.0, max(0.5, delay * 0.1))
     if _is_local(creds.base_url):
         return min(0.5, 0.1 * attempt)
     if error.code == "HTTP_429":
@@ -1037,7 +1074,7 @@ async def call_llm(*, provider="mock", base_url="", api_key="", model="", thinki
                    use_saved_connection=False, allow_parallel=False, retry_empty_response=True,
                    apply_output_floor=True, store=None, client: httpx.AsyncClient | None = None,
                    siwc_context=None, siwc_profile=None, messages=None, tools=None,
-                   reasoning_effort=None, cache_key=None):
+                   reasoning_effort=None, cache_key=None, _bypass_quota_blocks=False):
     """Call a model, returning the same camelCase response fields as the Node gateway."""
     started = _clock()
     effective_timeout = max(1000, int(timeout_ms or DEFAULT_TIMEOUT_MS))
@@ -1050,7 +1087,7 @@ async def call_llm(*, provider="mock", base_url="", api_key="", model="", thinki
         try:
             service.check_selection(model, siwc_profile)
         except SiwcError as error:
-            raise LLMError(str(error), code=error.code, status=error.status) from None
+            raise _siwc_llm_error(error) from None
         creds = _Credentials(SIWC, SIWC_RESOURCE, "", model, "disabled", service, service.epoch)
     else:
         creds = await _resolve_credentials(provider, base_url, api_key, model, thinking_mode, use_saved_connection, store)
@@ -1078,18 +1115,25 @@ async def call_llm(*, provider="mock", base_url="", api_key="", model="", thinki
     tried = set()
     fallbacks = 0
     attempt = 1
-    key = _circuit_key(creds)
+    endpoint_key = _circuit_key(creds)
+    key = endpoint_key if os.environ.get("NOVEL_FORGE_PROVIDER_CIRCUIT") != "0" else None
+    quota_key = None
+    if endpoint_key is not None and not _bypass_quota_blocks and os.environ.get("NOVEL_FORGE_QUOTA_FAST_FAIL") != "0":
+        quota_key = endpoint_key, creds.model
 
+    _check_quota_block(quota_key)
     _check_circuit(key)
     async with _http_client(client, creds, transport) as active_client:
         while attempt <= attempts:
-            _check_circuit(key)
-            tried.add(budget)
             try:
+                _check_quota_block(quota_key)
+                _check_circuit(key)
+                tried.add(budget)
                 result = await _provider_attempt(
                     active_client, transport, creds, key, system, prompt,
                     temperature, budget, effective_timeout, allow_parallel,
                     messages=messages, tools=tools, reasoning_effort=reasoning_effort, cache_key=cache_key,
+                    quota_key=quota_key,
                 )
                 finish = result.get("finishReason")
                 if guard and output_was_truncated(finish):
@@ -1099,6 +1143,13 @@ async def call_llm(*, provider="mock", base_url="", api_key="", model="", thinki
                                    retryable=True, finish_reason=finish)
                 return {**result, "durationMs": _elapsed(started)}
             except LLMError as error:
+                error.provider, error.model = creds.provider, creds.model
+                if is_long_quota(error):
+                    _remember_quota_block(quota_key, error)
+                    raise
+                if error.no_replay or (error.code in {"HTTP_429", "SIWC_RATE_LIMIT"}
+                                       and (error.retry_after_ms or 0) > 60_000):
+                    raise
                 if error.code == "CIRCUIT_OPEN" or (error.status == 429 and creds.provider == "openai"):
                     raise
                 if creds.provider == SIWC:
@@ -1155,6 +1206,7 @@ async def test_connection(*, provider="deepseek", base_url="", api_key="", model
                                model=creds.model, thinking_mode=creds.thinking_mode, timeout_ms=timeout_ms,
                                system="你是连通性探测助手，请简短回复。", prompt="回复OK", temperature=0,
                                max_tokens=protected_output_budget(4096, 16_384), retries=0, store=store, client=client,
+                               _bypass_quota_blocks=True,
                                **({"siwc_context": "provider-test"} if siwc else {}))
     except LLMError as error:
         return {**result, "ok": False, "latencyMs": _elapsed(started), "replyPreview": "",

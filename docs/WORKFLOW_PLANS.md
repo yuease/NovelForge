@@ -185,7 +185,7 @@
 
 ## 阶段七：运行时与长周期配额限流调度（`llm.py` / `pipeline.py` · WF-16）
 
-- **状态**：三方方案已收束定稿，待阶段六完成后由 `gpt-6.2-sol` 落实
+- **状态**：✅ 已落地并验收通过（`gpt-6.2-sol` 完成后端，全套单测与回归通过；前端 `format.ts` / `MonitorPage.tsx` / `studio.tsx` 已修复裸 `/quota/` 误匹配并补齐恢复时间与换模入口，通过 `tsc + vite build`）
 
 ### 三版方案对比
 

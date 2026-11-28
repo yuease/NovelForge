@@ -25,6 +25,7 @@ from .openai_siwc import OpenAISiwc, SiwcError
 from .pipeline import PipelineError, PipelineRuntime, _write
 from .prompt_budget import read_review_input_budget
 from .providers import ProviderCatalogError, list_model_catalog, sync_provider_models, update_model_settings
+from .rate_limits import seconds_until
 from .storage import StorageError, Store, claim_data_dir, public_job
 from .siwc_routes import siwc_router
 from .txt_import import parse_txt_manuscript
@@ -171,7 +172,10 @@ def create_app(data_dir: Path | None = None, *, client=None):
         return task
 
     async def service_error(_request: Request, exc):
-        return JSONResponse({"error": str(exc), "code": exc.code}, status_code=exc.status)
+        body = {"error": str(exc), "code": exc.code}
+        if isinstance(exc, (LLMError, SiwcError)) and exc.retry_at:
+            body["retryAt"] = exc.retry_at
+        return JSONResponse(body, status_code=exc.status)
 
     for error_type in (WorkerError, PipelineError, LLMError, StorageError, EvaluationError, ProviderCatalogError, SiwcError):
         app.add_exception_handler(error_type, service_error)
@@ -308,7 +312,8 @@ def create_app(data_dir: Path | None = None, *, client=None):
         return {"job": public_job(job), **{key: value for key, value in parsed.items() if key != "chapters"}}
 
     async def apply_job_action(request: Request, job_id: str, action: str):
-        if not await asyncio.to_thread(app.state.store.get_job, job_id):
+        saved = await asyncio.to_thread(app.state.store.get_job, job_id)
+        if not saved:
             return error_response("Job not found", 404)
         payload = await job_payload(request)
         config = payload.get("llmConfig")
@@ -322,6 +327,10 @@ def create_app(data_dir: Path | None = None, *, client=None):
                 app.state.worker.update_progress_status(job_id, "paused")
         elif action == "resume":
             job = await pipeline.resume_job(job_id, llm_config=config)
+            retry_at = (saved.get("error") or {}).get("retryAt")
+            before, after = saved.get("llmConfig") or {}, job.get("llmConfig") or {}
+            if (seconds_until(retry_at) or 0) > 0 and all(before.get(key) == after.get(key) for key in ("provider", "model")):
+                return {"job": job, "quotaPending": {"retryAt": retry_at}}
         elif action == "extend":
             job = await pipeline.extend_job(
                 job_id, **options(payload, "addChapters addWords targetTotalWords direction finalizeBook memeLevel memeSourceMode"),

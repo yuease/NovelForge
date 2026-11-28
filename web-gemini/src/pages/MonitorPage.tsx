@@ -150,7 +150,7 @@ function JobFocus({ job }: { job: JobRecord }) {
   const [actionError, setActionError] = useState('')
   const [panel, setPanel] = useState<'model' | 'extend' | null>(null)
 
-  const handle = async (action: () => Promise<void>, ok?: string) => {
+  const handle = async (action: () => Promise<unknown>, ok?: string) => {
     setBusy(true)
     setActionError('')
     try {
@@ -208,7 +208,19 @@ function JobFocus({ job }: { job: JobRecord }) {
               <Button variant="tonal" icon={<CirclePause className="size-4" />} loading={busy} onClick={() => void handle(() => pauseJob(job.id), '已暂停，检查点已保存')}>暂停</Button>
             )}
             {canResume(job) && (
-              <Button variant="primary" icon={<CirclePlay className="size-4" />} loading={busy} onClick={() => void handle(() => resumeJob(job.id), '已继续创作')}>
+              <Button
+                variant="primary"
+                icon={<CirclePlay className="size-4" />}
+                loading={busy}
+                onClick={() => void handle(async () => {
+                  const res = await resumeJob(job.id)
+                  if (res?.quotaPending?.retryAt) {
+                    toast(`已尝试继续，但原模型预计 ${formatDateTime(res.quotaPending.retryAt)} 恢复额度，如再受限可点「切换模型」`, 'info')
+                    return
+                  }
+                  toast('已继续创作', 'success')
+                })}
+              >
                 {job.status === 'pending' ? '开始创作' : '继续创作'}
               </Button>
             )}
@@ -237,6 +249,7 @@ function JobFocus({ job }: { job: JobRecord }) {
               <Alert tone="warning" className="mt-5" title="正在冷却，等待自动重试">
                 {retry.message || retry.code}
                 {retry.attempt ? ` · 第 ${retry.attempt}${retry.maxAttempts ? `/${retry.maxAttempts}` : ''} 次` : ''}
+                {retry.retryAfterSource === 'server' ? ' · 按服务端建议冷却' : ''}
                 {retry.resumeAt ? ` · 预计 ${new Date(retry.resumeAt).toLocaleTimeString('zh-CN', { hour12: false })} 恢复` : ''}
               </Alert>
             </motion.div>
@@ -262,8 +275,14 @@ function JobFocus({ job }: { job: JobRecord }) {
 
       {(job.status === 'failed' || job.status === 'error' || job.status === 'interrupted') && errorMessage && (() => {
         const info = friendlyError(rawError)
+        const errorCode = typeof rawError === 'object' && rawError ? rawError.code : undefined
+        const isQuotaStop = errorCode === 'QUOTA_EXCEEDED' || errorCode === 'SIWC_USAGE_LIMIT' || errorCode === 'QUOTA_SUSPECTED'
         return (
-          <Alert tone="danger" title={info.title}>
+          <Alert
+            tone={isQuotaStop ? 'warning' : 'danger'}
+            title={info.title}
+            action={isQuotaStop ? <Button size="sm" variant="secondary" onClick={() => setPanel('model')}>切换模型继续</Button> : undefined}
+          >
             <p>{info.summary}</p>
             {issues.length > 0 && (
               <ul className="mt-2 grid gap-1">
@@ -326,7 +345,14 @@ function JobFocus({ job }: { job: JobRecord }) {
           job={job}
           busy={busy}
           onSave={(c) => void handle(() => updateJobConfig(job.id, c), '模型设置已保存')}
-          onResume={(c) => void handle(() => resumeJob(job.id, c), '已保存并继续创作')}
+          onResume={(c) => void handle(async () => {
+            const res = await resumeJob(job.id, c)
+            if (res?.quotaPending?.retryAt) {
+              toast(`已尝试继续，但原模型预计 ${formatDateTime(res.quotaPending.retryAt)} 恢复额度，如再受限可切换其他模型`, 'info')
+              return
+            }
+            toast('已保存并继续创作', 'success')
+          })}
         />
       </Drawer>
       <Drawer open={panel === 'extend' && job.status === 'completed'} onClose={() => setPanel(null)} title="续写新篇" description={`从第 ${job.totalChapters + 1} 章开始，保留已完成的章节。`} width={520}>

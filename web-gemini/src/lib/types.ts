@@ -318,6 +318,13 @@ export interface JobErrorObject {
     sourceChapter?: number
   }>
   retryable?: boolean
+  retryAt?: string | null
+  quotaScope?: 'long' | 'short' | 'unknown' | string | null
+  quotaKind?: 'billing' | 'usage' | 'rate' | 'unknown' | string | null
+  resetSource?: string | null
+  resumePolicy?: 'manual' | string | null
+  provider?: string | null
+  model?: string | null
 }
 
 export interface JobLogEntry {
@@ -336,6 +343,7 @@ export interface AutoRetryState {
   maxAttempts?: number
   cooldownMs?: number
   resumeAt?: string
+  retryAfterSource?: 'server' | 'schedule' | string | null
 }
 
 export interface TokenUsageSummary {

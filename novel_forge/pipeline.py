@@ -54,6 +54,7 @@ from .prompts import (
     read_writing_options as read_prompt_writing_options,
 )
 from .providers import get_provider_definition, is_masked_api_key, same_endpoint_origin, thinking_capability
+from .rate_limits import humanize_wait, is_long_quota, positive_env_int, seconds_until
 from .storage import (
     _archive_touches, _canonical_facts, _is_committed, arc_context_version, completion_chapters_valid,
     count_chinese_words, public_job, replace_drift_fact_deltas, volume_source_hash,
@@ -69,11 +70,13 @@ _WORD_TARGET_DEFAULT = 2000
 _UNTITLED = "未命名小说项目"
 _USAGE_KEYS = ("promptTokens", "completionTokens", "totalTokens", "cacheHitTokens")
 _MAX_AUTO_RESUMES = 15
+_SHORT_RATE_CODES = {"HTTP_429", "SIWC_RATE_LIMIT"}
 _TRANSIENT_ERRORS = {
-    "HTTP_429", "TIMEOUT", "HTTP_503", "HTTP_502", "HTTP_504", "NETWORK_ERROR", "EMPTY_RESPONSE",
+    *_SHORT_RATE_CODES, "TIMEOUT", "HTTP_503", "HTTP_502", "HTTP_504", "NETWORK_ERROR", "EMPTY_RESPONSE",
     "ECONNRESET", "ETIMEDOUT", "UND_ERR_CONNECT_TIMEOUT",
 }
-_MANUAL_RESUME = {"QUOTA_EXCEEDED", "CIRCUIT_OPEN", "OUTPUT_TRUNCATED", "OPENAI_RATE_LIMIT", "OUTLINE_PARSE_FAILED",
+_MANUAL_RESUME = {"QUOTA_EXCEEDED", "SIWC_USAGE_LIMIT", "QUOTA_SUSPECTED", "CIRCUIT_OPEN",
+                  "OUTPUT_TRUNCATED", "OPENAI_RATE_LIMIT", "OUTLINE_PARSE_FAILED",
                   "ARC_SUMMARY_INVALID", "ARC_SOURCE_CHANGED", "CONTENT_BLOCKED", "BOOK_PLAN_INVALID", ARC_PROMPT_BUDGET_EXCEEDED}
 _COMEDY = re.compile(r"吐槽|搞笑|反差|打脸|震惊|直播|吃瓜|反转|嘴替|荒诞|尴尬|发疯")
 _PLACEHOLDERS = re.compile(r"【待补充|\[TODO\]|TBD|placeholder", re.I)
@@ -97,6 +100,26 @@ class PipelineError(RuntimeError):
 def _now(after_ms=0):
     stamp = datetime.now(timezone.utc) + timedelta(milliseconds=after_ms)
     return stamp.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _is_manual_resume_code(code, error_obj=None):
+    if isinstance(error_obj, dict):
+        return code in _MANUAL_RESUME or error_obj.get("resumePolicy") == "manual"
+    return code in _MANUAL_RESUME or is_long_quota(error_obj) or getattr(error_obj, "no_replay", False)
+
+
+def quota_message(error, current, *, suspected=False):
+    if suspected:
+        return "当前断点连续触发限流，可能已达到用量上限。请等待额度恢复，或切换模型后手动继续。"
+    wait = humanize_wait(seconds_until(getattr(error, "retry_at", None)))
+    config = _dict(current.get("llmConfig"))
+    model = getattr(error, "model", None) or config.get("model")
+    subject = f"模型 {model}" if model else "当前模型"
+    if wait:
+        return f"{subject}的用量额度已受限，预计 {wait.removeprefix('约 ')}后恢复。请等待恢复或切换模型后手动继续。"
+    if getattr(error, "quota_kind", None) == "billing":
+        return f"{subject}的计费额度已用尽。请检查余额或切换模型后手动继续。"
+    return f"{subject}的用量额度已受限。请等待额度恢复，或切换模型后手动继续。"
 
 
 def _number(value, default=0):
@@ -606,9 +629,8 @@ class PipelineRuntime:
                 recovered.append(_safe_job(updated))
                 stage = _dict(updated.get("checkpoint")).get("stage") or updated.get("stage")
                 await self._log(job_id, "warn", updated.get("stage"), f"检测到服务重启前的未完成任务，从断点恢复（stage={stage}）")
-                if auto_resume and _dict(updated.get("error")).get("code") not in (
-                    "OUTLINE_PARSE_FAILED", "ARC_SUMMARY_INVALID", "ARC_SOURCE_CHANGED", "BOOK_PLAN_INVALID", ARC_PROMPT_BUDGET_EXCEEDED,
-                ):
+                saved_error = _dict(updated.get("error"))
+                if auto_resume and not _is_manual_resume_code(saved_error.get("code"), saved_error):
                     await self._launch(updated)
         return recovered
 
@@ -695,7 +717,8 @@ class PipelineRuntime:
     async def run_pipeline(self, job_id):
         """Advance by awaiting the next phase, or send the action chosen at review."""
         yield {"phase": "prepare"}
-        progress_key, retry_count = None, 0
+        progress_key, retry_count, rate_streak = None, 0, 0
+        streak_limit = positive_env_int("NOVEL_FORGE_RATE_STREAK_LIMIT", 4)
         thinking_warnings = set()
         while True:
             try:
@@ -710,22 +733,48 @@ class PipelineRuntime:
                 raise
             except Exception as error:
                 current = await self._job(job_id)
-                key = current.get("stage"), _number(current.get("completedChapters"))
-                retry_count = retry_count + 1 if key == progress_key else 1
+                checkpoint = _dict(current.get("checkpoint"))
+                key = (current.get("stage"), checkpoint.get("nextChapter"), _number(current.get("completedChapters")))
+                if key != progress_key:
+                    retry_count = rate_streak = 0
+                retry_count += 1
                 progress_key = key
                 code = getattr(error, "code", "PIPELINE_ERROR")
                 if code in ("ABORTED", "JOB_PAUSED"):
                     paused = await self._update(job_id, {"status": "paused", "autoRetryState": None})
                     self._publish(job_id, "job:paused", job=paused)
                     return
+                long_quota = is_long_quota(error)
+                rate_streak = rate_streak + 1 if code in _SHORT_RATE_CODES and not long_quota else 0
+                if rate_streak >= streak_limit:
+                    code = "QUOTA_SUSPECTED"
+                    long_quota = True
+                stage = current.get("stage") or "init"
+                chapter_number = checkpoint.get("nextChapter") if stage == "chapter_writing" else None
+                if long_quota:
+                    config = _dict(current.get("llmConfig"))
+                    suspected = code == "QUOTA_SUSPECTED"
+                    retry_at = None if suspected else getattr(error, "retry_at", None)
+                    await self._failed(
+                        job_id, stage, code, quota_message(error, current, suspected=suspected),
+                        status="interrupted", retryable=True,
+                        chapterNumber=chapter_number, resumePolicy="manual", quotaScope="long",
+                        quotaKind="unknown" if suspected else getattr(error, "quota_kind", None) or "usage",
+                        resetSource=getattr(error, "reset_source", None) or "none",
+                        provider=getattr(error, "provider", None) or config.get("provider"),
+                        model=getattr(error, "model", None) or config.get("model"),
+                        **({"retryAt": retry_at} if (seconds_until(retry_at) or 0) > 0 else {}),
+                    )
+                    return
                 if not self._can_auto_retry(current, error, code, retry_count):
                     retry_at = getattr(error, "retry_at", None) or getattr(error, "circuit_retry_at", None)
                     output_budget = getattr(error, "request_max_tokens", None)
-                    stage = current.get("stage") or "init"
-                    retryable = (code in _MANUAL_RESUME or code in _TRANSIENT_ERRORS or bool(getattr(error, "retryable", False)))
+                    manual = _is_manual_resume_code(code, error)
+                    retryable = manual or code in _TRANSIENT_ERRORS or bool(getattr(error, "retryable", False))
                     await self._failed(
                         job_id, stage, code, f"{error}", status="interrupted" if retryable else "failed", retryable=retryable,
-                        chapterNumber=_dict(current.get("checkpoint")).get("nextChapter") if stage == "chapter_writing" else None,
+                        chapterNumber=chapter_number,
+                        **({"resumePolicy": "manual"} if manual else {}),
                         **({"retryAt": retry_at} if retry_at else {}),
                         **({"outputBudget": output_budget, "finishReason": getattr(error, "finish_reason", None)}
                            if output_budget else {}),
@@ -737,7 +786,7 @@ class PipelineRuntime:
     @staticmethod
     def _can_auto_retry(job, error, code, attempts):
         return (
-            attempts <= _MAX_AUTO_RESUMES and not job.get("testScenario") and code not in _MANUAL_RESUME
+            not _is_manual_resume_code(code, error) and attempts <= _MAX_AUTO_RESUMES and not job.get("testScenario")
             and not getattr(error, "circuit_retry_at", None)
             and (code in _TRANSIENT_ERRORS or getattr(error, "retryable", False))
             and job.get("autoResumeOnRateLimit") is not False
@@ -745,13 +794,23 @@ class PipelineRuntime:
         )
 
     async def _cooldown(self, job_id, job, error, code, attempt):
-        steps = (45_000, 75_000, 120_000, 180_000, 240_000, 300_000) if code == "HTTP_429" else (
+        steps = (45_000, 75_000, 120_000, 180_000, 240_000, 300_000) if code in _SHORT_RATE_CODES else (
             15_000, 30_000, 60_000, 120_000, 180_000,
         )
         configured = _number(job.get("autoResumeCooldownMs"))
-        delay = configured if configured > 0 else steps[min(attempt - 1, len(steps) - 1)] + random.randrange(4000)
+        hint_ms = _number(getattr(error, "retry_after_ms", None), None)
+        source = "schedule"
+        if configured > 0:
+            delay = configured
+        elif hint_ms is not None and 0 <= hint_ms <= 300_000:
+            jitter = min(5_000, max(500, int(hint_ms * 0.1)))
+            delay = min(300_000, max(5_000, int(hint_ms) + jitter))
+            source = "server"
+        else:
+            delay = steps[min(attempt - 1, len(steps) - 1)] + random.randrange(4000)
         state = {"waiting": True, "code": code, "message": str(error)[:160], "attempt": attempt,
-                 "maxAttempts": _MAX_AUTO_RESUMES, "cooldownMs": delay, "resumeAt": _now(delay)}
+                 "maxAttempts": _MAX_AUTO_RESUMES, "cooldownMs": delay, "resumeAt": _now(delay),
+                 "retryAfterSource": source}
         stage = job.get("stage") or "chapter_writing"
         await self._update(job_id, {"status": "running", "error": None, "autoRetryState": state})
         await self._log(job_id, "warn", stage,

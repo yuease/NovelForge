@@ -169,9 +169,11 @@ async def _stream_responses(service, epoch, body):
             elif event_type in ("response.refusal.delta", "response.refusal.done"):
                 refused = True
             elif event_type in ("response.failed", "error"):
-                error = responses_error(stream.status_code, response if event_type == "response.failed" else event)
+                error = responses_error(
+                    stream.status_code, response if event_type == "response.failed" else event, headers=stream.headers,
+                )
                 service.record_error(error, epoch)
-                error.retryable = False
+                error.retryable, error.no_replay = False, True
                 raise error
             elif event_type == "response.incomplete":
                 details = response.get("incomplete_details")
@@ -228,7 +230,7 @@ async def call_responses(service, model, system, prompt, epoch, *,
     try:
         return await _stream_responses(service, epoch, body)
     except SiwcError as error:
-        if (optional_keys and error.status == 400
+        if (optional_keys and not error.no_replay and error.status == 400
                 and error.code in ("SIWC_CAPABILITY_UNSUPPORTED", "SIWC_REQUEST_FAILED")
                 and "（tools）" not in str(error)):
             fallback_body = {k: v for k, v in body.items() if k not in optional_keys}

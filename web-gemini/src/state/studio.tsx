@@ -56,7 +56,7 @@ export interface StudioValue {
   /** Registers a new job and selects it for its first action. */
   onJobCreated: (job: JobRecord, destination?: 'monitor' | 'evaluation') => void
   updateJobConfig: (jobId: string, llmConfig: Partial<LLMConfig>) => Promise<void>
-  resumeJob: (jobId: string, llmConfig?: Partial<LLMConfig>) => Promise<void>
+  resumeJob: (jobId: string, llmConfig?: Partial<LLMConfig>) => Promise<{ quotaPending?: { retryAt?: string } }>
   pauseJob: (jobId: string) => Promise<void>
   extendJob: (jobId: string, payload: ExtendPayload) => Promise<void>
   replaceChapter: (chapter: ChapterRecord) => void
@@ -297,6 +297,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
     const res = await api.resumeJob(jobId, llmConfig)
     if (res.job) mergeJob(res.job)
     await loadJobDetails(jobId)
+    return { quotaPending: res.quotaPending }
   }, [mergeJob, loadJobDetails])
 
   const pauseJob = useCallback(async (jobId: string) => {

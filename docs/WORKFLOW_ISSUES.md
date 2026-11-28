@@ -92,5 +92,6 @@
 
 ## 七、运行时与限流调度（`pipeline.py` / `llm.py`）
 
-- [ ] **WF-16 `[P2]` 未识别“长周期配额耗尽（如 15 小时重置）”类 429，仍在 300s 间隔空转**
+- [x] **WF-16 `[P2]` 未识别“长周期配额耗尽（如 15 小时重置）”类 429，仍在 300s 间隔空转**
   - **现象**：上游明确返回 `resets in 15 hours, 3 minutes` 后仍连续每 300 秒自动冷却重试十余次，刷屏日志且无谓唤醒。
+  - **已落地**：新增 `novel_forge/rate_limits.py`（支持响应头 `Retry-After` 秒数/HTTP-date + 维度余量过滤的 `x-ratelimit-reset-*`、JSON `retryDelay`/`resets_at`、8000 字中英文复合时长解析、计费词优先与 300s 分界）；打通 `llm.py`、`openai_siwc.py`、`openai_responses.py` 去掉 60s 截断并新增进程内 `_quota_blocks` 快速失败；`pipeline.py` 实现 `run_pipeline` 与 `recover_interrupted_jobs` 共享手动恢复集合（含 `QUOTA_EXCEEDED`/`SIWC_USAGE_LIMIT`/`QUOTA_SUSPECTED`）、同断点 4 次连续 429 止损与短时服务端冷却对齐；`app.py` 透传 `retryAt` 与 `/resume` `quotaPending`；前端 `format.ts`/`MonitorPage.tsx` 修复裸 `/quota/` 误匹配并清晰展示本地恢复时间与一键切换模型入口。

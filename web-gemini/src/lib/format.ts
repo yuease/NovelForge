@@ -159,13 +159,38 @@ export interface FriendlyErrorInfo {
   detail?: string
 }
 
+export function formatQuotaRetryAt(retryAt: string | null | undefined): string {
+  if (!retryAt) return ''
+  const stamp = new Date(retryAt)
+  if (Number.isNaN(stamp.getTime())) return ''
+  const label = stamp.toLocaleString('zh-CN', {
+    hour12: false,
+    month: 'numeric',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  })
+  const remainingSec = Math.ceil((stamp.getTime() - Date.now()) / 1000)
+  if (remainingSec <= 60) return `预计 ${label} 恢复`
+  const days = Math.floor(remainingSec / 86400)
+  const hours = Math.floor((remainingSec % 86400) / 3600)
+  const mins = Math.ceil((remainingSec % 3600) / 60)
+  const parts = [
+    days > 0 ? `${days} 天` : '',
+    hours > 0 ? `${hours} 小时` : '',
+    days === 0 && mins > 0 ? `${mins} 分钟` : '',
+  ].filter(Boolean)
+  return `预计 ${label} 恢复${parts.length ? `（约 ${parts.join(' ')}）` : ''}`
+}
+
 /**
  * Turns raw backend / upstream provider errors into calm, actionable Chinese
  * while tucking raw JSON / HTTP stack details behind an optional disclosure.
  */
 export function friendlyError(err: string | JobErrorObject | null | undefined): FriendlyErrorInfo {
   const raw = errorText(err).trim()
-  const code = typeof err === 'object' && err ? (err.code ?? '') : ''
+  const errObj = typeof err === 'object' && err ? err : null
+  const code = errObj?.code ?? ''
   if (!raw) return { title: '遇到一点问题', summary: '本次操作未完成，可稍后重试。' }
 
   const jsonStart = raw.search(/\{\s*"error"|HTTP\s*\d{3}|finishReason|Internal server error|AI Studio/i)
@@ -179,10 +204,31 @@ export function friendlyError(err: string | JobErrorObject | null | undefined): 
       detail: raw,
     }
   }
-  if (code === 'QUOTA_EXCEEDED' || /额度已耗尽|quota|rate limit.*hour/i.test(raw)) {
+  if (code === 'QUOTA_SUSPECTED') {
     return {
-      title: '模型额度已达上限',
-      summary: '当前模型账号的配额暂时用完，已保留当前断点。切换其他可用模型即可立刻继续，或等待额度恢复。',
+      title: '疑似触及模型阶段限额，已停在安全断点',
+      summary: '同一断点连续多次触发限流且无进展，为避免持续空转已自动停止重试。请稍候额度恢复，或切换其他可用模型后手动继续。',
+      detail: hasRawTech ? raw : undefined,
+    }
+  }
+  if (
+    code === 'QUOTA_EXCEEDED'
+    || code === 'SIWC_USAGE_LIMIT'
+    || /额度已耗尽|额度已受限|用量上限|insufficient_quota|exceeded your current quota|reached your usage limit|usage_limit_exceeded/i.test(raw)
+  ) {
+    if (errObj?.quotaKind === 'billing') {
+      return {
+        title: '模型账号余额或计费额度不足',
+        summary: '当前模型账号的计费配额已用尽，已保留当前断点。请检查账号余额，或切换其他可用模型后继续创作。',
+        detail: hasRawTech ? raw : undefined,
+      }
+    }
+    const eta = formatQuotaRetryAt(errObj?.retryAt)
+    return {
+      title: '模型用量额度已达上限',
+      summary: eta
+        ? `当前模型账号的阶段配额暂时用完，${eta}。已保留当前断点，切换其他可用模型可立刻继续。`
+        : '当前模型账号的阶段配额暂时用完，已保留当前断点。切换其他可用模型即可立刻继续，或等待额度恢复。',
       detail: hasRawTech ? raw : undefined,
     }
   }
