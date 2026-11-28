@@ -33,6 +33,7 @@ _CONNECTION_FIELDS = {
     "apiKey": "api_key",
     "model": "model",
     "thinkingMode": "thinking_mode",
+    "reasoningEffort": "reasoning_effort",
     "timeoutMs": "timeout_ms",
     "maxTokens": "max_tokens",
     "maxRetries": "max_retries",

@@ -444,7 +444,7 @@ async def sync_provider_models(store: ProviderConfigStore, provider: str, *, cli
     if not _configured(provider, config):
         raise ProviderCatalogError("请先保存供应商连接。")
     if client is None:
-        async with httpx.AsyncClient(timeout=DISCOVERY_TIMEOUT) as owned:
+        async with httpx.AsyncClient(timeout=DISCOVERY_TIMEOUT, trust_env=False) as owned:
             models = await _fetch_models(provider, definition, config, endpoint, owned)
     else:
         models = await _fetch_models(provider, definition, config, endpoint, client)

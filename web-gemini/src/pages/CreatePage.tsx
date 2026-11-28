@@ -7,7 +7,17 @@ import { cn } from '../lib/cn'
 import { COLLAPSE_MOTION, SPRING_INDICATOR } from '../lib/motion'
 import { navigate } from '../lib/router'
 import { formatNumber, formatWords, messageOf } from '../lib/format'
-import type { CreateJobInput, LLMProvider, MemeLevel, MemeSourceMode, POVType, ThinkingMode } from '../lib/types'
+import type {
+  BudgetProfile,
+  CreateJobInput,
+  LLMProvider,
+  MemeLevel,
+  MemeSourceMode,
+  POVType,
+  StageBudgets,
+  StageThinkingMap,
+  ThinkingMode,
+} from '../lib/types'
 import { useStudio } from '../state/studio'
 import { useSessionState } from '../state/prefs'
 import {
@@ -15,6 +25,7 @@ import {
   KeyValue, PageHeader, Select, Slider, Switch,
 } from '../components/ui'
 import { findProvider, isModelChoiceReady, ModelPicker, ModelSelect, resolveSelectedModel, useModelCatalog } from '../components/model/ModelPicker'
+import { StagePolicyControls, cleanStageBudgets, cleanStageThinking, supportsThinkingPolicy } from '../components/model/StagePolicyControls'
 
 const GENRES = [
   '都市脑洞', '都市高武', '都市重生爽文', '都市种田', '悬疑推理', '悬疑脑洞', '无限流悬疑', '玄幻修仙', '玄幻脑洞',
@@ -112,7 +123,10 @@ export default function CreatePage() {
   const { catalog, loading: catalogLoading, error: catalogError } = useModelCatalog()
   const [modelChoice, setModelChoice] = useState<ModelChoice | null>(loadModelChoice)
   const [lightChoice, setLightChoice] = useState<ModelChoice | null>(null)
-  const [thinkingChoice, setThinkingChoice] = useState<ThinkingMode | ''>('')
+  const [thinkingMode, setThinkingMode] = useState<ThinkingMode>('auto')
+  const [stageThinking, setStageThinking] = useState<StageThinkingMap>({})
+  const [budgetProfile, setBudgetProfile] = useState<BudgetProfile>('balanced')
+  const [stageBudgets, setStageBudgets] = useState<StageBudgets>({})
   const preferred = modelChoice && findProvider(catalog, modelChoice.provider)?.configured ? modelChoice.provider : catalog?.activeProvider
   const provider: LLMProvider = preferred && findProvider(catalog, preferred)?.configured ? preferred : 'mock'
   const available = findProvider(catalog, provider)?.models ?? []
@@ -127,7 +141,7 @@ export default function CreatePage() {
   function selectModel(nextProvider: LLMProvider, nextModel: string) {
     const choice = { provider: nextProvider, model: nextModel }
     setModelChoice(choice)
-    if (nextProvider !== provider) { setLightChoice(null); setThinkingChoice('') }
+    if (nextProvider !== provider) { setLightChoice(null); setThinkingMode('auto'); setStageThinking({}) }
     try { localStorage.setItem(MODEL_CHOICE_KEY, JSON.stringify(choice)) } catch { /* ignore */ }
   }
 
@@ -138,6 +152,9 @@ export default function CreatePage() {
     setError(null)
     try {
       const d = draft
+      const canThink = supportsThinkingPolicy(provider, model, lightModel)
+      const cleanedThinking = canThink ? cleanStageThinking(stageThinking) : undefined
+      const cleanedBudgets = budgetProfile === 'custom' ? cleanStageBudgets(stageBudgets) : undefined
       const payload: CreateJobInput = {
         title: d.title.trim() || undefined,
         premise: d.premise.trim(),
@@ -158,7 +175,10 @@ export default function CreatePage() {
           useSavedConnection: true,
           model,
           lightModel: lightModel || undefined,
-          thinkingMode: provider === 'deepseek' ? thinkingChoice || undefined : undefined,
+          thinkingMode: canThink ? thinkingMode : undefined,
+          stageThinking: cleanedThinking,
+          budgetProfile: budgetProfile !== 'balanced' ? budgetProfile : undefined,
+          stageBudgets: cleanedBudgets,
           temperature: d.temperature,
           timeoutMs: Math.max(30, d.timeoutSec) * 1000,
           maxRetries: Math.max(0, Math.min(20, d.llmMaxRetries)),
@@ -375,18 +395,19 @@ export default function CreatePage() {
                     <Field label="请求重试">{(id) => <Input id={id} type="number" min={0} max={20} value={draft.llmMaxRetries} onChange={(e) => set('llmMaxRetries', Number(e.target.value))} />}</Field>
                     <Field label="超时（秒）" className="col-span-2">{(id) => <Input id={id} type="number" min={30} max={1800} value={draft.timeoutSec} onChange={(e) => set('timeoutSec', Number(e.target.value))} />}</Field>
                   </div>
-                  {provider === 'deepseek' && (
-                    <Field label="思考模式">
-                      {(id) => (
-                        <Select id={id} value={thinkingChoice} onChange={(e) => setThinkingChoice(e.target.value as ThinkingMode | '')}>
-                          <option value="">自动（重算术/考据题材自动开启）</option>
-                          <option value="auto">自动（题材保护）</option>
-                          <option value="enabled">始终启用</option>
-                          <option value="disabled">手动关闭</option>
-                        </Select>
-                      )}
-                    </Field>
-                  )}
+                  <StagePolicyControls
+                    provider={provider}
+                    model={model}
+                    lightModel={lightModel}
+                    thinkingMode={thinkingMode}
+                    onThinkingModeChange={setThinkingMode}
+                    stageThinking={stageThinking}
+                    onStageThinkingChange={setStageThinking}
+                    budgetProfile={budgetProfile}
+                    onBudgetProfileChange={setBudgetProfile}
+                    stageBudgets={stageBudgets}
+                    onStageBudgetsChange={setStageBudgets}
+                  />
                   <Switch checked={draft.autoResumeOnRateLimit} onChange={(v) => set('autoResumeOnRateLimit', v)} label="限流自动续跑" description="临时限流或超时后等待，从断点继续" />
                   <Switch checked={draft.enableEvaluation} onChange={(v) => set('enableEvaluation', v)} label="完本后自动评估" />
                 </div>

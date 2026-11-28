@@ -1,6 +1,7 @@
 """Asynchronous LLM transports and retry policies used by the writing pipeline."""
 
 import asyncio
+import ipaddress
 import json
 import logging
 import math
@@ -14,7 +15,7 @@ from asyncio import sleep as _sleep
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import httpx
 
@@ -24,7 +25,9 @@ from .openai_responses import call_responses
 from .openai_siwc import PROVIDER as SIWC, RESOURCE as SIWC_RESOURCE, SiwcError, all_stages as siwc_all_stages
 from .providers import get_provider_definition, is_masked_api_key, provider_requires_key, same_endpoint_origin
 from .rate_limits import is_long_quota, parse_reset_hint, quota_retry_at, seconds_until
-from .thinking_policy import resolve_vertex_thinking_config, strip_vertex_model_suffix
+from .thinking_policy import (
+    is_openai_gemini_model, preferred_enabled_effort, resolve_vertex_thinking_config, strip_vertex_model_suffix,
+)
 
 
 DEFAULT_TIMEOUT_MS = 300_000
@@ -161,8 +164,29 @@ async def _resolve_credentials(provider, base_url, api_key, model, thinking_mode
                         thinking_mode or stored.get("thinkingMode") or "disabled")
 
 
+_CGNAT_NET = ipaddress.ip_network("100.64.0.0/10")
+
+
 def _is_local(base_url):
     return bool(re.match(r"^https?://(?:127\.0\.0\.1|localhost)(?::|/|$)", base_url, re.I))
+
+
+def _is_private_or_local(base_url):
+    if _is_local(base_url):
+        return True
+    try:
+        host = (urlsplit(base_url or "").hostname or "").strip().lower()
+    except ValueError:
+        return False
+    if not host:
+        return False
+    if host in ("localhost", "localhost.localdomain") or host.endswith(".local") or host.endswith(".ts.net"):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return bool(ip.is_loopback or ip.is_private or ip.is_link_local or (ip.version == 4 and ip in _CGNAT_NET))
 
 
 def _circuit_key(creds):
@@ -490,7 +514,7 @@ async def _http_client(client, creds, transport):
         yield client
         return
     options = {"trust_env": False, "timeout": None}
-    if transport == "vertex" and not _is_local(creds.base_url):
+    if transport == "vertex" and not _is_private_or_local(creds.base_url):
         proxy = next((os.environ[var] for var in ("VERTEX_PROXY", "HTTPS_PROXY", "HTTP_PROXY") if os.environ.get(var)), "")
         if proxy:
             options["proxy"] = proxy
@@ -827,6 +851,13 @@ async def _call_transport(client, transport, creds, system, prompt, temperature,
             if allow_thinking_field:
                 body["thinking"] = {"type": "enabled" if creds.thinking_mode == "enabled" else "disabled"}
                 thinking_field = body, "thinking"
+        elif transport == "openai":
+            effort = reasoning_effort.strip().lower() if isinstance(reasoning_effort, str) and reasoning_effort.strip() else None
+            if effort is None and is_openai_gemini_model(provider, model) and creds.thinking_mode == "enabled":
+                effort = preferred_enabled_effort(model)
+            if effort and allow_thinking_field:
+                body["reasoning_effort"] = effort
+                thinking_field = body, "reasoning_effort"
     elif transport == "anthropic":
         label = "Anthropic"
         endpoint = root + ("/messages" if root.endswith("/v1") else "/v1/messages")
@@ -1110,6 +1141,10 @@ async def call_llm(*, provider="mock", base_url="", api_key="", model="", thinki
         budget = max(budget, min(_env_positive_int("NOVEL_FORGE_MIN_OUTPUT_TOKENS", 0), DEFAULT_MAX_TOKENS))
     if transport == "vertex" and stage != "RETITLE":
         budget = max(1024, budget or DEFAULT_MAX_TOKENS)
+    if transport == "openai" and guard and apply_output_floor and stage != "RETITLE":
+        eff = reasoning_effort.strip().lower() if isinstance(reasoning_effort, str) else ""
+        if eff in ("medium", "high") or (not eff and is_openai_gemini_model(creds.provider, creds.model) and creds.thinking_mode == "enabled"):
+            budget = max(budget, 16_384)
     rejected_at = math.inf
     truncation = None
     tried = set()

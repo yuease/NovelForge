@@ -21,11 +21,13 @@ from .long_memory import (
     normalize_volume_summary, replay_long_memory, unresolved_drifts,
 )
 from .openai_siwc import PROVIDER as SIWC, RESOURCE as SIWC_RESOURCE
+from .prompt_budget import normalize_budget_profile, normalize_stage_budgets
 from .providers import (
     PROVIDERS, ProviderCatalogError, get_provider_definition, is_masked_api_key, mask_api_key,
     normalize_model_ids, provider_requires_key, same_endpoint_origin,
 )
 from .text_evidence import locate_quote, normalize_quote
+from .thinking_policy import normalize_stage_thinking
 
 log = logging.getLogger(__name__)
 
@@ -280,6 +282,15 @@ def _job_record(data, config, now):
         llm["lightModel"] = str(raw["lightModel"]).strip()
     if isinstance(raw.get("autoResumeOnRateLimit"), bool):
         llm["autoResumeOnRateLimit"] = raw["autoResumeOnRateLimit"]
+    budget_profile = normalize_budget_profile(_first_non_null(raw.get("budgetProfile"), data.get("budgetProfile")))
+    if budget_profile:
+        llm["budgetProfile"] = budget_profile
+    stage_budgets = normalize_stage_budgets(_first_non_null(raw.get("stageBudgets"), data.get("stageBudgets")))
+    if stage_budgets:
+        llm["stageBudgets"] = stage_budgets
+    stage_thinking = normalize_stage_thinking(_first_non_null(raw.get("stageThinking"), data.get("stageThinking")))
+    if stage_thinking:
+        llm["stageThinking"] = stage_thinking
 
     topic = data.get("topicPackage")
     meme_level = data.get("memeLevel")

@@ -13,7 +13,31 @@ DEFAULT_VERIFY_INPUT_BUDGET = 14_336
 DEFAULT_REPAIR_INPUT_BUDGET = 12_288
 DEFAULT_AUDIT_INPUT_BUDGET = 24_576
 CHAPTER_INPUT_RESERVE = 1_024
+MAX_STAGE_INPUT_BUDGET = 200_000
 ARC_PROMPT_BUDGET_EXCEEDED = "ARC_PROMPT_BUDGET_EXCEEDED"
+BUDGET_PROFILES = {
+    "balanced": {
+        "chapter": DEFAULT_CHAPTER_INPUT_BUDGET,
+        "arc": DEFAULT_ARC_INPUT_BUDGET,
+        "verify": DEFAULT_VERIFY_INPUT_BUDGET,
+        "repair": DEFAULT_REPAIR_INPUT_BUDGET,
+        "audit": DEFAULT_AUDIT_INPUT_BUDGET,
+    },
+    "long_book": {
+        "chapter": 24_576,
+        "arc": 24_576,
+        "verify": 18_432,
+        "repair": 16_384,
+        "audit": 40_960,
+    },
+}
+_STAGE_BUDGET_ENV = {
+    "chapter": ("NOVEL_FORGE_CHAPTER_INPUT_BUDGET", "写章", "CHAPTER_PROMPT_BUDGET_INVALID"),
+    "arc": ("NOVEL_FORGE_ARC_INPUT_BUDGET", "滚纲", "ARC_PROMPT_BUDGET_INVALID"),
+    "verify": ("NOVEL_FORGE_REVIEW_INPUT_BUDGET", "审校", "REVIEW_PROMPT_BUDGET_INVALID"),
+    "repair": ("NOVEL_FORGE_REPAIR_INPUT_BUDGET", "返修", "REPAIR_PROMPT_BUDGET_INVALID"),
+    "audit": ("NOVEL_FORGE_AUDIT_INPUT_BUDGET", "终审", "AUDIT_PROMPT_BUDGET_INVALID"),
+}
 _SPACE = "\u0009-\u000d\u0020\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff"
 _EDGE_SPACE = re.compile(rf"^[{_SPACE}]+|[{_SPACE}]+$")
 _LEADING_SPACE = re.compile(rf"^[{_SPACE}]+")
@@ -46,6 +70,48 @@ def read_review_input_budget(kind="verify", raw=_UNSET):
         "repair": ("NOVEL_FORGE_REPAIR_INPUT_BUDGET", DEFAULT_REPAIR_INPUT_BUDGET, "返修", "REPAIR_PROMPT_BUDGET_INVALID"),
     }[kind]
     return _read_input_budget(os.environ.get(env) if raw is _UNSET else raw, default, label=label, code=code)
+
+
+def normalize_budget_profile(raw) -> str | None:
+    if not isinstance(raw, str):
+        return None
+    cleaned = raw.strip().lower()
+    return cleaned if cleaned in ("balanced", "long_book", "custom") else None
+
+
+def normalize_stage_budgets(raw) -> dict[str, int]:
+    if not isinstance(raw, dict):
+        return {}
+    cleaned = {}
+    for key, (_, label, code) in _STAGE_BUDGET_ENV.items():
+        if key not in raw or raw[key] is None or raw[key] == "":
+            continue
+        parsed = _read_input_budget(raw[key], BUDGET_PROFILES["balanced"][key], label=label, code=code)
+        if parsed is None:
+            cleaned[key] = 0
+        elif parsed > MAX_STAGE_INPUT_BUDGET:
+            raise LLMError(f"{label}输入预算不能超过 {MAX_STAGE_INPUT_BUDGET} tokens。", code=code, status=400)
+        else:
+            cleaned[key] = parsed
+    return cleaned
+
+
+def resolve_stage_budgets(job=None) -> dict[str, int | None]:
+    llm = job.get("llmConfig") if isinstance(job, dict) and isinstance(job.get("llmConfig"), dict) else {}
+    profile = normalize_budget_profile(llm.get("budgetProfile")) or "balanced"
+    overrides = normalize_stage_budgets(llm.get("stageBudgets"))
+    preset = BUDGET_PROFILES["long_book"] if profile == "long_book" else BUDGET_PROFILES["balanced"]
+    resolved = {}
+    for key, (env_var, label, code) in _STAGE_BUDGET_ENV.items():
+        if key in overrides:
+            resolved[key] = None if overrides[key] == 0 else overrides[key]
+        else:
+            env_val = os.environ.get(env_var)
+            if env_val is not None and _EDGE_SPACE.sub("", env_val):
+                resolved[key] = _read_input_budget(env_val, preset[key], label=label, code=code)
+            else:
+                resolved[key] = preset[key]
+    return resolved
 
 
 def _read_input_budget(raw, default, *, label, code):

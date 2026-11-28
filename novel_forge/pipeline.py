@@ -34,8 +34,8 @@ from .llm import DEFAULT_MAX_TOKENS, LLMError, build_mock_volume_summary, call_l
 from .long_memory import drift_ledger, normalize_memory_delta, normalize_volume_summary, story_ledger_view
 from .memes import MemeStore
 from .prompt_budget import (
-    ARC_PROMPT_BUDGET_EXCEEDED, DEFAULT_ARC_INPUT_BUDGET, read_arc_input_budget, read_audit_input_budget,
-    read_review_input_budget,
+    ARC_PROMPT_BUDGET_EXCEEDED, DEFAULT_ARC_INPUT_BUDGET, normalize_budget_profile, normalize_stage_budgets,
+    read_arc_input_budget, read_audit_input_budget, read_review_input_budget, resolve_stage_budgets,
 )
 from .prompts import (
     STYLE_PRESETS,
@@ -60,7 +60,9 @@ from .storage import (
     count_chinese_words, public_job, replace_drift_fact_deltas, volume_source_hash,
 )
 from .text_evidence import locate_quote, normalize_quote
-from .thinking_policy import resolve_writing_thinking, writing_profile
+from .thinking_policy import (
+    normalize_stage_thinking, resolve_stage_thinking, resolve_writing_thinking, writing_profile,
+)
 from .verifier import (
     _llm_options, parse_json_from_llm, review_chapter_stages, verify_and_repair_chapter,
 )
@@ -84,10 +86,26 @@ _MARKDOWN_HEADING = re.compile(r"^#{1,6}\s*")
 
 
 def read_writing_options(job=None):
+    budgets = resolve_stage_budgets(job)
     return {
-        **read_prompt_writing_options(job), "arc_input_budget": read_arc_input_budget(),
-        "verify_input_budget": read_review_input_budget("verify"), "repair_input_budget": read_review_input_budget("repair"),
+        **read_prompt_writing_options(job),
+        "input_budget": budgets["chapter"],
+        "arc_input_budget": budgets["arc"],
+        "verify_input_budget": budgets["verify"],
+        "repair_input_budget": budgets["repair"],
+        "audit_input_budget": budgets["audit"],
     }
+
+
+def _stage_llm_config(stage, config, *, profile=None):
+    cfg = _dict(config)
+    decision = resolve_stage_thinking(stage, cfg, profile=profile)
+    updated = {**cfg, "thinkingMode": decision["thinkingMode"]}
+    if decision["reasoningEffort"]:
+        updated["reasoningEffort"] = decision["reasoningEffort"]
+    else:
+        updated.pop("reasoningEffort", None)
+    return updated
 
 
 class PipelineError(RuntimeError):
@@ -385,6 +403,24 @@ def _patched_connection(existing, patch, saved):
         updates.update(thinkingMode=requested, thinkingModeSource="auto" if requested == "auto" else "user")
     elif "thinkingMode" not in existing:
         updates.update(thinkingMode="disabled", thinkingModeSource="default")
+    if "budgetProfile" in patch:
+        profile = normalize_budget_profile(patch.get("budgetProfile"))
+        if profile:
+            updates["budgetProfile"] = profile
+        else:
+            updates.pop("budgetProfile", None)
+    if "stageBudgets" in patch:
+        budgets = normalize_stage_budgets(patch.get("stageBudgets"))
+        if budgets:
+            updates["stageBudgets"] = budgets
+        else:
+            updates.pop("stageBudgets", None)
+    if "stageThinking" in patch:
+        stage_thinking = normalize_stage_thinking(patch.get("stageThinking"))
+        if stage_thinking:
+            updates["stageThinking"] = stage_thinking
+        else:
+            updates.pop("stageThinking", None)
     for key, low, high, default in (("timeoutMs", 1000, math.inf, 300_000), ("maxRetries", 0, 20, 5)):
         number = _number(patch.get(key), None)
         updates[key] = (max(low, min(high, math.floor(number))) if number is not None
@@ -674,7 +710,8 @@ class PipelineRuntime:
         await self._update(job_id, patch)
 
     async def _llm(self, job_id, stage, config, prompt, temperature, *, max_tokens=None, retries=0):
-        options = _llm_options(config)
+        effective = config if "reasoningEffort" in _dict(config) or stage == "chapter_writing" else _stage_llm_config(stage, config)
+        options = _llm_options(effective)
         if stage == "chapter_retitle":
             options.update(retries=0, apply_output_floor=False)
         if max_tokens is not None:
@@ -1163,9 +1200,10 @@ class PipelineRuntime:
             if decision["warning"] and not thinking_warnings:
                 await self._log(job_id, "warn", "chapter_writing", decision["warning"])
                 thinking_warnings.add(decision["warning"])
-            return {**config, "thinkingMode": decision["effective"]}
+            return _stage_llm_config("chapter_writing", config, profile=profile)
 
         write_config = await configure_writing(first_missing, _dict(job.get("canonicalFacts")))
+        verify_config = _stage_llm_config("chapter_verify", auxiliary)
         arcs = saved_arc_plans(job) if rolling else []
         if options["long_memory"] and committed and not resume_cached_audit:
             await self._catch_up_volumes(job_id, max(committed), committed, auxiliary)
@@ -1300,7 +1338,7 @@ class PipelineRuntime:
                 book_plan=plan, recent_chapters=recent_chapters, rolling_arc_outlines=rolling, boundary_state=boundary_state,
                 story_ledger=story_ledger, extract_missing_facts=extract_missing_facts if story_ledger else None,
                 prev_chapter_ending=prev, pov=pov, target_words=target, min_words=minimum, max_words=maximum,
-                llm_config=write_config, verify_llm_config=auxiliary, test_scenario=config.get("testScenario"),
+                llm_config=write_config, verify_llm_config=verify_config, test_scenario=config.get("testScenario"),
                 max_retries=max_repairs, chapter_ai_gate=options["chapter_ai_gate"], long_memory=options["long_memory"],
                 degrade_on_verify_exhausted=options["degrade_on_verify_exhausted"], store=self.store, client=self.client,
                 on_event=lambda name, fields: self._publish(job_id, name, **fields),
@@ -1440,7 +1478,7 @@ class PipelineRuntime:
     async def _adjust_words(self, job_id, number, body, words, target, outline, pov, auxiliary):
         prompt = build_word_count_adjust_prompt(chapter_number=number, chapter_text=body, current_words=words,
                                                target_words=target, outline=outline, pov=pov)
-        reply = await self._llm(job_id, "chapter_writing", auxiliary, prompt, 0.5, retries=1)
+        reply = await self._llm(job_id, "chapter_writing", _stage_llm_config("archive", auxiliary), prompt, 0.5, retries=1)
         revised = str(reply.get("text") or "").strip()
         if (not output_was_truncated(reply.get("finishReason")) and _utf16_length(revised) > 100
                 and abs(count_chinese_words(revised) - target) < abs(words - target)):
@@ -1729,7 +1767,10 @@ class PipelineRuntime:
         return patches, deltas, updates
 
     async def _request_drift_patch(self, job_id, config, prompt):
-        options = {**_llm_options(config), "retries": 0, "max_tokens": 2400, "apply_output_floor": False}
+        effective = _stage_llm_config("drift_patch", config)
+        effort = effective.get("reasoningEffort")
+        max_tokens = 4096 if effort in ("low", "medium", "high") else 2400
+        options = {**_llm_options(effective), "retries": 0, "max_tokens": max_tokens, "apply_output_floor": False}
         return await call_llm(**options, **prompt, temperature=0.1, cache_key=f"nf-drift-{job_id}"[:64],
                               store=self.store, client=self.client)
 
@@ -1770,7 +1811,8 @@ class PipelineRuntime:
             if config.get("provider") == "mock":
                 raw = build_mock_volume_summary(volume)
             else:
-                options = {**_llm_options(config), "max_tokens": protected_output_budget(16_384, DEFAULT_MAX_TOKENS)}
+                effective = _stage_llm_config("volume_archive", config)
+                options = {**_llm_options(effective), "max_tokens": protected_output_budget(16_384, DEFAULT_MAX_TOKENS)}
                 reply = await call_llm(**options, **build_volume_summary_prompt(volume), temperature=0.15,
                                        store=self.store, client=self.client)
                 usage = reply.get("usage")
@@ -1895,7 +1937,9 @@ class PipelineRuntime:
                                      rolling_arc_outlines=False, story_ledger=False):
         job_id, plan = job["id"], job.get("bookPlan")
         indices = {row["chapterNumber"]: index for index, row in enumerate(chapters)}
-        verify_budget, repair_budget = read_review_input_budget(), read_review_input_budget("repair")
+        budgets = resolve_stage_budgets(job)
+        verify_budget, repair_budget = budgets["verify"], budgets["repair"]
+        verify_config = _stage_llm_config("chapter_verify", auxiliary)
         if isinstance(targets, set):
             targets = [{"chapterNumber": number, "findings": []} for number in sorted(targets & indices.keys())]
         for target in targets:
@@ -1917,7 +1961,7 @@ class PipelineRuntime:
                     result = await verify_and_repair_chapter(
                         job_id=job_id, chapter_number=number, chapter_text=chapter["content"], outline=outline,
                         canonical_facts=facts, pov=job.get("pov") or "第三人称限知", target_words=job["wordsPerChapter"],
-                        llm_config=config, verify_llm_config=auxiliary, long_memory=long_memory, max_retries=1,
+                        llm_config=config, verify_llm_config=verify_config, long_memory=long_memory, max_retries=1,
                         store=self.store, client=self.client, book_plan=plan, rolling_arc_outlines=rolling_arc_outlines,
                         story_ledger=story_ledger, boundary_state=boundary, chapter_title=chapter["title"],
                         verify_input_budget=verify_budget, repair_input_budget=repair_budget, arc_plans=saved_arc_plans(job),
@@ -1990,7 +2034,7 @@ class PipelineRuntime:
         if cache.get("auditInputHash") == diagnostics["auditInputHash"] and isinstance(cache.get("report"), dict):
             return cache["report"]
         attempts = max(1, int(_number(job.get("maxAuditRetries"), 2)) + 1)
-        input_budget = read_audit_input_budget()
+        input_budget = resolve_stage_budgets(job)["audit"]
         report = {}
         for attempt in range(1, attempts + 1):
             fingerprint = diagnostics["auditInputHash"]

@@ -161,6 +161,27 @@ export interface ProviderTestResult {
   code?: string
 }
 
+export type BudgetProfile = 'balanced' | 'long_book' | 'custom'
+
+export interface StageBudgets {
+  chapter?: number
+  arc?: number
+  verify?: number
+  repair?: number
+  audit?: number
+}
+
+export type StageThinkingBucket =
+  | 'book_plan'
+  | 'chapter_outlines'
+  | 'chapter_writing'
+  | 'chapter_verify'
+  | 'archive'
+  | 'full_audit'
+
+export type StageThinkingLevel = 'auto' | 'off' | 'minimal' | 'low' | 'medium' | 'high'
+export type StageThinkingMap = Partial<Record<StageThinkingBucket, StageThinkingLevel>>
+
 export interface LLMConfig {
   provider: LLMProvider
   useSavedConnection?: boolean
@@ -171,6 +192,9 @@ export interface LLMConfig {
   temperature?: number
   thinkingMode?: ThinkingMode
   thinkingModeSource?: 'user' | 'default' | 'auto' | string
+  budgetProfile?: BudgetProfile
+  stageBudgets?: StageBudgets
+  stageThinking?: StageThinkingMap
   maxRetries?: number
   timeoutMs?: number
   autoResumeOnRateLimit?: boolean

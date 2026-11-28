@@ -11,7 +11,18 @@ import { COLLAPSE_MOTION, EASE_OUT, TAB_MOTION } from '../lib/motion'
 import { navigate } from '../lib/router'
 import { estimateJobCostCny, formatCny } from '../lib/pricing'
 import { AUDIT_VERDICT_META, formatDateTime, formatNumber, formatTokens, formatWords, friendlyError, messageOf } from '../lib/format'
-import type { ChapterRecord, JobRecord, LLMConfig, LLMProvider, MemeLevel, SSELogItem, ThinkingMode } from '../lib/types'
+import type {
+  BudgetProfile,
+  ChapterRecord,
+  JobRecord,
+  LLMConfig,
+  LLMProvider,
+  MemeLevel,
+  SSELogItem,
+  StageBudgets,
+  StageThinkingMap,
+  ThinkingMode,
+} from '../lib/types'
 import { useStudio } from '../state/studio'
 import type { ExtendPayload } from '../state/studio'
 import {
@@ -20,6 +31,7 @@ import {
   Textarea, Thinking, useToast,
 } from '../components/ui'
 import { ModelPicker, ModelSelect, isModelChoiceReady, resolveSelectedModel, useModelCatalog } from '../components/model/ModelPicker'
+import { StagePolicyControls, cleanStageBudgets, cleanStageThinking, supportsThinkingPolicy } from '../components/model/StagePolicyControls'
 import { WorkflowGraph, useWorkflowMonitor } from './monitor/Workflow'
 
 const STAGES: Record<string, string> = {
@@ -611,15 +623,25 @@ function JobModelPanel({ job, busy, onSave, onResume }: { job: JobRecord; busy: 
   const [lightModel, setLightModel] = useState(config?.lightModel ?? '')
   const [timeout, setTimeoutSec] = useState(Math.round((config?.timeoutMs ?? 300000) / 1000))
   const [retries, setRetries] = useState(config?.maxRetries ?? 5)
-  const [thinkingMode, setThinkingMode] = useState<ThinkingMode>(config?.thinkingMode ?? 'auto')
+  const [thinkingMode, setThinkingMode] = useState<ThinkingMode>(
+    config?.thinkingModeSource === 'default' ? 'auto' : (config?.thinkingMode ?? 'auto'),
+  )
+  const [stageThinking, setStageThinking] = useState<StageThinkingMap>(config?.stageThinking ?? {})
+  const [budgetProfile, setBudgetProfile] = useState<BudgetProfile>(
+    config?.budgetProfile ?? (config?.stageBudgets && Object.keys(config.stageBudgets).length ? 'custom' : 'balanced'),
+  )
+  const [stageBudgets, setStageBudgets] = useState<StageBudgets>(config?.stageBudgets ?? {})
   const [autoResume, setAutoResume] = useState(config?.autoResumeOnRateLimit !== false && job.autoResumeOnRateLimit !== false)
   const resolved = resolveSelectedModel(catalog, provider, model)
   const saved = isModelChoiceReady(catalog, provider, resolved)
   const canSave = saved || (provider === config?.provider && resolved === config.model)
+  const canThink = supportsThinkingPolicy(provider, resolved, lightModel)
   const patch: Partial<LLMConfig> = {
     provider, model: resolved, lightModel, timeoutMs: Math.max(timeout, 30) * 1000,
     maxRetries: Math.min(20, Math.max(retries, 0)), autoResumeOnRateLimit: autoResume,
-    ...(provider === 'deepseek' ? { thinkingMode } : {}),
+    budgetProfile,
+    stageBudgets: budgetProfile === 'custom' ? (cleanStageBudgets(stageBudgets) ?? {}) : {},
+    ...(canThink ? { thinkingMode, stageThinking: cleanStageThinking(stageThinking) ?? {} } : {}),
     ...(saved ? { useSavedConnection: true } : {}),
   }
 
@@ -631,20 +653,23 @@ function JobModelPanel({ job, busy, onSave, onResume }: { job: JobRecord; busy: 
         catalog={catalog}
         disabled={busy}
         label="主模型"
-        onChange={(p, m) => { if (p !== provider) setLightModel(''); setProvider(p); setModel(m) }}
+        onChange={(p, m) => { if (p !== provider) { setLightModel(''); setStageThinking({}) } setProvider(p); setModel(m) }}
       />
-      <ModelSelect provider={provider} model={lightModel} onChange={setLightModel} catalog={catalog} disabled={busy} label="辅助模型" emptyLabel="与主模型相同" hint="用于审校、事实提取等轻量环节。" />
-      {provider === 'deepseek' && (
-        <Field label="写章思考模式">
-          {(id) => (
-            <Select id={id} value={thinkingMode} onChange={(e) => setThinkingMode(e.target.value as ThinkingMode)} disabled={busy}>
-              <option value="auto">自动（重算术/考据题材自动开启）</option>
-              <option value="enabled">始终启用</option>
-              <option value="disabled">手动关闭</option>
-            </Select>
-          )}
-        </Field>
-      )}
+      <ModelSelect provider={provider} model={lightModel} onChange={setLightModel} catalog={catalog} disabled={busy} label="辅助模型" emptyLabel="与主模型相同" hint="用于审校、事实提取和归档纠偏，推荐 gemini-3.8-flash 或 gemini-4-hydrogen。" />
+      <StagePolicyControls
+        provider={provider}
+        model={resolved}
+        lightModel={lightModel}
+        disabled={busy}
+        thinkingMode={thinkingMode}
+        onThinkingModeChange={setThinkingMode}
+        stageThinking={stageThinking}
+        onStageThinkingChange={setStageThinking}
+        budgetProfile={budgetProfile}
+        onBudgetProfileChange={setBudgetProfile}
+        stageBudgets={stageBudgets}
+        onStageBudgetsChange={setStageBudgets}
+      />
       <div className="grid grid-cols-2 gap-3">
         <Field label="超时（秒）">{(id) => <Input id={id} type="number" min={30} value={timeout} onChange={(e) => setTimeoutSec(Number(e.target.value))} />}</Field>
         <Field label="重试上限">{(id) => <Input id={id} type="number" min={0} max={20} value={retries} onChange={(e) => setRetries(Number(e.target.value))} />}</Field>
